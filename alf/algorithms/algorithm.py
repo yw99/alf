@@ -167,7 +167,8 @@ class Algorithm(AlgorithmInterface):
         if config:
             self._temporally_independent_train_step = config.temporally_independent_train_step
             self.use_rollout_state = config.use_rollout_state
-            if config.enable_amp and torch.cuda.is_available():
+            if (config.enable_amp and torch.cuda.is_available()
+                    and config.amd_dtype == torch.float16):
                 self._grad_scaler = torch.cuda.amp.GradScaler()
         if self._temporally_independent_train_step is None:
             self._temporally_independent_train_step = (len(
@@ -1886,7 +1887,8 @@ class Algorithm(AlgorithmInterface):
             weight (float): weight for this batch. Loss will be multiplied with
                 this weight before calculating gradient.
         """
-        with torch.cuda.amp.autocast(self._config.enable_amp):
+        with torch.cuda.amp.autocast(
+                self._config.enable_amp, dtype=self._config.amp_dtype):
             train_info, loss_info = self._compute_train_info_and_loss_info(
                 experience)
 
@@ -2093,7 +2095,8 @@ class Algorithm(AlgorithmInterface):
         length = alf.nest.get_nest_size(offline_experience, dim=0)
 
         if self._RL_train:
-            with torch.cuda.amp.autocast(self._config.enable_amp):
+            with torch.cuda.amp.autocast(
+                    self._config.enable_amp, dtype=self._config.amp_dtype):
                 train_info, loss_info = self._compute_train_info_and_loss_info(
                     experience)
                 self._update_priority(loss_info, batch_info,
