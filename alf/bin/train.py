@@ -81,7 +81,7 @@ def _define_flags():
     flags.DEFINE_bool('store_snapshot', True,
                       'Whether store an ALF snapshot before training')
     flags.DEFINE_enum(
-        'distributed', 'none', ['none', 'multi-gpu'],
+        'distributed', 'none', ['none', 'multi-gpu', 'multi-node-multi-gpu'],
         'Set whether and how to run training in distributed mode.')
     flags.DEFINE_bool('as_remote_trainer', False,
                       'Whether to run in a remote trainer mode.')
@@ -99,6 +99,19 @@ def _define_flags():
 FLAGS = flags.FLAGS
 
 
+def check_valid_launch():
+    # must use torch.distributed.launch in multi-node-multi-gpu mode
+    required_keys = {"RANK", "LOCAL_RANK", "WORLD_SIZE"}
+    env_keys = set(os.environ.keys())
+
+    if FLAGS.distributed == 'multi-node-multi-gpu':
+        missing = required_keys - env_keys
+        assert not missing, f"Missing environment variables for distributed launch: {missing}"
+    else:
+        extra = required_keys & env_keys
+        assert not extra, f"Unexpected environment variables for non-distributed launch: {extra}"
+
+
 def _setup_logging(rank: int, log_dir: str):
     """Setup logging for each process
 
@@ -109,7 +122,6 @@ def _setup_logging(rank: int, log_dir: str):
     FLAGS.alsologtostderr = True
     logging.set_verbosity(logging.INFO)
     logging.get_absl_handler().use_absl_log_file(log_dir=log_dir)
-    logging.use_absl_handler()
 
 
 def _setup_device():
@@ -147,12 +159,13 @@ def _setup_remote_configs_if_needed():
         })
 
 
-def _train(root_dir, rank=0, world_size=1):
+def _train(root_dir, local_rank=-1, rank=0, world_size=1):
     """Launch the trainer after the conf file has been parsed. This function
     could be called by grid search after the config has been modified.
 
     Args:
         root_dir (str): Path to the directory for writing logs/summaries/checkpoints.
+        local_rank (int): The ID of the process within current node
         rank (int): The ID of the process among all of the DDP processes. For
             non-distributed training, this id should be 0.
         world_size (int): The number of processes in total. If set to 1, it is
@@ -161,6 +174,12 @@ def _train(root_dir, rank=0, world_size=1):
     conf_file = common.get_conf_file()
     trainer_conf = policy_trainer.TrainerConfig(
         root_dir=root_dir, conf_file=conf_file)
+
+    if trainer_conf.ddp_paras_check_interval > 0 and world_size > 1 and local_rank >= 0:
+        # world_size > 1 means ddp mode, local_rank >= 0 means multi-node multi-gpu
+        raise NotImplementedError(
+            "ddp_paras_check currently not supported under multi-node multi-gpu training"
+        )
 
     if trainer_conf.ml_type == 'rl':
         ddp_rank = rank if world_size > 1 else -1
@@ -203,7 +222,7 @@ def training_worker(rank: int,
             interpreted as "non distributed mode".
         conf_file (str): Path to the training configuration.
         root_dir (str): Path to the directory for writing logs/summaries/checkpoints.
-        paras_queue: a shared Queue for checking the consistency of model parameters
+        paras_queue (Queue): a shared Queue for checking the consistency of model parameters
             in different worker processes, if multi-gpu training is used.
     """
     try:
@@ -223,7 +242,7 @@ def training_worker(rank: int,
                 timeout=datetime.timedelta(minutes=FLAGS.nccl_timeout))
             # Set the rank and total number of processes for distributed training.
             PerProcessContext().set_distributed(
-                rank=rank, num_processes=world_size)
+                rank=rank, local_rank=-1, num_processes=world_size)
             assert paras_queue is not None
             PerProcessContext().set_paras_queue(paras_queue)
 
@@ -235,7 +254,68 @@ def training_worker(rank: int,
 
         # Parse the configuration file, which will also implicitly bring up the environments.
         common.parse_conf_file(conf_file)
-        _train(root_dir, rank, world_size)
+        _train(root_dir=root_dir, rank=rank, world_size=world_size)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        if world_size >= 1:
+            # If the training worker is running as a process in multiprocessing
+            # environment, this will make sure that the exception raised in this
+            # particular process is captured and shown.
+            logging.exception(f'{mp.current_process().name} - {e}')
+        raise e
+    finally:
+        # Note that each training worker will have its own child processes
+        # running the environments. In the case when training worker process
+        # finishes earlier (e.g. when it raises an exception), it will hang
+        # instead of quitting unless all child processes are killed.
+        alf.close_env()
+
+
+def training_worker_multi_node(local_rank: int,
+                               rank: int,
+                               world_size: int,
+                               conf_file: str,
+                               root_dir: str,
+                               paras_queue: mp.Queue = None):
+    """An executable instance that trains and evaluate the algorithm
+
+    Args:
+        local_rank (int): The ID of the process within current node.
+        rank (int): The ID of the process among all of the DDP processes.
+        world_size (int): The number of processes in total. If set to 1, it is
+            interpreted as "non distributed mode".
+        conf_file (str): Path to the training configuration.
+        root_dir (str): Path to the directory for writing logs/summaries/checkpoints.
+        paras_queue (Queue): a shared Queue for checking the consistency of model parameters
+            in different worker processes, if multi-gpu training is used.
+    """
+    try:
+        _setup_logging(log_dir=root_dir, rank=rank)
+        _setup_device()
+
+        # Specialization for distributed mode
+        dist.init_process_group('nccl', rank=rank, world_size=world_size)
+        # Recover the flags when spawned as a sub process
+        # _define_flags()
+        FLAGS(sys.argv, known_only=True)
+        FLAGS.mark_as_parsed()
+        # Set the rank and total number of processes for distributed training.
+        PerProcessContext().set_distributed(
+            rank=rank, local_rank=local_rank, num_processes=world_size)
+        assert paras_queue is not None
+        PerProcessContext().set_paras_queue(paras_queue)
+
+        # Make PerProcessContext read-only.
+        PerProcessContext().finalize()
+
+        # Parse the configuration file, which will also implicitly bring up the environments.
+        common.parse_conf_file(conf_file)
+        _train(
+            root_dir=root_dir,
+            local_rank=local_rank,
+            rank=rank,
+            world_size=world_size)
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -259,7 +339,11 @@ def main(_):
 
     conf_file = common.get_conf_file()
 
-    if FLAGS.store_snapshot:
+    # check if launched with right command
+    check_valid_launch()
+
+    if FLAGS.store_snapshot and (FLAGS.distributed != 'multi-node-multi-gpu'
+                                 or int(os.environ.get('RANK', -1)) == 0):
         common.generate_alf_snapshot(common.alf_root(), conf_file, root_dir)
 
     # FLAGS.distributed is guaranteed to be one of the possible values.
@@ -326,6 +410,45 @@ def main(_):
                                 paras_queue)
                 for process in processes:
                     process.join()
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            # ``e`` has been printed in the subprocess, so here we won't print it
+            # again. But we raise another error so that we will have a correct
+            # exit code for the program.
+            raise ChildProcessError(f'Training failed on subprocess exception')
+
+    elif FLAGS.distributed == 'multi-node-multi-gpu':
+        local_rank = int(os.environ['LOCAL_RANK'])
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+
+        try:
+            # Create a shared queue for checking the consistency of the parameters
+            # in different work processes.
+            manager = mp.Manager()
+            paras_queue = manager.Queue()
+            CUDA_VISIBLE_DEVICES = os.environ.get('CUDA_VISIBLE_DEVICES')
+            if CUDA_VISIBLE_DEVICES is None:
+                num_devices = torch.cuda.device_count()
+                devices = [d for d in range(num_devices)]
+            else:
+                devices = CUDA_VISIBLE_DEVICES.split(',')
+                devices = [int(d) for d in devices]
+            assert local_rank < len(devices)
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(devices[local_rank])
+            training_worker_multi_node(
+                local_rank=local_rank,
+                rank=rank,
+                world_size=world_size,
+                conf_file=conf_file,
+                root_dir=root_dir,
+                paras_queue=paras_queue)
+            # Restore the original CUDA_VISIBLE_DEVICES
+            if CUDA_VISIBLE_DEVICES is not None:
+                os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
+            else:
+                os.environ.pop('CUDA_VISIBLE_DEVICES', None)
         except KeyboardInterrupt:
             pass
         except Exception as e:
