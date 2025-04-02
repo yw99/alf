@@ -14,12 +14,13 @@
 
 from absl import logging
 from absl import flags
+import math
 import torch.multiprocessing as mp
 import os
 import sys
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import alf
 from alf.algorithms.config import TrainerConfig
@@ -32,6 +33,7 @@ from alf.data_structures import StepType
 from alf.algorithms.data_transformer import create_data_transformer
 from alf.environments.utils import create_environment
 from alf.trainers import policy_trainer
+from alf.utils.schedulers import Scheduler, as_scheduler
 from collections import namedtuple
 
 EvalJob = namedtuple(
@@ -176,11 +178,25 @@ class PeekableQueue(object):
 class SyncEvaluator(object):
     """Evaluator for performing evaluation on the current algorithm.
 
-    For each round of evaluation, it will play ``config.num_eval_episodes`` using
-    ``config.num_eval_environments`` parallel environments.
+    There are two modes:
+        - episode mode: run ``num_eval_episodes`` rounds of evaluation.
+            For each round of evaluation, it will play ``config.num_eval_episodes`` using
+            ``config.num_eval_environments`` parallel environments.
+            This option is suitable for the evaluation of episodic tasks.
+        - step mode: run ``num_eval_steps`` environmental steps. This option is good for
+            the evaluation of non-episodic tasks.
+
+
     """
 
     def __init__(self, env, config):
+
+        num_eval_episodes = config.num_eval_episodes
+        num_eval_steps = config.num_eval_steps
+
+        assert num_eval_episodes == 0 or num_eval_steps(
+        ) == 0, "should use at most one eval mode"
+
         self._env = env
         self._config = config
         eval_dir = os.path.join(config.root_dir, 'eval')
@@ -211,7 +227,8 @@ class SyncEvaluator(object):
         with alf.summary.push_summary_writer(self._summary_writer):
             logging.info("Start evaluation")
             metrics = evaluate(self._env, algorithm,
-                               self._config.num_eval_episodes, job_queue)
+                               self._config.num_eval_episodes,
+                               self._config.num_eval_steps, job_queue)
             if metrics is None:
                 return
             common.log_metrics(metrics)
@@ -371,6 +388,7 @@ def _worker(job_queue: mp.Queue,
 def evaluate(env: AlfEnvironment,
              algorithm: RLAlgorithm,
              num_episodes: int,
+             num_steps: Union[int, Scheduler] = 0,
              job_queue: Optional[PeekableQueue] = None
              ) -> List[alf.metrics.StepMetric]:
     """Perform one round of evaluation.
@@ -379,6 +397,7 @@ def evaluate(env: AlfEnvironment,
         env: the environment
         algorithm: the training algorithm
         num_episodes: number of episodes to evaluate
+        num_steps: number of environment steps to evaluate
         job_queue: This is only used when `eval()` is called from a worker
             process. If during the evaluation, the worker receives a "stop"
             job from the main process, it will stop the evaluation and
@@ -393,35 +412,58 @@ def evaluate(env: AlfEnvironment,
     algorithm.eval()
     policy_state = algorithm.get_initial_predict_state(env.batch_size)
     trans_state = algorithm.get_initial_transform_state(env.batch_size)
-    episodes_per_env = (num_episodes + batch_size - 1) // batch_size
-    env_episodes = torch.zeros(batch_size, dtype=torch.int32)
-    episodes = 0
+
+    buffer_size = max(num_episodes, 1)
     metrics = [
         alf.metrics.AverageReturnMetric(
-            buffer_size=num_episodes, example_time_step=time_step),
+            buffer_size=buffer_size, example_time_step=time_step),
         alf.metrics.AverageEpisodeLengthMetric(
-            example_time_step=time_step, buffer_size=num_episodes),
+            example_time_step=time_step, buffer_size=buffer_size),
         alf.metrics.AverageEnvInfoMetric(
-            example_time_step=time_step, buffer_size=num_episodes),
+            example_time_step=time_step, buffer_size=buffer_size),
         alf.metrics.AverageDiscountedReturnMetric(
-            buffer_size=num_episodes, example_time_step=time_step),
+            buffer_size=buffer_size, example_time_step=time_step),
         alf.metrics.EpisodicStartAverageDiscountedReturnMetric(
-            example_time_step=time_step, buffer_size=num_episodes),
+            example_time_step=time_step, buffer_size=buffer_size),
         alf.metrics.AverageRewardMetric(
-            example_time_step=time_step, buffer_size=num_episodes),
+            example_time_step=time_step, buffer_size=buffer_size),
     ]
+
+    counter = 0
+    if num_episodes > 0:
+        # episode eval mode
+        episode_mode = True
+        episodes_per_env = (num_episodes + batch_size - 1) // batch_size
+        env_episodes = torch.zeros(batch_size, dtype=torch.int32)
+        total_num = num_episodes
+    else:
+        episode_mode = False
+        num_eval_steps = num_steps()
+        assert num_eval_steps > 0
+        # adjust the ``num_eval_steps`` so that all the envs will have the same number of steps
+        num_eval_steps = math.ceil(num_eval_steps / batch_size) * batch_size
+        total_num = num_eval_steps
+
     time_step = common.get_initial_time_step(env)
-    while episodes < num_episodes:
-        # For parallel play, we cannot naively pick the first finished `num_episodes`
-        # episodes to estimate the average return (or other statistics) as it can be
-        # biased towards short episodes. Instead, we stick to using the first
-        # episodes_per_env episodes from each environment to calculate the
-        # statistics and ignore the potentially extra episodes from each environment.
-        invalid = env_episodes >= episodes_per_env
-        # Force the step_type of the extra episodes to be StepType.FIRST so that
-        # these time steps do not affect metrics as the metrics are only updated
-        # at StepType.LAST. The metric computation uses cpu version of time_step.
-        time_step.cpu().step_type[invalid] = StepType.FIRST
+
+    while counter < total_num:
+        if episode_mode:
+            # For parallel play, we cannot naively pick the first finished `num_episodes`
+            # episodes to estimate the average return (or other statistics) as it can be
+            # biased towards short episodes. Instead, we stick to using the first
+            # episodes_per_env episodes from each environment to calculate the
+            # statistics and ignore the potentially extra episodes from each environment.
+            invalid = env_episodes >= episodes_per_env
+            # Force the step_type of the extra episodes to be StepType.FIRST so that
+            # these time steps do not affect metrics as the metrics are only updated
+            # at StepType.LAST. The metric computation uses cpu version of time_step.
+            time_step.cpu().step_type[invalid] = StepType.FIRST
+        else:
+            # env step mode
+            if counter + batch_size >= total_num:
+                time_step.cpu().step_type[torch.arange(
+                    batch_size)] = StepType.LAST
+                time_step.step_type[torch.arange(batch_size)] = StepType.LAST
 
         next_time_step, policy_step, trans_state = policy_trainer._step(
             algorithm=algorithm,
@@ -431,12 +473,15 @@ def evaluate(env: AlfEnvironment,
             trans_state=trans_state,
             metrics=metrics)
 
-        time_step.step_type[invalid] = StepType.FIRST
+        if episode_mode:
+            time_step.step_type[invalid] = StepType.FIRST
 
-        for i in range(batch_size):
-            if time_step.step_type[i] == StepType.LAST:
-                env_episodes[i] += 1
-                episodes += 1
+            for i in range(batch_size):
+                if time_step.step_type[i] == StepType.LAST:
+                    env_episodes[i] += 1
+                    counter += 1
+        else:
+            counter += batch_size
 
         policy_state = policy_step.state
         time_step = next_time_step
@@ -445,6 +490,5 @@ def evaluate(env: AlfEnvironment,
             if job is not None and job.type == "stop":
                 logging.info("Received stop signal. Aborting evaluation.")
                 return None
-
     env.reset()
     return metrics
