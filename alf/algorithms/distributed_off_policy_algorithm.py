@@ -598,7 +598,7 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
                 positive number.
             unroller_only: if True, will skip the training related steps (including
                 registering to all trainer workers, _create_pull_params_subprocess,
-                _check_paramss_update observe_for_replay) and do unroll only. Therefore,
+                _check_params_update observe_for_replay) and do unroll only. Therefore,
                 it won't be blocked by the trainer and is useful for visualizing the
                 unroll behaviors without training.
             *args: additional args to pass to ``core_alg_ctor``.
@@ -761,18 +761,23 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
                 f"Trainer {worker_id} is not reachable. Skip sending exp to it."
             )
 
-    def _check_paramss_update(self) -> bool:
+    def _check_params_update(self) -> bool:
         """Returns True if params have been updated.
         """
         # Check if the params have been updated
         buffer = None
         with self._shared_mem_lock:
             if self._shared_alg_params.buf[0] == 1:
-                buffer = io.BytesIO(self._shared_alg_params.buf[1:])
+                with record_time(
+                        "time/dist_unroller_params_update/1_buffer_from_io"):
+                    buffer = io.BytesIO(self._shared_alg_params.buf[1:])
         if buffer is not None:
-            state_dict = torch.load(buffer, map_location='cpu')
+            with record_time("time/dist_unroller_params_update/2_load_to_cpu"):
+                state_dict = torch.load(buffer, map_location='cpu')
             # We might only update part of the params
-            self._core_alg.load_state_dict(state_dict, strict=False)
+            with record_time(
+                    "time/dist_unroller_params_update/3_load_state_dict"):
+                self._core_alg.load_state_dict(state_dict, strict=False)
             logging.debug("Params updated from the trainer.")
             with self._shared_mem_lock:
                 self._shared_alg_params.buf[0] = 0
@@ -787,7 +792,8 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
         """
         # Copied from super().train_iter()
         if self._config.empty_cache:
-            torch.cuda.empty_cache()
+            with record_time("time/dist_unroller_train_iter/0_empty_cache"):
+                torch.cuda.empty_cache()
 
         if self._unroller_only:
             self._unroll_iter_off_policy()
@@ -802,12 +808,16 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
             # get overwritten by a checkpointer.
             self._create_pull_params_subprocess()
             while True:
-                if self._check_paramss_update():
+                if self._check_params_update():
                     break
                 time.sleep(0.01)
             self._registered = True
 
         # Experience will be sent to the trainer in this function
-        self._unroll_iter_off_policy()
-        self._check_paramss_update()
+        with record_time(
+                "time/dist_unroller_train_iter/1_unroll_iter_off_policy"):
+            self._unroll_iter_off_policy()
+        with record_time(
+                "time/dist_unroller_train_iter/2_check_params_update"):
+            self._check_params_update()
         return 0
