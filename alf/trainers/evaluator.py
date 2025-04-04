@@ -436,6 +436,7 @@ def evaluate(
         total_num = num_episodes
     else:
         episode_mode = False
+        num_steps = as_scheduler(num_steps)
         num_eval_steps = num_steps()
         assert num_eval_steps > 0
         # adjust the ``num_eval_steps`` so that all the envs will have the same number of steps
