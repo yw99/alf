@@ -11,54 +11,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Patch torch.nn.Module for better performance.
 
-``torch.nn.Module.__getattr__`` is frequently used by all class derived from
-``nn.Module``. It can introduce too much unnecessary overhead. So we patch
-``nn.Module`` class to explicitly store Parameter/Module as attribute so
-that `__getattr__` won't be triggered. This patch can speed up the access
-of ``Module`` or ``Parameter`` attributes by more than 10x times.
-"""
-
-import torch
+from contextlib import contextmanager
 from torch.nn import Module
 
-_old_Module__setattr__ = torch.nn.Module.__setattr__
+# ALF Algorithm will overwrite these functions, we save the original ones.
+old_state_dict = Module.state_dict
+old_load_state_dict = Module.load_state_dict
+old__save_to_state_dict = Module._save_to_state_dict
+old__load_from_state_dict = Module._load_from_state_dict
 
 
-def _new_Module__setattr__(self, name, value):
-    _old_Module__setattr__(self, name, value)
-    object.__setattr__(self, name, value)
+@contextmanager
+def original_torch_module_functions():
+    """A context manager for restoring some key original nn.Module functions that
+    have been overwritten by ALF.
 
+    This can be used when we are trying to load a pretrained huggingface model which
+    require a newer and original ``torch.nn.Module``.
 
-Module.__setattr__ = _new_Module__setattr__
+    Example:
 
-old_register_parameter = torch.nn.Module.register_parameter
+    .. code-block:: python
 
-
-def _new_register_parameter(self, name, param):
-    old_register_parameter(self, name, param)
-    object.__setattr__(self, name, param)
-
-
-Module.register_parameter = _new_register_parameter
-
-old_register_buffer = torch.nn.Module.register_buffer
-
-
-def _new_register_buffer(self, name, param):
-    old_register_buffer(self, name, param)
-    object.__setattr__(self, name, param)
-
-
-Module.register_buffer = _new_register_buffer
-
-old_add_module = torch.nn.Module.add_module
-
-
-def _new_add_module(self, name, module):
-    old_add_module(self, name, module)
-    object.__setattr__(self, name, module)
-
-
-Module.add_module = _new_add_module
+        with original_torch_module_functions():
+            model = hf_model_load()
+    """
+    keys = [
+        'state_dict', 'load_state_dict', '_save_to_state_dict',
+        '_load_from_state_dict'
+    ]
+    current_funcs = {k: getattr(Module, k) for k in keys}
+    old_funcs = {k: globals()['old_' + k] for k in keys}
+    for k in keys:
+        setattr(Module, k, old_funcs[k])
+    yield
+    for k in keys:
+        setattr(Module, k, current_funcs[k])

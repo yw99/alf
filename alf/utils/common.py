@@ -41,6 +41,7 @@ from typing import Callable, List, Dict, Optional, Union
 from contextlib import contextmanager
 
 import alf
+from alf import module as alf_module
 from alf.algorithms.config import TrainerConfig
 import alf.nest as nest
 from alf.utils.schedulers import Scheduler, as_scheduler
