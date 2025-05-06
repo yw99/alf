@@ -2138,7 +2138,7 @@ class ParamFC(nn.Module):
                              self._input_size)
         self.update_weight(weight, reinitialize=reinitialize)
 
-    def update_weight(self, weight, reinitialize=False):
+    def update_weight(self, weight, update_n_groups=False, reinitialize=False):
         """Update the weight from a weight tensor or a batch of weight tensors.
 
         Args:
@@ -2149,6 +2149,8 @@ class ParamFC(nn.Module):
                 - ``D_in``: D_in of the weight
             reinitialize (bool): whether to reinitialize self._weight
         """
+        if update_n_groups:
+            self._n_groups = weight.shape[0]
         if reinitialize:
             for i in range(self._n_groups):
                 if self._kernel_initializer is None:
@@ -2160,7 +2162,7 @@ class ParamFC(nn.Module):
 
         self._weight = weight
 
-    def update_bias(self, bias, reinitialize=False):
+    def update_bias(self, bias, update_n_groups=False, reinitialize=False):
         """Store a bias tensor or batch of bias tensors.
 
         Args:
@@ -2170,6 +2172,8 @@ class ParamFC(nn.Module):
                 - ``D``: length of bias vector, should be self._bias_length
             reinitialize (bool): whether to reinitialize self._bias
         """
+        if update_n_groups:
+            self._n_groups = bias.shape[0]
         if reinitialize:
             if self._use_bias:
                 nn.init.constant_(bias, self._bias_init_value)
@@ -2207,6 +2211,7 @@ class ParamFC(nn.Module):
             assert inputs.shape[1] == self._input_size, (
                 "Input inputs has wrong shape %s. Expecting (B, %d)" %
                 (inputs.shape, self._input_size))
+            # [n, B, D]
             inputs = inputs.unsqueeze(0).expand(self._n_groups, *inputs.shape)
         elif inputs.ndim == 3:
             # case 2: parallel inputs
@@ -2220,7 +2225,7 @@ class ParamFC(nn.Module):
             raise ValueError("Wrong inputs.ndim=%d" % inputs.ndim)
 
         if store_inputs:
-            self._inputs = inputs
+            self._inputs = inputs.transpose(0, 1)
 
         if self._bias is not None:
             res = torch.baddbmm(self._bias.unsqueeze(1), inputs,
