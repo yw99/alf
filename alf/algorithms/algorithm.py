@@ -1534,6 +1534,7 @@ class Algorithm(AlgorithmInterface):
                     config.mini_batch_length,
                     (config.update_counter_every_mini_batch
                      and update_global_counter),
+                    config.summarize_train_every_mini_batch,
                     whole_replay_buffer_training=config.
                     whole_replay_buffer_training)
         else:
@@ -1581,6 +1582,7 @@ class Algorithm(AlgorithmInterface):
                           mini_batch_size,
                           mini_batch_length,
                           update_counter_every_mini_batch,
+                          summarize_train_every_mini_batch,
                           whole_replay_buffer_training: bool = False):
         """Train using experience."""
         (experience, processed_exp_spec, batch_info, length, mini_batch_length,
@@ -1668,11 +1670,12 @@ class Algorithm(AlgorithmInterface):
                         mini_batch_info_list[0],
                         weight=alf.nest.get_nest_size(mini_batch_list[0], 1) /
                         mini_batch_size)
-                    if do_summary:
-                        self.summarize_train(exp, train_info, loss_info,
-                                             params)
-                    # These are no longer used, release them to reduce memory usage.
-                    del exp, train_info, loss_info, params
+
+                if do_summary or (alf.summary.should_record_summaries() and (
+                        summarize_train_every_mini_batch)):
+                    self.summarize_train(exp, train_info, loss_info, params)
+                # These are no longer used, release them to reduce memory usage.
+                del exp, train_info, loss_info, params
 
         train_steps = batch_size * mini_batch_length * num_updates
         return train_steps
