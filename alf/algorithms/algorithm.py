@@ -1876,6 +1876,8 @@ class Algorithm(AlgorithmInterface):
         """Update the priority of the ``replay buffer`` based on the ``priority``
         field of loss_info.
         """
+        if not self._config.priority_replay:
+            return
         if loss_info.priority != ():
             priority = (loss_info.priority + self._config.priority_replay_eps
                         )**self._config.priority_replay_alpha()
