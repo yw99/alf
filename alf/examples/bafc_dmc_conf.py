@@ -22,13 +22,19 @@ from alf.algorithms.data_transformer import ObservationNormalizer
 from alf.examples.benchmarks.dm_control import dmc_conf
 from alf.optimizers import Adam
 
-actor_hidden_layers = (256, 256)
-joint_hidden_layers = (256, 256)
-# actor_hidden_layers = (32, 32)
-# joint_hidden_layers = (32, 32)
+debug_mode = False
 optimizer = Adam(lr=5e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
+
+if debug_mode:
+    actor_hidden_layers = (32, 32)
+    joint_hidden_layers = (32, 32)
+    num_actor_eval_samples = 64
+else:
+    actor_hidden_layers = (256, 256)
+    joint_hidden_layers = (256, 256)
+    num_actor_eval_samples = 512
 
 if use_obs_normalizer:
     data_transformer_ctor = ObservationNormalizer
@@ -56,24 +62,20 @@ alf.config(
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
     num_actors=10,
-    use_target_actor=False,
     use_bootstrap_actors=True,
     bootstrap_mask_prob=0.8,
-    # num_actor_eval_samples=512,
-    num_actor_eval_samples=64,
+    num_actor_eval_samples=num_actor_eval_samples,
     eval_samples_init_method='normal',
     eval_samples_clipping=obs_normalizer_clipping,
-    actor_eval_type='last',
-    actor_encoding_dim=256,
+    actor_eval_type='exclude_input',
+    actor_encoding_dim=None,
     obs_action_encoding_dim=128,
     actor_utd=1,
-    critic_utd=5,
+    critic_utd=2,
+    critic_respect_exp_batch_size=True,
     target_critic_tau=0.005,
     target_critic_period=1,
-    target_critic_use_ema=False,
-    target_actor_tau=0.05,
-    target_actor_period=1,
-    target_actor_use_ema=False)
+    target_critic_use_ema=False)
 
 alf.config(
     'TransformerEncoder',
