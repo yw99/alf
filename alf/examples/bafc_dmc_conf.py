@@ -26,6 +26,7 @@ debug_mode = False
 optimizer = Adam(lr=5e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
+actor_use_ln = False
 
 if debug_mode:
     actor_hidden_layers = (32, 32)
@@ -45,7 +46,8 @@ if obs_normalizer_clipping:
 
 actor_network_cls = partial(
     alf.networks.ActorFCNetwork,
-    fc_layer_params=actor_hidden_layers)
+    fc_layer_params=actor_hidden_layers,
+    use_ln=actor_use_ln)
 
 critic_network_cls = partial(
     alf.networks.FuncCriticNetwork,
@@ -63,11 +65,12 @@ alf.config(
     critic_network_cls=critic_network_cls,
     num_actors=10,
     use_bootstrap_actors=True,
+    actor_use_ln=actor_use_ln,
     bootstrap_mask_prob=0.8,
     num_actor_eval_samples=num_actor_eval_samples,
     eval_samples_init_method='normal',
     eval_samples_clipping=obs_normalizer_clipping,
-    actor_eval_type='exclude_input',
+    actor_eval_type='output',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,
     actor_utd=1,
@@ -91,7 +94,8 @@ alf.config(
     whole_replay_buffer_training=False,
     clear_replay_buffer=False,
     num_updates_per_train_iter=6,
-    num_env_steps=int(1e7),
+    num_env_steps=int(1e6),
+    mini_batch_size=256,
     evaluate=False,
     debug_summaries=True,
     summary_interval=100,

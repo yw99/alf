@@ -91,6 +91,7 @@ class BafcAlgorithm(OffPolicyAlgorithm):
                  calculate_priority=False,
                  num_actors=10,
                  use_bootstrap_actors=False,
+                 actor_use_ln=False,
                  bootstrap_mask_prob=0.8,
                  num_actor_eval_samples=256,
                  eval_samples_init_method='normal',
@@ -219,6 +220,7 @@ class BafcAlgorithm(OffPolicyAlgorithm):
             self.add_optimizer(critic_optimizer, [critic_network])
 
         self._actor_networks = actor_networks
+        self._actor_use_ln = actor_use_ln
         self._actor_eval_samples = nn.Parameter(actor_eval_samples)
         self._actor_eval_type = actor_eval_type
         self._actor_encoder = actor_encoder
@@ -277,10 +279,16 @@ class BafcAlgorithm(OffPolicyAlgorithm):
             action, state = actor_net(
                 observation, state=state.actor_network)
         else:
-            action, state = actor_net(
-                observation,
-                id=self._rollout_actor_id,
-                state=state.actor_network)
+            if self._actor_use_ln:
+                action, state = actor_net(
+                    observation, state=state.actor_network)
+                # [n_env, n_actor, d_a] --> [n_env, d_a]
+                action = action[:, self._rollout_actor_id, :]
+            else:
+                action, state = actor_net(
+                    observation,
+                    id=self._rollout_actor_id,
+                    state=state.actor_network)
         new_state = BafcActionState(actor_network=state)
 
         return action, new_state
@@ -425,7 +433,7 @@ class BafcAlgorithm(OffPolicyAlgorithm):
             actor_encoding = actor_encoding[idx]  # [T*B, d_enc]
 
         ## Step 2: compute critics and target critics for training actor batch
-        ## There are two options for handling the actor batch and (s, a) batch
+        ## There are two ways of handling the actor batch and (s, a) batch
         ##
         ## 1) critic_respect_exp_batch_size = True
         ##    respect the (s, a) batch size [T*B]
