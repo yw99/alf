@@ -322,6 +322,7 @@ class FuncCriticNetwork(EncodingNetwork):
             name=name)
 
         self._obs_action_batch_dominate = obs_action_batch_dominate
+        self._use_naive_parallel_network = use_naive_parallel_network
 
     def _cross_batch_concat(self, tensors):
         assert len(tensors) == 2, "Only support 2 tensors."
@@ -355,6 +356,17 @@ class FuncCriticNetwork(EncodingNetwork):
 
     def set_obs_action_batch_dominate(self, flag: bool):
         self._obs_action_batch_dominate = flag
+
+    def make_parallel(self, n):
+        """Create a parallel func critic network using ``n`` replicas of ``self``.
+        The initialized network parameters will be different.
+        If ``use_naive_parallel_network`` is True, use ``NaiveParallelNetwork``
+        to create the parallel network.
+        """
+        if self._use_naive_parallel_network:
+            return alf.networks.NaiveParallelNetwork(self, n)
+        else:
+            return super().make_parallel(n, True)
 
 
 @alf.configurable
