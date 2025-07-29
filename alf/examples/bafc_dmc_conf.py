@@ -23,7 +23,7 @@ from alf.examples.benchmarks.dm_control import dmc_conf
 from alf.optimizers import Adam
 
 debug_mode = False
-optimizer = Adam(lr=5e-4)
+optimizer = Adam(lr=3e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
 actor_use_ln = False
@@ -66,16 +66,17 @@ alf.config(
     num_actors=10,
     use_bootstrap_actors=True,
     actor_use_ln=actor_use_ln,
-    bootstrap_mask_prob=0.8,
+    switch_actor_per_step=True,
+    bootstrap_mask_prob=0.9,
     num_actor_eval_samples=num_actor_eval_samples,
     eval_samples_init_method='normal',
     eval_samples_clipping=obs_normalizer_clipping,
-    actor_eval_type='output',
+    actor_eval_type='last_two',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,
     actor_utd=1,
-    critic_utd=2,
-    critic_respect_exp_batch_size=True,
+    critic_utd=3,
+    critic_respect_exp_batch_size=False,
     target_critic_tau=0.005,
     target_critic_period=1,
     target_critic_use_ema=False)
@@ -93,7 +94,7 @@ alf.config(
     enable_amp=False,
     whole_replay_buffer_training=False,
     clear_replay_buffer=False,
-    num_updates_per_train_iter=6,
+    num_updates_per_train_iter=8,
     num_env_steps=int(1e6),
     mini_batch_size=256,
     evaluate=False,

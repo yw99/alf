@@ -92,6 +92,7 @@ class BafcAlgorithm(OffPolicyAlgorithm):
                  num_actors=10,
                  use_bootstrap_actors=False,
                  actor_use_ln=False,
+                 switch_actor_per_step=False,
                  bootstrap_mask_prob=0.8,
                  num_actor_eval_samples=256,
                  eval_samples_init_method='normal',
@@ -221,6 +222,7 @@ class BafcAlgorithm(OffPolicyAlgorithm):
 
         self._actor_networks = actor_networks
         self._actor_use_ln = actor_use_ln
+        self._switch_actor_per_step = switch_actor_per_step
         self._actor_eval_samples = nn.Parameter(actor_eval_samples)
         self._actor_eval_type = actor_eval_type
         self._actor_encoder = actor_encoder
@@ -310,9 +312,9 @@ class BafcAlgorithm(OffPolicyAlgorithm):
         ``_target_critic_networks`` to maintain their states.
         """
         assert not self._is_eval
-        if inputs.step_type == StepType.FIRST:
+        if inputs.step_type == StepType.FIRST or self._switch_actor_per_step:
             self._rollout_actor_id = torch.randint(self._num_actors, ())
-            if self._use_bootstrap_actors:
+            if self._use_bootstrap_actors and inputs.step_type == StepType.FIRST:
                 # [n_env, n_actors] masks for bootstrap actors
                 prob_t = torch.full(
                     (inputs.step_type.shape[0], self._num_actors),
