@@ -92,10 +92,12 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  reward_weights=None,
                  calculate_priority=False,
                  num_actor_critic=10,
+                 actor_critic_pairing=True,
                  use_bootstrap_actors=False,
                  use_bootstrap_critics=False,
                  actor_use_ln=False,
                  bootstrap_mask_prob=0.8,
+                 bootstrap_mask_type='episode',
                  num_actor_eval_samples=256,
                  eval_samples_init_method='normal',
                  eval_samples_clipping=False,
@@ -115,17 +117,33 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  dqda_clipping=None,
                  actor_optimizer=None,
                  critic_optimizer=None,
+                 actor_encoder_optimizer=None,
+                 eval_samples_optimizer=None,
                  checkpoint=None,
                  debug_summaries=False,
                  reproduce_locomotion=False,
                  name="BafcAlgorithm"):
         """
         Args:
+
+            actor_critic_pairing (bool): whether or not fix the 1-1 pairing of actors 
+                and critics during actor_train_step (there are the same number of 
+                actors and critics, we pair each actor with a unique and different 
+                critic during actor training). If True, such a actor-critic pairing is 
+                fixed throughout the training. Otherwise, it is randomized at each
+                actor_train_step.
+            bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
+                bootstrapped training of actors and/or critics. There are two types, 
+                ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
+                every step of an episode. ``step`` means resampled bootstrap_mask for
+                every step of an episode.
         """
         assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'output'], (
             r"{actor_eval_type} in not supported.")
         assert eval_samples_init_method in ['normal', 'uniform'], (
             r"init method {eval_samples_init_method} is not supported.")
+        assert bootstrap_mask_type in ['episode', 'step'], (
+            r"bootstrap mask type {bootstrap_mask_type} is not supported.")
         if actor_utd is None and critic_utd is None:
             self._train_mode = TrainMode.standard
         else:
@@ -148,9 +166,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             self._critic_utd = critic_utd
 
         self._num_actor_critic = num_actor_critic
+        self._actor_critic_pairing = actor_critic_pairing
         self._use_bootstrap_actors = use_bootstrap_actors
         self._use_bootstrap_critics = use_bootstrap_critics
         self._bootstrap_mask_prob = bootstrap_mask_prob
+        self._bootstrap_mask_type = bootstrap_mask_type
         self._bootstrap_mask = ()
         actor_networks = actor_network_cls(
             input_tensor_spec=observation_spec,
@@ -221,10 +241,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             self.add_optimizer(actor_optimizer, [actor_networks])
         if critic_optimizer is not None and critic_networks is not None:
             self.add_optimizer(critic_optimizer, [critic_networks])
+        if actor_encoder_optimizer is not None:
+            self.add_optimizer(actor_encoder_optimizer, [actor_encoder])
+        self._actor_eval_samples = nn.Parameter(actor_eval_samples)
+        if eval_samples_optimizer is not None:
+            self.add_optimizer(eval_samples_optimizer, [self._actor_eval_samples])
 
         self._actor_networks = actor_networks
         self._actor_use_ln = actor_use_ln
-        self._actor_eval_samples = nn.Parameter(actor_eval_samples)
         self._actor_eval_type = actor_eval_type
         self._actor_encoder = actor_encoder
         self._critic_networks = critic_networks
@@ -318,8 +342,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         ``_target_critic_networks`` to maintain their states.
         """
         assert not self._is_eval
-        if inputs.step_type == StepType.FIRST:
-            self._rollout_actor_id = torch.randint(self._num_actor_critic, ())
+        if inputs.step_type == StepType.FIRST or self._bootstrap_mask_type == 'step':
+            if inputs.step_type == StepType.FIRST:
+                # commitment: only resample rollout actor at the beginning of an episode
+                self._rollout_actor_id = torch.randint(self._num_actor_critic, ())
             if self._use_bootstrap_actors or self._use_bootstrap_critics:
                 # [n_env, n_actors] masks for bootstrap actors
                 prob_t = torch.full(
@@ -369,6 +395,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
         actor_tokens = self._tokenize_actor_out(eval_action) 
         actor_encoding = self._actor_encoder(actor_tokens)[0]
+        if not self._actor_critic_pairing:
+            perm = torch.randperm(self._num_actor_critic)
+            actor_encoding = actor_encoding[perm, :]
+            action = action[:, perm, :]
         actor_encoding = actor_encoding.unsqueeze(0).repeat(
             observation.shape[0], 1, 1)  # [T*B, n_actor, d_enc]
 
