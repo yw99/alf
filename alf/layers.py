@@ -914,6 +914,246 @@ class ParallelFC(nn.Module):
 
 
 @alf.configurable
+@alf.repr_wrapper
+class ParallelModulatedFC(ParallelFC):
+    """
+    Parallel fully-connected layers with StyleGAN2-style modulation/demodulation.
+
+    Equivalent to `n` separate FC layers of shape (input_size -> output_size),
+    applied in parallel to a batch.
+
+    Modulation:
+      - Either provide `noise` directly (see forward), or
+      - Provide a `noise_dim` and the module will learn an affine to produce
+        per-sample modulation scalars.
+
+    Demodulation:
+      - Normalizes per (batch, layer, output) to keep activation statistics stable.
+    """
+
+    def __init__(self,
+                 input_size: int,
+                 output_size: int,
+                 n: int,
+                 activation: Callable = identity,
+                 use_bias: bool = True,
+                 use_bn: bool = False,
+                 use_ln: bool = False,
+                 bn_ctor: Callable = nn.BatchNorm1d,
+                 kernel_initializer: Optional[Callable] = None,
+                 kernel_init_gain: float = 1.0,
+                 bias_init_value: float = 0.,
+                 use_torch_init: bool = False,
+                 bias_initializer: Optional[Callable] = None,
+                 weight_opt_args: Optional[Dict] = None,
+                 bias_opt_args: Optional[Dict] = None,
+                 # NEW:
+                 noise_dim: Optional[int] = None,
+                 per_layer_noise: bool = True,
+                 demodulate: bool = True,
+                 eps: float = 1e-8):
+        """
+        New Args:
+            noise_dim: dimension of the noise vector for each sample. If specified,
+                noise are mapped via affine transform(s) to input_size. If None,
+                you must pass a noise vector of shape [B, input_size].
+            per_layer_noise: only effetive if noise_dim is not None. If True, use
+                different modulatation for each of the FC layers, i.e., affine outputs 
+                ``n * input_size``. If False, affine outputs ``input_size`` and 
+                broadcasts the same modulation to all FC layers.
+            demodulate: whether or not apply per-sample output normalization.
+            esp: numerical stability term for demodulation
+        """
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            n=n,
+            activation=activation,
+            use_bias=use_bias,
+            use_bn=use_bn,
+            use_ln=use_ln,
+            bn_ctor=bn_ctor,
+            kernel_initializer=kernel_initializer,
+            kernel_init_gain=kernel_init_gain,
+            bias_init_value=bias_init_value,
+            bias_initializer=bias_initializer,
+            weight_opt_args=weight_opt_args,
+            bias_opt_args=bias_opt_args
+        )
+
+        # Modulation / Demodulation
+        self._demodulate = demodulate
+        self._eps = eps
+
+        self._noise_dim = noise_dim
+        self._per_layer_noise = per_layer_noise
+        if noise_dim is not None:
+            # If per_layer_noise: produce [B, n*input_size]; else [B, input_size]
+            out_dim = (n * input_size) if per_layer_noise else input_size
+            self._noise_affine = nn.Linear(noise_dim, out_dim)
+            # Initialize to output ~1.0 so modulation starts as near-identity.
+            nn.init.zeros_(self._noise_affine.weight)
+            nn.init.ones_(self._noise_affine.bias)
+        else:
+            self._noise_affine = None
+
+    def _build_modulation(self, noise: Optional[torch.Tensor], B: int):
+        """
+        Returns modulation m with shape [B, n, input_size].
+        If self._noise_affine is set, `noise` must be [B, noise_dim].
+        Otherwise, `noise` must be either [B, n, input_size] (per-layer)
+        or [B, input_size] (broadcast), depending on self._per_layer_noise.
+        """
+        l = self._input_size
+        n = self._n
+
+        if self._noise_affine is not None:
+            assert noise is not None and noise.dim() == 2 and \
+                noise.size(1) == self._noise_dim, (
+                    "Pass noise as [B, noise_dim] when noise_dim is set.")
+            m = self._noise_affine(noise)  # [B, out_dim]
+            if self._per_layer_noise:
+                m = m.view(noise.size(0), n, l)  # [B, n, l]
+            else:
+                m = m.view(noise.size(0), 1, l).expand(-1, n, -1)  # broadcast to n
+        else:
+            assert noise is not None, (
+                "Provide `noise` when no noise_dim/affine is defined.")
+            if self._per_layer_noise:
+                # expect [B, n, l]
+                if noise.dim() == 2 and noise.size(1) == l:
+                    # allow [B, l] and broadcast across n
+                    m = noise.view(noise.size(0), 1, l).expand(-1, n, -1)
+                else:
+                    assert noise.shape == (B, n, l), (
+                        f"Expected noise [B,{n},{l}] or [B,{l}]")
+                    m = noise
+            else:
+                # expect [B, l], broadcast across n
+                assert noise.dim() == 2 and noise.size(1) == l, (
+                    f"Expected noise [B,{l}]")
+                m = noise.view(noise.size(0), 1, l).expand(-1, n, -1)
+
+        return m
+
+    def forward(self, inputs: torch.Tensor, style: Optional[torch.Tensor] = None,
+                store_inputs: bool = False, id: Optional[int] = None):
+        """
+        inputs:
+            [B, n, input_size] or [B, input_size]
+        style:
+            If style_affine is set: [B, style_dim]
+            Else:
+              - per_layer_style=True : [B, n, input_size] (or [B, input_size] to 
+                broadcast)
+              - per_layer_style=False: [B, input_size] (broadcast to all n)
+        returns:
+            [B, n, output_size]
+        """
+        if id is not None:
+            assert inputs.ndim == 2, (
+                f"inputs must have shape (B, d) for id={id}")
+            return self._selective_forward(inputs, id=id)
+
+        n, k, l = self._weight.shape
+        B = inputs.shape[0]
+
+        # Normalize input shape → [n, B, l]
+        if inputs.ndim == 2:
+            assert inputs.shape[1] == l, (
+                "inputs has wrong shape %s. Expecting (B, %d)" %
+                (inputs.shape, l))
+            inputs = inputs.unsqueeze(0).expand(n, *inputs.shape)
+        elif inputs.ndim == 3:
+            assert (inputs.shape[1] == n and inputs.shape[2] == l), (
+                (inputs.shape, n, l))
+            inputs = inputs.transpose(0, 1)  # [n, B, l]
+        else:
+            raise ValueError("Wrong inputs.ndim=%d" % inputs.ndim)
+
+        if store_inputs:
+            self._inputs = inputs.transpose(0, 1)  # [B, n, l]
+
+        # Build modulation m: [B, n, l] → align to [n, B, l]
+        m = self._build_modulation(noise, B)  # [B, n, l]
+        m = m.transpose(0, 1)  # [n, B, l]
+
+        # Modulate (scale inputs per-sample, per-layer, per-input-dim)
+        x_mod = x * m  # [n, B, l]
+
+        # Linear transform WITHOUT bias first (so we can apply demod then add bias)
+        if self._output_size == 1:
+            # Temp fix due to https://github.com/pytorch/pytorch/issues/106951
+            y_lin = torch.einsum('nbi,ni->nb', x_mod,
+                                 self._weight.squeeze(1))  # [n, B]
+            y_lin = y_lin.unsqueeze(2)  # [n, B, 1]
+        else:
+            # y_lin[n,B,k] = x_mod[n,B,l] @ W[n,k,l]^T
+            y_lin = torch.bmm(x_mod, self._weight.transpose(1, 2))  # [n, B, k]
+
+        # Demodulation (per B,n,k): divide by sqrt(sum_i W^2 * m^2 + eps)
+        if self._demodulate:
+            # w_sq: [n,k,l], m_sq: [n,B,l] → denom_sq: [n,B,k]
+            w_sq = self._weight.pow(2)                     # [n, k, l]
+            m_sq = m.pow(2)                                # [B, n, l]
+            # m_sq[n,B,l] @ w_sq[n,k,l]^T
+            denom_sq = torch.bmm(m_sq, w_sq.transpose(1, 2))  # [n, B, k]
+            denom = torch.sqrt(denom_sq + self._eps)       # [n, B, k]
+            y_lin = y_lin / denom
+
+        # Now add bias (broadcast over batch) if present
+        if self._use_bias:
+            y_lin = y_lin + self._bias.unsqueeze(1)  # [n, 1, k] +→ [n, B, k]
+
+        y = y_lin.transpose(0, 1)  # [B, n, k]
+
+        if self._ln is not None:
+            if self._bias is None:
+                self._ln.bias.data.zero_()
+            y1 = y.reshape(-1, n * k)
+            y1 = self._ln(y1)
+            y = y1.view(-1, n, k)
+
+        if self._bn is not None:
+            if self._bias is None:
+                self._bn.bias.data.zero_()
+            y1 = y.reshape(-1, n * k)
+            y1 = self._bn(y1)
+            y = y1.view(-1, n, k)
+
+        return self._activation(y)
+
+    def _selective_forward(self, inputs, id):
+        """Forward using a selective member of the parallel layer.
+        """
+        # Build modulation m: [B, n, l] → align to [n, B, l]
+        m = self._build_modulation(noise, inputs.shape[0])  # [B, n, l]
+        m = m[:, id, :]  # [B, l]
+        x_mod = x * m  # [B, l]
+
+        weight = self._weight[id]   # [k, l]
+        y = inputs.matmul(self._weight.t())  # [B, k]
+
+        if self._demodulate:
+            w_sq = weight.pow(2)  # [k, l]
+            m_sq = m.pow(2)  # [B, l]
+            denom = torch.sqrt(m_sq @ w_sq.t() + self._eps)  # [B, k]
+            y = y / denom
+
+        if self._use_bias:
+            y = y + self._bias[id]
+
+        if self._use_ln:
+            if not self._use_bias:
+                self._ln.bias.data.zero_()
+            y = self._ln(y)
+        if self._use_bn:
+            y = self._bn(y)
+
+        return self._activation(y)
+
+
+@alf.configurable
 class CompositionalFC(nn.Module):
     """Compositional FC layer."""
 
