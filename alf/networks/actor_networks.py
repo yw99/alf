@@ -288,6 +288,7 @@ class ActorFCNetwork(Network):
                  n_groups=None,
                  use_bias=True,
                  use_ln=False,
+                 last_stochastic=False,
                  activation=torch.relu_,
                  squashing_func=torch.tanh,
                  kernel_initializer=None,
@@ -301,6 +302,8 @@ class ActorFCNetwork(Network):
             fc_layer_params (tuple[int]): a tuple of integers representing hidden
                 FC layer sizes.
             n_groups (int): number of parallel groups.
+            last_stochastic (bool): if True, the last layer will be created by
+                ParallelModulatedFC.
             activation (nn.functional): activation used for hidden layers. The
                 last layer will not be activated.
             squashing_func: the activation function used to squashing
@@ -348,22 +351,23 @@ class ActorFCNetwork(Network):
                 torch.nn.init.uniform_, a=-0.003, b=0.003)
 
         self._squashing_func = squashing_func
-        self._action_layer = layers.ParallelFC(
-            input_size,
-            action_spec.shape[0],
-            n=n_groups,
-            use_bias=use_bias,
-            kernel_initializer=last_kernel_initializer)
+        if last_stochastic:
+            self._action_layer = layers.ParallelModulatedFC(
+                input_size,
+                action_spec.shape[0],
+                n=n_groups,
+                use_bias=use_bias,
+                kernel_initializer=last_kernel_initializer,
+                noise_dim=input_size)
+        else:
+            self._action_layer = layers.ParallelFC(
+                input_size,
+                action_spec.shape[0],
+                n=n_groups,
+                use_bias=use_bias,
+                kernel_initializer=last_kernel_initializer)
 
-        # self._fc_layers.append(
-        #     layers.ParallelFC(
-        #         input_size,
-        #         action_spec.shape[0],
-        #         n=n_groups,
-        #         activation=math_ops.identity,
-        #         use_bias=use_bias,
-        #         kernel_initializer=last_kernel_initializer))
-
+        self._last_stochastic = last_stochastic
         self._output_spec = action_spec
         self._weight_params = [m.weight for m in self._fc_layers] + [
             self._action_layer.weight]
@@ -403,7 +407,7 @@ class ActorFCNetwork(Network):
     def network_kwargs(self):
         return self._network_kwargs
 
-    def forward(self, inputs, full_neurons=False, id=None, state=()):
+    def forward(self, inputs, full_neurons=False, id=None, noise=None, state=()):
         """
         Args:
             inputs (Tensor):
@@ -427,7 +431,10 @@ class ActorFCNetwork(Network):
             else:
                 neurons.append(x)
 
-        pre_activation = self._action_layer(x, id=id)
+        if self._last_stochastic and noise is not None:
+            pre_activation = self._action_layer(x, noise, id=id)
+        else:
+            pre_activation = self._action_layer(x, id=id)
         action = self._squashing_func(pre_activation)
         action = spec_utils.scale_to_spec(action, self._output_spec)
 
