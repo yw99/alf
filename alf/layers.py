@@ -876,6 +876,8 @@ class ParallelFC(nn.Module):
     def _selective_forward(self, inputs, id):
         """Forward using a selective member of the parallel layer.
         """
+        if id < 0 or id >= self._n:
+            raise IndexError(f"Index {id} out of range for {self._n} parallel layers")
         weight = self._weight[id]
         if self._use_bias:
             bias = self._bias[id]
@@ -988,16 +990,23 @@ class ParallelModulatedFC(ParallelFC):
         self._noise_dim = noise_dim
         self._per_layer_noise = per_layer_noise
         if noise_dim is not None:
-            # If per_layer_noise: produce [B, n*input_size]; else [B, input_size]
-            out_dim = (n * input_size) if per_layer_noise else input_size
-            self._noise_affine = nn.Linear(noise_dim, out_dim)
             # Initialize to output ~1.0 so modulation starts as near-identity.
-            nn.init.zeros_(self._noise_affine.weight)
-            nn.init.ones_(self._noise_affine.bias)
+            if per_layer_noise:
+                # If per_layer_noise: produce [B, n, input_size]; 
+                self._noise_affine = ParallelFC(
+                    noise_dim, input_size, n, 
+                    kernel_initializer=nn.init.zeros_,
+                    bias_initializer=nn.init.ones_)
+            else:
+                # produce [B, input_size]
+                self._noise_affine = nn.Linear(noise_dim, input_size)
+                nn.init.zeros_(self._noise_affine.weight)
+                nn.init.ones_(self._noise_affine.bias)
         else:
             self._noise_affine = None
 
-    def _build_modulation(self, noise: Optional[torch.Tensor], B: int):
+    def _build_modulation(self, noise: Optional[torch.Tensor], B: int,
+                          id: Optional[int] = None):
         """
         Returns modulation m with shape [B, n, input_size].
         If self._noise_affine is set, `noise` must be [B, noise_dim].
@@ -1011,10 +1020,8 @@ class ParallelModulatedFC(ParallelFC):
             assert noise is not None and noise.dim() == 2 and \
                 noise.size(1) == self._noise_dim, (
                     "Pass noise as [B, noise_dim] when noise_dim is set.")
-            m = self._noise_affine(noise)  # [B, out_dim]
-            if self._per_layer_noise:
-                m = m.view(noise.size(0), n, l)  # [B, n, l]
-            else:
+            m = self._noise_affine(noise, id=id)  # [B, n, l] or [B, l]
+            if not self._per_layer_noise and id is not None:
                 m = m.view(noise.size(0), 1, l).expand(-1, n, -1)  # broadcast to n
         else:
             assert noise is not None, (
@@ -1022,31 +1029,39 @@ class ParallelModulatedFC(ParallelFC):
             if self._per_layer_noise:
                 # expect [B, n, l]
                 if noise.dim() == 2 and noise.size(1) == l:
-                    # allow [B, l] and broadcast across n
-                    m = noise.view(noise.size(0), 1, l).expand(-1, n, -1)
+                    if id is None:
+                        # allow [B, l] and broadcast across n
+                        m = noise.view(noise.size(0), 1, l).expand(-1, n, -1)
+                    else:
+                        m = noise
                 else:
                     assert noise.shape == (B, n, l), (
                         f"Expected noise [B,{n},{l}] or [B,{l}]")
-                    m = noise
+                    if id is None:
+                        m = noise[:, id, :]
+                    else:
+                        m = noise
             else:
                 # expect [B, l], broadcast across n
                 assert noise.dim() == 2 and noise.size(1) == l, (
                     f"Expected noise [B,{l}]")
-                m = noise.view(noise.size(0), 1, l).expand(-1, n, -1)
-
+                if id is None:
+                    m = noise.view(noise.size(0), 1, l).expand(-1, n, -1)
+                else:
+                    m = noise
         return m
 
-    def forward(self, inputs: torch.Tensor, style: Optional[torch.Tensor] = None,
+    def forward(self, inputs: torch.Tensor, noise: Optional[torch.Tensor] = None,
                 store_inputs: bool = False, id: Optional[int] = None):
         """
         inputs:
             [B, n, input_size] or [B, input_size]
-        style:
-            If style_affine is set: [B, style_dim]
+        noise:
+            If noise_affine is set: [B, noise_dim]
             Else:
-              - per_layer_style=True : [B, n, input_size] (or [B, input_size] to 
+              - per_layer_noise=True : [B, n, input_size] (or [B, input_size] to 
                 broadcast)
-              - per_layer_style=False: [B, input_size] (broadcast to all n)
+              - per_layer_noise=False: [B, input_size] (broadcast to all n)
         returns:
             [B, n, output_size]
         """
@@ -1123,12 +1138,13 @@ class ParallelModulatedFC(ParallelFC):
 
         return self._activation(y)
 
-    def _selective_forward(self, inputs, id):
+    def _selective_forward(self, inputs, noise, id):
         """Forward using a selective member of the parallel layer.
         """
+        if id < 0 or id >= self._n:
+            raise IndexError(f"Index {id} out of range for {self._n} parallel layers")
         # Build modulation m: [B, n, l] → align to [n, B, l]
-        m = self._build_modulation(noise, inputs.shape[0])  # [B, n, l]
-        m = m[:, id, :]  # [B, l]
+        m = self._build_modulation(noise, inputs.shape[0], id=id)  # [B, l]
         x_mod = x * m  # [B, l]
 
         weight = self._weight[id]   # [k, l]
