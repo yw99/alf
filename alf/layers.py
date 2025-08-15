@@ -1068,7 +1068,7 @@ class ParallelModulatedFC(ParallelFC):
         if id is not None:
             assert inputs.ndim == 2, (
                 f"inputs must have shape (B, d) for id={id}")
-            return self._selective_forward(inputs, id=id)
+            return self._selective_forward(inputs, noise=noise, id=id)
 
         n, k, l = self._weight.shape
         B = inputs.shape[0]
@@ -1094,7 +1094,7 @@ class ParallelModulatedFC(ParallelFC):
         m = m.transpose(0, 1)  # [n, B, l]
 
         # Modulate (scale inputs per-sample, per-layer, per-input-dim)
-        x_mod = x * m  # [n, B, l]
+        x_mod = inputs * m  # [n, B, l]
 
         # Linear transform WITHOUT bias first (so we can apply demod then add bias)
         if self._output_size == 1:
@@ -1145,10 +1145,10 @@ class ParallelModulatedFC(ParallelFC):
             raise IndexError(f"Index {id} out of range for {self._n} parallel layers")
         # Build modulation m: [B, n, l] → align to [n, B, l]
         m = self._build_modulation(noise, inputs.shape[0], id=id)  # [B, l]
-        x_mod = x * m  # [B, l]
+        x_mod = inputs * m  # [B, l]
 
         weight = self._weight[id]   # [k, l]
-        y = inputs.matmul(self._weight.t())  # [B, k]
+        y = x_mod.matmul(weight.t())  # [B, k]
 
         if self._demodulate:
             w_sq = weight.pow(2)  # [k, l]
