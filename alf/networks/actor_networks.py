@@ -289,6 +289,7 @@ class ActorFCNetwork(Network):
                  use_bias=True,
                  use_ln=False,
                  last_stochastic=False,
+                 noise_dim=None,
                  activation=torch.relu_,
                  squashing_func=torch.tanh,
                  kernel_initializer=None,
@@ -302,8 +303,10 @@ class ActorFCNetwork(Network):
             fc_layer_params (tuple[int]): a tuple of integers representing hidden
                 FC layer sizes.
             n_groups (int): number of parallel groups.
-            last_stochastic (bool): if True, the last layer will be created by
+            last_stochastic (bool): if True, the action layer will be created by
                 ParallelModulatedFC.
+            noise_dim (int): dimension of the noise. Only effective if last_stochastic.
+                Default to None, i.e., it will be set as the input_size to the action_layer.
             activation (nn.functional): activation used for hidden layers. The
                 last layer will not be activated.
             squashing_func: the activation function used to squashing
@@ -352,13 +355,15 @@ class ActorFCNetwork(Network):
 
         self._squashing_func = squashing_func
         if last_stochastic:
+            if noise_dim is None:
+                noise_dim = input_size
             self._action_layer = layers.ParallelModulatedFC(
                 input_size,
                 action_spec.shape[0],
                 n=n_groups,
                 use_bias=use_bias,
                 kernel_initializer=last_kernel_initializer,
-                noise_dim=input_size)
+                noise_dim=noise_dim)
         else:
             self._action_layer = layers.ParallelFC(
                 input_size,
