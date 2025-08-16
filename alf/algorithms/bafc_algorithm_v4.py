@@ -95,6 +95,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                  actor_critic_pairing=True,
                  use_bootstrap_actors=False,
                  use_bootstrap_critics=False,
+                 use_sample_wise_actor_noise=True,
                  actor_use_ln=False,
                  bootstrap_mask_prob=0.8,
                  bootstrap_mask_type='episode',
@@ -132,6 +133,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 critic during actor training). If True, such a actor-critic pairing is 
                 fixed throughout the training. Otherwise, it is randomized at each
                 actor_train_step.
+            use_sample_wise_actor_noise (bool): whether or not to use sample-wise noise
+                for the stochastic actor network.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -169,6 +172,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         self._actor_critic_pairing = actor_critic_pairing
         self._use_bootstrap_actors = use_bootstrap_actors
         self._use_bootstrap_critics = use_bootstrap_critics
+        self._use_sample_wise_actor_noise = use_sample_wise_actor_noise
         self._bootstrap_mask_prob = bootstrap_mask_prob
         self._bootstrap_mask_type = bootstrap_mask_type
         self._bootstrap_mask = ()
@@ -330,8 +334,11 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
 
     def predict_step(self, inputs: TimeStep, state: BafcActionState):
         if inputs.step_type == StepType.FIRST:
-            self._eval_noise = torch.randn(inputs.observation.shape[0],
-                                           self._actor_noise_dim)
+            if self._use_sample_wise_actor_noise:
+                self._eval_noise = torch.randn(inputs.observation.shape[0],
+                                               self._actor_noise_dim)
+            else:
+                self._eval_noise = torch.randn(1, self._actor_noise_dim)
         action, action_state = self._predict_action(
             self._actor_networks,
             inputs.observation,
@@ -353,8 +360,11 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             if inputs.step_type == StepType.FIRST:
                 # commitment: only resample rollout actor at the beginning of an episode
                 self._rollout_actor_id = torch.randint(self._num_actor_critic, ())
-                self._rollout_noise = torch.randn(
-                    inputs.observation.shape[0], self._actor_noise_dim)
+                if self._use_sample_wise_actor_noise:
+                    self._rollout_noise = torch.randn(
+                        inputs.observation.shape[0], self._actor_noise_dim)
+                else:
+                    self._rollout_noise = torch.randn(1, self._actor_noise_dim)
             if self._use_bootstrap_actors or self._use_bootstrap_critics:
                 # [n_env, n_actors] masks for bootstrap actors
                 prob_t = torch.full(
@@ -396,8 +406,11 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         """
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        actor_noise = torch.randn(self._actor_eval_samples.shape[0],
-                                  self._actor_noise_dim)
+        if self._use_sample_wise_actor_noise:
+            actor_noise = torch.randn(self._actor_eval_samples.shape[0],
+                                      self._actor_noise_dim)
+        else:
+            actor_noise = torch.randn(1, self._actor_noise_dim)
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
             full_neurons=self._actor_eval_type != 'output',
@@ -472,8 +485,11 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                            rollout_info: BafcInfo, action): 
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        actor_noise = torch.randn(self._actor_eval_samples.shape[0],
-                                  self._actor_noise_dim)
+        if self._use_sample_wise_actor_noise:
+            actor_noise = torch.randn(self._actor_eval_samples.shape[0],
+                                      self._actor_noise_dim)
+        else:
+            actor_noise = torch.randn(1, self._actor_noise_dim)
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
             full_neurons=self._actor_eval_type != 'output',
@@ -548,8 +564,11 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         self._training_started = True
 
         # [T*B, n_actor, d_a]
-        actor_noise = torch.randn(inputs.observation.shape[0],
-                                  self._actor_noise_dim)
+        if self._use_sample_wise_actor_noise:
+            actor_noise = torch.randn(inputs.observation.shape[0],
+                                      self._actor_noise_dim)
+        else:
+            actor_noise = torch.randn(1, self._actor_noise_dim)
         action, action_state = self._predict_action(
             self._actor_networks, inputs.observation, 
             state=state.action, noise=actor_noise, train=True)
