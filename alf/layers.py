@@ -995,6 +995,7 @@ class ParallelModulatedFC(ParallelFC):
                 # If per_layer_noise: produce [B, n, input_size]; 
                 self._noise_affine = ParallelFC(
                     noise_dim, input_size, n, 
+                    # use_torch_init=True,
                     kernel_initializer=nn.init.zeros_,
                     bias_initializer=nn.init.ones_)
             else:
