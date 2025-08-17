@@ -289,6 +289,7 @@ class ActorFCNetwork(Network):
                  use_bias=True,
                  use_ln=False,
                  last_stochastic=False,
+                 demodulate=True,
                  noise_dim=None,
                  activation=torch.relu_,
                  squashing_func=torch.tanh,
@@ -363,6 +364,7 @@ class ActorFCNetwork(Network):
                 n=n_groups,
                 use_bias=use_bias,
                 kernel_initializer=last_kernel_initializer,
+                demodulate=demodulate,
                 noise_dim=noise_dim)
         else:
             self._action_layer = layers.ParallelFC(
@@ -444,6 +446,7 @@ class ActorFCNetwork(Network):
         action = spec_utils.scale_to_spec(action, self._output_spec)
 
         if full_neurons:
+            # neurons.append(pre_activation)
             neurons.append(action)
             return neurons, state
         return action, state
