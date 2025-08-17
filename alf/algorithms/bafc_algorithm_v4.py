@@ -95,7 +95,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                  actor_critic_pairing=True,
                  use_bootstrap_actors=False,
                  use_bootstrap_critics=False,
-                 use_sample_wise_actor_noise=True,
+                 use_sample_wise_actor_noise=False,
                  actor_use_ln=False,
                  bootstrap_mask_prob=0.8,
                  bootstrap_mask_type='episode',
@@ -189,16 +189,19 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             actor_eval_samples = 2 * torch.rand(
                 num_actor_eval_samples, observation_spec.shape[0]) - 1
 
-        # extract actor token length from actor_encoder 
+        # extract actor token length from actor_networks 
         if actor_eval_type == 'full':
             actor_token_length = observation_spec.shape[0] + sum( 
-                t.shape[1] for t in actor_networks.bias_params)
+                t.shape[1] for t in actor_networks.bias_params)  # \
+                # + action_spec.shape[0]
         elif actor_eval_type == 'exclude_input':
             actor_token_length = sum( 
-                t.shape[1] for t in actor_networks.bias_params)
+                t.shape[1] for t in actor_networks.bias_params)  # \
+                # + action_spec.shape[0]
         elif actor_eval_type == 'last_two':
             actor_token_length = sum( 
-                t.shape[1] for t in actor_networks.bias_params[-2:])
+                t.shape[1] for t in actor_networks.bias_params[-2:])  # \
+                # + action_spec.shape[0]
         else:
             actor_token_length = action_spec.shape[0]
 
@@ -334,11 +337,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
 
     def predict_step(self, inputs: TimeStep, state: BafcActionState):
         if inputs.step_type == StepType.FIRST:
-            if self._use_sample_wise_actor_noise:
-                self._eval_noise = torch.randn(inputs.observation.shape[0],
-                                               self._actor_noise_dim)
-            else:
-                self._eval_noise = torch.randn(1, self._actor_noise_dim)
+            self._eval_noise = torch.randn(inputs.observation.shape[0],
+                                           self._actor_noise_dim)
         action, action_state = self._predict_action(
             self._actor_networks,
             inputs.observation,
@@ -360,11 +360,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             if inputs.step_type == StepType.FIRST:
                 # commitment: only resample rollout actor at the beginning of an episode
                 self._rollout_actor_id = torch.randint(self._num_actor_critic, ())
-                if self._use_sample_wise_actor_noise:
-                    self._rollout_noise = torch.randn(
-                        inputs.observation.shape[0], self._actor_noise_dim)
-                else:
-                    self._rollout_noise = torch.randn(1, self._actor_noise_dim)
+                self._rollout_noise = torch.randn(
+                    inputs.observation.shape[0], self._actor_noise_dim)
             if self._use_bootstrap_actors or self._use_bootstrap_critics:
                 # [n_env, n_actors] masks for bootstrap actors
                 prob_t = torch.full(
@@ -395,7 +392,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
 
         return eval_out_seq
 
-    def _actor_train_step(self, observation, action, mask, state):
+    def _actor_train_step(self, observation, action, mask, state,
+                          actor_noise=None):
         """Compute the exact off-policy policy gradient from the functional critic,
         which consists of two terms, 
 
@@ -406,11 +404,11 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         """
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        if self._use_sample_wise_actor_noise:
+        if actor_noise is None:
+            assert self._use_sample_wise_actor_noise
             actor_noise = torch.randn(self._actor_eval_samples.shape[0],
                                       self._actor_noise_dim)
-        else:
-            actor_noise = torch.randn(1, self._actor_noise_dim)
+
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
             full_neurons=self._actor_eval_type != 'output',
@@ -482,14 +480,14 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         return critic_state, actor_info
 
     def _critic_train_step(self, observation, state: BafcCriticState, 
-                           rollout_info: BafcInfo, action): 
+                           rollout_info: BafcInfo, action, actor_noise=None): 
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        if self._use_sample_wise_actor_noise:
+        if actor_noise is None:
+            assert self._use_sample_wise_actor_noise
             actor_noise = torch.randn(self._actor_eval_samples.shape[0],
                                       self._actor_noise_dim)
-        else:
-            actor_noise = torch.randn(1, self._actor_noise_dim)
+
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
             full_neurons=self._actor_eval_type != 'output',
@@ -565,13 +563,15 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
 
         # [T*B, n_actor, d_a]
         if self._use_sample_wise_actor_noise:
-            actor_noise = torch.randn(inputs.observation.shape[0],
-                                      self._actor_noise_dim)
+            noise = torch.randn(inputs.observation.shape[0],
+                                self._actor_noise_dim)
+            actor_noise = None
         else:
-            actor_noise = torch.randn(1, self._actor_noise_dim)
+            noise = torch.randn(1, self._actor_noise_dim)
+            actor_noise = noise
         action, action_state = self._predict_action(
             self._actor_networks, inputs.observation, 
-            state=state.action, noise=actor_noise, train=True)
+            state=state.action, noise=noise, train=True)
 
         if self._train_mode == TrainMode.standard or (
                 self._critic_update_counter == 0
@@ -579,10 +579,12 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             actor_action = action  # [T*B, n_actor, d_a]
             actor_state, actor_info = self._actor_train_step(
                 inputs.observation, actor_action, 
-                rollout_info.bootstrap_mask, state.actor)
+                rollout_info.bootstrap_mask, state.actor,
+                actor_noise=actor_noise)
             critic_action = action.reshape(-1, action.shape[-1])  # [T*B * n_actor, d_a]
             critic_state, critic_info = self._critic_train_step(
-                inputs.observation, state.critic, rollout_info, critic_action)
+                inputs.observation, state.critic, rollout_info, critic_action,
+                actor_noise=actor_noise)
             new_state = BafcState(action=action_state,
                                   actor=actor_state,
                                   critic=critic_state)
@@ -591,7 +593,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             if self._train_mode == TrainMode.actor:
                 actor_state, actor_info = self._actor_train_step(
                     inputs.observation, action, 
-                    rollout_info.bootstrap_mask, state.actor)
+                    rollout_info.bootstrap_mask, state.actor,
+                    actor_noise=actor_noise)
                 critic_info = BafcCriticInfo()
                 new_state = BafcState(action=action_state,
                                       actor=actor_state,
@@ -600,7 +603,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             else:
                 action = action.reshape(-1, action.shape[-1])  # [T*B * n_actor, d_a]
                 critic_state, critic_info = self._critic_train_step(
-                    inputs.observation, state.critic, rollout_info, action)
+                    inputs.observation, state.critic, rollout_info, action,
+                    actor_noise=actor_noise)
                 actor_info = LossInfo(extra=BafcActorInfo())
                 new_state = BafcState(action=action_state,
                                       actor=state.actor,
