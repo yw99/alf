@@ -96,6 +96,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                  use_bootstrap_actors=False,
                  use_bootstrap_critics=False,
                  use_sample_wise_actor_noise=False,
+                 use_indep_actor_noise=False,
                  actor_use_ln=False,
                  bootstrap_mask_prob=0.8,
                  bootstrap_mask_type='episode',
@@ -135,6 +136,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 actor_train_step.
             use_sample_wise_actor_noise (bool): whether or not to use sample-wise noise
                 for the stochastic actor network.
+            use_indep_actor_noise (bool): whether or not to use a separate noise for each
+                actor network, only effective when not use_sample_wise_actor_noise.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -173,6 +176,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         self._use_bootstrap_actors = use_bootstrap_actors
         self._use_bootstrap_critics = use_bootstrap_critics
         self._use_sample_wise_actor_noise = use_sample_wise_actor_noise
+        self._use_indep_actor_noise = use_indep_actor_noise
         self._bootstrap_mask_prob = bootstrap_mask_prob
         self._bootstrap_mask_type = bootstrap_mask_type
         self._bootstrap_mask = ()
@@ -567,7 +571,10 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                                 self._actor_noise_dim)
             actor_noise = None
         else:
-            noise = torch.randn(1, self._actor_noise_dim)
+            if self._use_indep_actor_noise:
+                noise = torch.randn(1, self._num_actor_critic, self._actor_noise_dim)
+            else:
+                noise = torch.randn(1, self._actor_noise_dim)
             actor_noise = noise
         action, action_state = self._predict_action(
             self._actor_networks, inputs.observation, 

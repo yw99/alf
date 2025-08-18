@@ -1006,27 +1006,35 @@ class ParallelModulatedFC(ParallelFC):
         else:
             self._noise_affine = None
 
-    def _build_modulation(self, noise: Optional[torch.Tensor], B: int,
-                          id: Optional[int] = None):
+    def _build_modulation(self, noise: Optional[torch.Tensor], id: Optional[int] = None):
         """
+        Shape of input `noise` has several cases:
+
+        1. self._noise_affine is set 
+            If self._per_layer_noise, must be [B, noise_dim] (broadcast to n by ParallelFC)
+            or [B, n, noise_dim].
+            Otherwise, must be [B, noise_dim] (broadcast).
+        2. self._noise_affine is None
+            If self._per_layer_noise, must be [B, n, input_size].
+            Otherwise, must be [B, input_size] (broadcast).
+
         Returns modulation m with shape [B, n, input_size].
-        If self._noise_affine is set, `noise` must be [B, noise_dim].
-        Otherwise, `noise` must be either [B, n, input_size] (per-layer)
-        or [B, input_size] (broadcast), depending on self._per_layer_noise.
         """
+        assert noise is not None, "`noise` has to be provided."
         l = self._input_size
         n = self._n
 
         if self._noise_affine is not None:
-            assert noise is not None and noise.dim() == 2 and \
-                noise.size(1) == self._noise_dim, (
-                    "Pass noise as [B, noise_dim] when noise_dim is set.")
-            m = self._noise_affine(noise, id=id)  # [B, n, l] or [B, l]
-            if not self._per_layer_noise and id is not None:
-                m = m.view(noise.size(0), 1, l).expand(-1, n, -1)  # broadcast to n
+            assert noise.shape[-1] == self._noise_dim, (
+                "Pass noise as [B, noise_dim] or [B, n, noise_dim] when noise_dim is set.")
+            if self._per_layer_noise:
+                m = self._noise_affine(noise, id=id)  # [B, n, l] or [B, l]
+            else:
+                assert noise.ndim == 2, f"Expected noise [B, {self._noise_dim}]"
+                m = self._noise_affine(noise)  # [B, l]
+                if id is None:
+                    m = m.view(noise.size(0), 1, l).expand(-1, n, -1)  # broadcast to n
         else:
-            assert noise is not None, (
-                "Provide `noise` when no noise_dim/affine is defined.")
             if self._per_layer_noise:
                 # expect [B, n, l]
                 if noise.dim() == 2 and noise.size(1) == l:
@@ -1036,9 +1044,10 @@ class ParallelModulatedFC(ParallelFC):
                     else:
                         m = noise
                 else:
-                    assert noise.shape == (B, n, l), (
+                    # assert noise.shape == (B, n, l), (
+                    assert noise.ndim == 3 and noise.shape[1] == n and noise.shape[2] == l, (
                         f"Expected noise [B,{n},{l}] or [B,{l}]")
-                    if id is None:
+                    if id is not None:
                         m = noise[:, id, :]
                     else:
                         m = noise
@@ -1058,7 +1067,10 @@ class ParallelModulatedFC(ParallelFC):
         inputs:
             [B, n, input_size] or [B, input_size]
         noise:
-            If noise_affine is set: [B, noise_dim]
+            If noise_affine is set:
+              - per_layer_noise=True : [B, n, noise_dim] (or [B, noise_dim] to 
+                broadcast)
+              - per_layer_noise=False: [B, noise_dim] (broadcast to all n)
             Else:
               - per_layer_noise=True : [B, n, input_size] (or [B, input_size] to 
                 broadcast)
@@ -1072,7 +1084,6 @@ class ParallelModulatedFC(ParallelFC):
             return self._selective_forward(inputs, noise=noise, id=id)
 
         n, k, l = self._weight.shape
-        B = inputs.shape[0]
 
         # Normalize input shape → [n, B, l]
         if inputs.ndim == 2:
@@ -1091,7 +1102,7 @@ class ParallelModulatedFC(ParallelFC):
             self._inputs = inputs.transpose(0, 1)  # [B, n, l]
 
         # Build modulation m: [B, n, l] → align to [n, B, l]
-        m = self._build_modulation(noise, B)  # [B, n, l]
+        m = self._build_modulation(noise)  # [B, n, l]
         m = m.transpose(0, 1)  # [n, B, l]
 
         # Modulate (scale inputs per-sample, per-layer, per-input-dim)
@@ -1145,7 +1156,7 @@ class ParallelModulatedFC(ParallelFC):
         if id < 0 or id >= self._n:
             raise IndexError(f"Index {id} out of range for {self._n} parallel layers")
         # Build modulation m: [B, n, l] → align to [n, B, l]
-        m = self._build_modulation(noise, inputs.shape[0], id=id)  # [B, l]
+        m = self._build_modulation(noise, id=id)  # [B, l]
         x_mod = inputs * m  # [B, l]
 
         weight = self._weight[id]   # [k, l]
