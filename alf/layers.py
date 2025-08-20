@@ -953,6 +953,7 @@ class ParallelModulatedFC(ParallelFC):
                  noise_dim: Optional[int] = None,
                  per_layer_noise: bool = True,
                  demodulate: bool = True,
+                 detach_demodulate: bool = False,
                  eps: float = 1e-8):
         """
         New Args:
@@ -964,6 +965,9 @@ class ParallelModulatedFC(ParallelFC):
                 ``n * input_size``. If False, affine outputs ``input_size`` and 
                 broadcasts the same modulation to all FC layers.
             demodulate: whether or not apply per-sample output normalization.
+            detach_demodulate: whether or not detach demodulate term. Default is False
+                following the original StyleGAN2. Set it to True for more lower gradient
+                variance.
             esp: numerical stability term for demodulation
         """
         super().__init__(
@@ -985,6 +989,7 @@ class ParallelModulatedFC(ParallelFC):
 
         # Modulation / Demodulation
         self._demodulate = demodulate
+        self._detach_demodulate = detach_demodulate
         self._eps = eps
 
         self._noise_dim = noise_dim
@@ -995,6 +1000,7 @@ class ParallelModulatedFC(ParallelFC):
                 # If per_layer_noise: produce [B, n, input_size]; 
                 self._noise_affine = ParallelFC(
                     noise_dim, input_size, n, 
+                    use_ln=use_ln,
                     # use_torch_init=True,
                     kernel_initializer=nn.init.zeros_,
                     bias_initializer=nn.init.ones_)
@@ -1126,6 +1132,8 @@ class ParallelModulatedFC(ParallelFC):
             # m_sq[n,B,l] @ w_sq[n,k,l]^T
             denom_sq = torch.bmm(m_sq, w_sq.transpose(1, 2))  # [n, B, k]
             denom = torch.sqrt(denom_sq + self._eps)       # [n, B, k]
+            if self._detach_demodulate:
+                denom = denom.detach()
             y_lin = y_lin / denom
 
         # Now add bias (broadcast over batch) if present
@@ -1166,6 +1174,8 @@ class ParallelModulatedFC(ParallelFC):
             w_sq = weight.pow(2)  # [k, l]
             m_sq = m.pow(2)  # [B, l]
             denom = torch.sqrt(m_sq @ w_sq.t() + self._eps)  # [B, k]
+            if self._detach_demodulate:
+                denom = denom.detach()
             y = y / denom
 
         if self._use_bias:

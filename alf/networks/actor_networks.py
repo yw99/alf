@@ -288,8 +288,10 @@ class ActorFCNetwork(Network):
                  n_groups=None,
                  use_bias=True,
                  use_ln=False,
-                 last_stochastic=False,
+                 action_layer_modulated=False,
+                 action_layer_use_ln=False,
                  demodulate=True,
+                 detach_demodulate=False,
                  noise_dim=None,
                  activation=torch.relu_,
                  squashing_func=torch.tanh,
@@ -304,9 +306,10 @@ class ActorFCNetwork(Network):
             fc_layer_params (tuple[int]): a tuple of integers representing hidden
                 FC layer sizes.
             n_groups (int): number of parallel groups.
-            last_stochastic (bool): if True, the action layer will be created by
-                ParallelModulatedFC.
-            noise_dim (int): dimension of the noise. Only effective if last_stochastic.
+            action_layer_modulated (bool): if True, the action layer will be created 
+                by ParallelModulatedFC.
+            action_layer_use_ln (bool): whether or not use_ln for action_layer.
+            noise_dim (int): dimension of the noise. Only effective if action_layer_modulated.
                 Default to None, i.e., it will be set as the input_size to the action_layer.
             activation (nn.functional): activation used for hidden layers. The
                 last layer will not be activated.
@@ -355,7 +358,7 @@ class ActorFCNetwork(Network):
                 torch.nn.init.uniform_, a=-0.003, b=0.003)
 
         self._squashing_func = squashing_func
-        if last_stochastic:
+        if action_layer_modulated:
             if noise_dim is None:
                 noise_dim = input_size
             self._action_layer = layers.ParallelModulatedFC(
@@ -363,8 +366,10 @@ class ActorFCNetwork(Network):
                 action_spec.shape[0],
                 n=n_groups,
                 use_bias=use_bias,
+                use_ln=action_layer_use_ln,
                 kernel_initializer=last_kernel_initializer,
                 demodulate=demodulate,
+                detach_demodulate=detach_demodulate,
                 noise_dim=noise_dim)
         else:
             self._action_layer = layers.ParallelFC(
@@ -372,9 +377,10 @@ class ActorFCNetwork(Network):
                 action_spec.shape[0],
                 n=n_groups,
                 use_bias=use_bias,
+                use_ln=action_layer_use_ln,
                 kernel_initializer=last_kernel_initializer)
 
-        self._last_stochastic = last_stochastic
+        self._action_layer_modulated = action_layer_modulated
         self._output_spec = action_spec
         self._weight_params = [m.weight for m in self._fc_layers] + [
             self._action_layer.weight]
@@ -438,7 +444,7 @@ class ActorFCNetwork(Network):
             else:
                 neurons.append(x)
 
-        if self._last_stochastic and noise is not None:
+        if self._action_layer_modulated and noise is not None:
             pre_activation = self._action_layer(x, noise, id=id)
         else:
             pre_activation = self._action_layer(x, id=id)
