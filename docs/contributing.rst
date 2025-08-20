@@ -9,12 +9,15 @@ Workflow
 
 2. Install code style tools
 
+Needs to be the same as the versions used by the CI docker
+(.ci-cd/Dockerfile_py3.11_torch2.2.cpu). Otherwise may cause CI issue.
+
 .. code-block:: bash
 
-    pip install pre-commit==1.17.0
-    pip install cpplint==1.4.4
-    pip install pydocstyle==4.0.0
-    pip install pylint==2.3.1
+    pip install pre-commit==3.6.2
+    pip install cpplint==1.6.1
+    pip install pydocstyle==6.3.0
+    pip install pylint==2.17.7
     pip install yapf==0.43.0
     sudo apt install clang-format
 
