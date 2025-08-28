@@ -64,6 +64,9 @@ def _define_flags():
         'deterministic implementation.')
     flags.DEFINE_integer('num_episodes', 10, "number of episodes to play")
     flags.DEFINE_integer(
+        'num_steps', None, "If provided, play for exactly this many steps. "
+        "Will override num_episodes.")
+    flags.DEFINE_integer(
         'last_step_repeats', 0,
         "If >0, will repeat such number of times for the last "
         "frame of each episode in the rendered video file.")
@@ -180,6 +183,7 @@ def play():
             algorithm,
             checkpoint_step=FLAGS.checkpoint_step,
             num_episodes=FLAGS.num_episodes,
+            num_steps=FLAGS.num_steps,
             sleep_time_per_step=FLAGS.sleep_time_per_step,
             record_file=FLAGS.record_file,
             append_blank_frames=FLAGS.append_blank_frames,
