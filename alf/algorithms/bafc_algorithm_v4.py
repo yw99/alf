@@ -109,6 +109,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                  obs_action_encoding_dim=64,
                  actor_utd: Optional[int] = None,
                  critic_utd: Optional[int] = None,
+                 eval_samples_slow_timescale: Optional[int] = None,
                  env=None,
                  config: TrainerConfig = None,
                  critic_loss_ctor=None,
@@ -144,7 +145,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 every step of an episode. ``step`` means resampled bootstrap_mask for
                 every step of an episode.
         """
-        assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'output'], (
+        assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'last_three', 
+                                   'output2', 'output_input', 'output'], (
             r"{actor_eval_type} in not supported.")
         assert eval_samples_init_method in ['normal', 'uniform'], (
             r"init method {eval_samples_init_method} is not supported.")
@@ -171,6 +173,9 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             self._actor_utd = actor_utd
             self._critic_utd = critic_utd
 
+        self._eval_samples_utd = None
+        if eval_samples_slow_timescale is not None:
+            self._eval_samples_utd = eval_samples_slow_timescale * critic_utd
         self._num_actor_critic = num_actor_critic
         self._actor_critic_pairing = actor_critic_pairing
         self._use_bootstrap_actors = use_bootstrap_actors
@@ -206,6 +211,15 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             actor_token_length = sum( 
                 t.shape[1] for t in actor_networks.bias_params[-2:])  # \
                 # + action_spec.shape[0]
+        elif actor_eval_type == 'last_three':
+            actor_token_length = sum( 
+                t.shape[1] for t in actor_networks.bias_params[-2:]) \
+                + action_spec.shape[0]
+        elif actor_eval_type == 'output2':
+            actor_token_length = actor_networks.bias_params[-1].shape[1] \
+                + action_spec.shape[0]
+        elif actor_eval_type == 'output_input':
+            actor_token_length = observation_spec.shape[0] + action_spec.shape[0]
         else:
             actor_token_length = action_spec.shape[0]
 
@@ -259,7 +273,11 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             self.add_optimizer(eval_samples_optimizer, [self._actor_eval_samples])
 
         self._actor_networks = actor_networks
-        self._actor_noise_dim = actor_networks._bias_params[-2].shape[1]
+        # assert actor_networks.noise_dim is not None
+        self._actor_noise_dim = actor_networks.noise_dim
+        # self._actor_noise_dim = actor_networks._bias_params[-2].shape[1]
+        self._eval_noise = None
+        self._rollout_noise = None
         self._actor_use_ln = actor_use_ln
         self._actor_eval_type = actor_eval_type
         self._actor_encoder = actor_encoder
@@ -341,8 +359,9 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
 
     def predict_step(self, inputs: TimeStep, state: BafcActionState):
         if inputs.step_type == StepType.FIRST:
-            self._eval_noise = torch.randn(inputs.observation.shape[0],
-                                           self._actor_noise_dim)
+            if self._actor_noise_dim is not None:
+                self._eval_noise = torch.randn(inputs.observation.shape[0],
+                                               self._actor_noise_dim)
         action, action_state = self._predict_action(
             self._actor_networks,
             inputs.observation,
@@ -364,8 +383,9 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             if inputs.step_type == StepType.FIRST:
                 # commitment: only resample rollout actor at the beginning of an episode
                 self._rollout_actor_id = torch.randint(self._num_actor_critic, ())
-                self._rollout_noise = torch.randn(
-                    inputs.observation.shape[0], self._actor_noise_dim)
+                if self._actor_noise_dim is not None:
+                    self._rollout_noise = torch.randn(
+                        inputs.observation.shape[0], self._actor_noise_dim)
             if self._use_bootstrap_actors or self._use_bootstrap_critics:
                 # [n_env, n_actors] masks for bootstrap actors
                 prob_t = torch.full(
@@ -409,9 +429,10 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
         if actor_noise is None:
-            assert self._use_sample_wise_actor_noise
-            actor_noise = torch.randn(self._actor_eval_samples.shape[0],
-                                      self._actor_noise_dim)
+            if self._actor_noise_dim is not None:
+                assert self._use_sample_wise_actor_noise
+                actor_noise = torch.randn(self._actor_eval_samples.shape[0],
+                                          self._actor_noise_dim)
 
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
@@ -419,8 +440,12 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             noise=actor_noise)[0]
         if self._actor_eval_type == 'exclude_input':
             eval_action = eval_action[1:]
-        elif self._actor_eval_type == 'last_two':
+        elif self._actor_eval_type == 'last_three':
+            eval_action = eval_action[-3:]
+        elif self._actor_eval_type in ['last_two', 'output2']:
             eval_action = eval_action[-2:]
+        elif self._actor_eval_type == 'output_input':
+            eval_action = [eval_action[i] for i in (0, -1)]
 
         actor_tokens = self._tokenize_actor_out(eval_action) 
         actor_encoding = self._actor_encoder(actor_tokens)[0]
@@ -449,7 +474,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         dqda = nest_utils.grad(action, q_value.sum(), retain_graph=True)
         # need to exclude the input actor_eval_samples, since they don't requires_grad
         # for actor TrainMode
-        if self._actor_eval_type == 'full':
+        if self._actor_eval_type in ['full', 'output_input']:
             eval_action_in_graph = eval_action[1:]
         else:
             eval_action_in_graph = eval_action
@@ -488,9 +513,10 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
         if actor_noise is None:
-            assert self._use_sample_wise_actor_noise
-            actor_noise = torch.randn(self._actor_eval_samples.shape[0],
-                                      self._actor_noise_dim)
+            if self._actor_noise_dim is not None:
+                assert self._use_sample_wise_actor_noise
+                actor_noise = torch.randn(self._actor_eval_samples.shape[0],
+                                          self._actor_noise_dim)
 
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
@@ -498,8 +524,12 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             noise=actor_noise)[0]
         if self._actor_eval_type == 'exclude_input':
             eval_action = eval_action[1:]
-        elif self._actor_eval_type == 'last_two':
+        elif self._actor_eval_type == 'last_three':
+            eval_action = eval_action[-3:]
+        elif self._actor_eval_type in ['last_two', 'output2']:
             eval_action = eval_action[-2:]
+        elif self._actor_eval_type == 'output_input':
+            eval_action = [eval_action[i] for i in (0, -1)]
 
         actor_tokens = self._tokenize_actor_out(eval_action)
         actor_encoding = self._actor_encoder(actor_tokens)[0]  # [n_actor, d_enc]
@@ -551,7 +581,8 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 # self._critic_network.set_obs_action_batch_dominate(False)
                 for p in self._actor_networks.parameters():
                     p.requires_grad_(False)
-                self._actor_eval_samples.requires_grad_(True)
+                if self._eval_samples_utd is None:
+                    self._actor_eval_samples.requires_grad_(True)
         elif self._train_mode == TrainMode.critic:
             if self._critic_update_counter % self._critic_utd == 0:
                 self._train_mode = TrainMode.actor
@@ -559,23 +590,32 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 for p in self._actor_networks.parameters():
                     p.requires_grad_(True)
                 self._actor_eval_samples.requires_grad_(False)
+            if self._eval_samples_utd is not None:
+                if self._critic_update_counter % self._eval_samples_utd == (
+                   self._eval_samples_utd - 1):
+                    self._actor_eval_samples.requires_grad_(True)
 
     def train_step(self, inputs: TimeStep, state: BafcState,
                    rollout_info: BafcInfo):
         assert not self._is_eval
         self._training_started = True
 
-        # [T*B, n_actor, d_a]
-        if self._use_sample_wise_actor_noise:
-            noise = torch.randn(inputs.observation.shape[0],
-                                self._actor_noise_dim)
-            actor_noise = None
-        else:
-            if self._use_indep_actor_noise:
-                noise = torch.randn(1, self._num_actor_critic, self._actor_noise_dim)
+        if self._actor_noise_dim is not None:
+            # [T*B, n_actor, d_a]
+            if self._use_sample_wise_actor_noise:
+                noise = torch.randn(inputs.observation.shape[0],
+                                    self._actor_noise_dim)
+                actor_noise = None
             else:
-                noise = torch.randn(1, self._actor_noise_dim)
-            actor_noise = noise
+                if self._use_indep_actor_noise:
+                    noise = torch.randn(1, self._num_actor_critic, self._actor_noise_dim)
+                else:
+                    noise = torch.randn(1, self._actor_noise_dim)
+                actor_noise = noise
+        else:
+            noise = None
+            actor_noise = None
+
         action, action_state = self._predict_action(
             self._actor_networks, inputs.observation, 
             state=state.action, noise=noise, train=True)

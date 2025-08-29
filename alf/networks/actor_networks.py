@@ -492,7 +492,7 @@ class ActorFCNetwork(Network):
         action = spec_utils.scale_to_spec(action, self._output_spec)
 
         if full_neurons:
-            # uncomment the line below if actor_eval_type="last_three"
+            # uncomment below if actor_eval_type in ['output2', 'last_three']
             # neurons.append(pre_activation)  
             neurons.append(action)
             return neurons, state
