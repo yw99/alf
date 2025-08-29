@@ -288,6 +288,7 @@ class ActorFCNetwork(Network):
                  n_groups=None,
                  use_bias=True,
                  use_ln=False,
+                 first_layer_modulated=False,
                  action_layer_modulated=False,
                  action_layer_use_ln=False,
                  demodulate=True,
@@ -341,7 +342,33 @@ class ActorFCNetwork(Network):
         else:
             assert isinstance(fc_layer_params, tuple)
 
-        for size in fc_layer_params:
+        if first_layer_modulated:
+            if noise_dim is None:
+                noise_dim = input_size
+            self._fc_layers.append(
+                layers.ParallelModulatedFC(
+                    input_size, 
+                    fc_layer_params[0],
+                    n=n_groups,
+                    use_bias=use_bias,
+                    use_ln=use_ln,
+                    kernel_initializer=kernel_initializer,
+                    demodulate=demodulate,
+                    detach_demodulate=detach_demodulate,
+                    noise_dim=noise_dim))
+        else:
+            self._fc_layers.append(
+                layers.ParallelFC(
+                    input_size,
+                    fc_layer_params[0],
+                    n=n_groups,
+                    activation=activation,
+                    use_bias=use_bias,
+                    use_ln=use_ln,
+                    kernel_initializer=kernel_initializer))
+        input_size = fc_layer_params[0]
+
+        for size in fc_layer_params[1:]:
             self._fc_layers.append(
                 layers.ParallelFC(
                     input_size,
@@ -380,7 +407,9 @@ class ActorFCNetwork(Network):
                 use_ln=action_layer_use_ln,
                 kernel_initializer=last_kernel_initializer)
 
+        self._first_layer_modulated = first_layer_modulated
         self._action_layer_modulated = action_layer_modulated
+        self._noise_dim = noise_dim
         self._output_spec = action_spec
         self._weight_params = [m.weight for m in self._fc_layers] + [
             self._action_layer.weight]
@@ -420,6 +449,10 @@ class ActorFCNetwork(Network):
     def network_kwargs(self):
         return self._network_kwargs
 
+    @property
+    def noise_dim(self):
+        return self._noise_dim
+
     def forward(self, inputs, full_neurons=False, id=None, noise=None, state=()):
         """
         Args:
@@ -429,12 +462,19 @@ class ActorFCNetwork(Network):
         x = inputs
 
         if not full_neurons:
-            for fc_l in self._fc_layers:
+            if self._first_layer_modulated:
+                x = self._fc_layers[0](x, noise, id=id)
+            else:
+                x = self._fc_layers[0](x, id=id)
+            for fc_l in self._fc_layers[1:]:
                 x = fc_l(x, id=id)
         else:
             neurons = []
             if len(self._fc_layers) > 0:
-                x = self._fc_layers[0](x, store_inputs=True)
+                if self._first_layer_modulated:
+                    x = self._fc_layers[0](x, noise, store_inputs=True)
+                else:
+                    x = self._fc_layers[0](x, store_inputs=True)
                 neurons.append(self._fc_layers[0].inputs)
                 neurons.append(x)
                 if len(self._fc_layers) > 1:
@@ -452,7 +492,8 @@ class ActorFCNetwork(Network):
         action = spec_utils.scale_to_spec(action, self._output_spec)
 
         if full_neurons:
-            # neurons.append(pre_activation)
+            # uncomment the line below if actor_eval_type="last_three"
+            # neurons.append(pre_activation)  
             neurons.append(action)
             return neurons, state
         return action, state
