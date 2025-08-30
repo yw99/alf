@@ -104,6 +104,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                  eval_samples_init_method='normal',
                  eval_samples_clipping=False,
                  actor_eval_type='full',
+                 actor_eval_include_input=False,
                  actor_encoder_cls=TransformerEncoder,
                  actor_encoding_dim=128,
                  obs_action_encoding_dim=64,
@@ -145,8 +146,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 every step of an episode. ``step`` means resampled bootstrap_mask for
                 every step of an episode.
         """
-        assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'last_three', 
-                                   'output2', 'output_input', 'output'], (
+        assert actor_eval_type in ['full', 'last_two', 'last_three', 'output2', 'output'], (
             r"{actor_eval_type} in not supported.")
         assert eval_samples_init_method in ['normal', 'uniform'], (
             r"init method {eval_samples_init_method} is not supported.")
@@ -198,12 +198,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             actor_eval_samples = 2 * torch.rand(
                 num_actor_eval_samples, observation_spec.shape[0]) - 1
 
-        # extract actor token length from actor_networks 
         if actor_eval_type == 'full':
-            actor_token_length = observation_spec.shape[0] + sum( 
-                t.shape[1] for t in actor_networks.bias_params)  # \
-                # + action_spec.shape[0]
-        elif actor_eval_type == 'exclude_input':
             actor_token_length = sum( 
                 t.shape[1] for t in actor_networks.bias_params)  # \
                 # + action_spec.shape[0]
@@ -212,16 +207,19 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 t.shape[1] for t in actor_networks.bias_params[-2:])  # \
                 # + action_spec.shape[0]
         elif actor_eval_type == 'last_three':
+            # need to append(pre_activation) in ActorFCNetwork
             actor_token_length = sum( 
                 t.shape[1] for t in actor_networks.bias_params[-2:]) \
-                + action_spec.shape[0]
+                + action_spec.shape[0]  
         elif actor_eval_type == 'output2':
+            # need to append(pre_activation) in ActorFCNetwork
             actor_token_length = actor_networks.bias_params[-1].shape[1] \
                 + action_spec.shape[0]
-        elif actor_eval_type == 'output_input':
-            actor_token_length = observation_spec.shape[0] + action_spec.shape[0]
         else:
             actor_token_length = action_spec.shape[0]
+
+        if actor_eval_include_input:
+            actor_token_length += observation_spec.shape[0]
 
         actor_token_spec = TensorSpec(
             shape=(actor_token_length, num_actor_eval_samples))
@@ -280,6 +278,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         self._rollout_noise = None
         self._actor_use_ln = actor_use_ln
         self._actor_eval_type = actor_eval_type
+        self._actor_eval_include_input = actor_eval_include_input
         self._actor_encoder = actor_encoder
         self._critic_networks = critic_networks
         self._target_critic_networks = critic_networks.copy(
@@ -407,7 +406,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         # To make actor eval_out an input sequence to the transformer, we set
         # n_actor as the batch_size, \sum_d as the length of the sequence, 
         # and num_eval_samples B as the dimension of embedding
-        if self._actor_eval_type == 'output':
+        if (self._actor_eval_type == 'output') and (not self._actor_eval_include_input):
             # [bs, n_actor, d_a] -> [n_actor, d_a, bs]
             eval_out_seq = eval_out.permute(1, 2, 0)
         else:
@@ -434,18 +433,28 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 actor_noise = torch.randn(self._actor_eval_samples.shape[0],
                                           self._actor_noise_dim)
 
+        output_only = (self._actor_eval_type == 'output') and (
+            not self._actor_eval_include_input)
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
-            full_neurons=self._actor_eval_type != 'output',
+            full_neurons=not output_only,
             noise=actor_noise)[0]
-        if self._actor_eval_type == 'exclude_input':
-            eval_action = eval_action[1:]
-        elif self._actor_eval_type == 'last_three':
-            eval_action = eval_action[-3:]
-        elif self._actor_eval_type in ['last_two', 'output2']:
-            eval_action = eval_action[-2:]
-        elif self._actor_eval_type == 'output_input':
-            eval_action = [eval_action[i] for i in (0, -1)]
+
+        if not output_only:
+            inputs = eval_action[:1]
+            all_neurons = eval_action[1:]
+            if self._actor_eval_type == 'full':
+                eval_action = all_neurons
+            elif self._actor_eval_type == 'last_three':
+                eval_action = all_neurons[-3:]
+            elif self._actor_eval_type in ['last_two', 'output2']:
+                eval_action = all_neurons[-2:]
+            else:
+                # actor_eval_type == 'output'
+                eval_action = all_neurons[-1:]
+
+            if self._actor_eval_include_input:
+                eval_action = inputs + eval_action
 
         actor_tokens = self._tokenize_actor_out(eval_action) 
         actor_encoding = self._actor_encoder(actor_tokens)[0]
@@ -474,12 +483,12 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         dqda = nest_utils.grad(action, q_value.sum(), retain_graph=True)
         # need to exclude the input actor_eval_samples, since they don't requires_grad
         # for actor TrainMode
-        if self._actor_eval_type in ['full', 'output_input']:
+        if self._actor_eval_include_input:
             eval_action_in_graph = eval_action[1:]
         else:
             eval_action_in_graph = eval_action
         dqde = nest_utils.grad(eval_action_in_graph, q_value.sum(), 
-                               retain_graph=self._actor_eval_type != 'output')
+                               retain_graph=not output_only)
 
         def action_loss_fn(dqda, a_in):
             if self._dqda_clipping:
@@ -518,18 +527,28 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 actor_noise = torch.randn(self._actor_eval_samples.shape[0],
                                           self._actor_noise_dim)
 
+        output_only = (self._actor_eval_type == 'output') and (
+            not self._actor_eval_include_input)
         eval_action = self._actor_networks(
             self._actor_eval_samples, 
-            full_neurons=self._actor_eval_type != 'output',
+            full_neurons=not output_only,
             noise=actor_noise)[0]
-        if self._actor_eval_type == 'exclude_input':
-            eval_action = eval_action[1:]
-        elif self._actor_eval_type == 'last_three':
-            eval_action = eval_action[-3:]
-        elif self._actor_eval_type in ['last_two', 'output2']:
-            eval_action = eval_action[-2:]
-        elif self._actor_eval_type == 'output_input':
-            eval_action = [eval_action[i] for i in (0, -1)]
+
+        if not output_only:
+            inputs = eval_action[:1]
+            all_neurons = eval_action[1:]
+            if self._actor_eval_type == 'full':
+                eval_action = all_neurons
+            elif self._actor_eval_type == 'last_three':
+                eval_action = all_neurons[-3:]
+            elif self._actor_eval_type in ['last_two', 'output2']:
+                eval_action = all_neurons[-2:]
+            else:
+                # actor_eval_type == 'output'
+                eval_action = all_neurons[-1:]
+
+            if self._actor_eval_include_input:
+                eval_action = inputs + eval_action
 
         actor_tokens = self._tokenize_actor_out(eval_action)
         actor_encoding = self._actor_encoder(actor_tokens)[0]  # [n_actor, d_enc]
