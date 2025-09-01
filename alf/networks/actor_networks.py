@@ -287,6 +287,7 @@ class ActorFCNetwork(Network):
                  fc_layer_params=None,
                  n_groups=None,
                  use_bias=True,
+                 use_bn=False,
                  use_ln=False,
                  first_layer_modulated=False,
                  action_layer_modulated=False,
@@ -307,6 +308,12 @@ class ActorFCNetwork(Network):
             fc_layer_params (tuple[int]): a tuple of integers representing hidden
                 FC layer sizes.
             n_groups (int): number of parallel groups.
+            use_bias (bool): whether to use bias in the network.
+            use_bn (bool): whether to use batch normalization for all layers.
+            use_ln (bool): whether to use layer normalization for all layers except
+                for the action_layer.
+            first_layer_modulated (bool): if True, the first FC layer will be created
+                by ParallelModulatedFC.
             action_layer_modulated (bool): if True, the action layer will be created 
                 by ParallelModulatedFC.
             action_layer_use_ln (bool): whether or not use_ln for action_layer.
@@ -351,6 +358,7 @@ class ActorFCNetwork(Network):
                     fc_layer_params[0],
                     n=n_groups,
                     use_bias=use_bias,
+                    use_bn=use_bn,
                     use_ln=use_ln,
                     kernel_initializer=kernel_initializer,
                     demodulate=demodulate,
@@ -364,6 +372,7 @@ class ActorFCNetwork(Network):
                     n=n_groups,
                     activation=activation,
                     use_bias=use_bias,
+                    use_bn=use_bn,
                     use_ln=use_ln,
                     kernel_initializer=kernel_initializer))
         input_size = fc_layer_params[0]
@@ -376,6 +385,7 @@ class ActorFCNetwork(Network):
                     n=n_groups,
                     activation=activation,
                     use_bias=use_bias,
+                    use_bn=use_bn,
                     use_ln=use_ln,
                     kernel_initializer=kernel_initializer))
             input_size = size
@@ -393,6 +403,7 @@ class ActorFCNetwork(Network):
                 action_spec.shape[0],
                 n=n_groups,
                 use_bias=use_bias,
+                use_bn=use_bn,
                 use_ln=action_layer_use_ln,
                 kernel_initializer=last_kernel_initializer,
                 demodulate=demodulate,
@@ -404,6 +415,7 @@ class ActorFCNetwork(Network):
                 action_spec.shape[0],
                 n=n_groups,
                 use_bias=use_bias,
+                use_bn=use_bn,
                 use_ln=action_layer_use_ln,
                 kernel_initializer=last_kernel_initializer)
 
