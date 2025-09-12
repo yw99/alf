@@ -97,7 +97,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                  use_bootstrap_critics=False,
                  use_sample_wise_actor_noise=False,
                  use_indep_actor_noise=False,
-                 actor_use_ln=False,
+                 actor_use_norm=False,
                  bootstrap_mask_prob=0.8,
                  bootstrap_mask_type='episode',
                  num_actor_eval_samples=256,
@@ -276,7 +276,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         # self._actor_noise_dim = actor_networks._bias_params[-2].shape[1]
         self._eval_noise = None
         self._rollout_noise = None
-        self._actor_use_ln = actor_use_ln
+        self._actor_use_norm = actor_use_norm
         self._actor_eval_type = actor_eval_type
         self._actor_eval_include_input = actor_eval_include_input
         self._actor_encoder = actor_encoder
@@ -341,7 +341,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             action, state = actor_net(
                 observation, noise=noise, state=state.actor_network)
         else:
-            if self._actor_use_ln:
+            if self._actor_use_norm:
                 action, state = actor_net(
                     observation, noise=noise, state=state.actor_network)
                 # [n_env, n_actor, d_a] --> [n_env, d_a]
@@ -479,8 +479,10 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
 
         ## Step 3: exact off-policy policy gradient (OPG)
         #################################################
+
         # This sum() will reduce all dims so q_value can be any rank
         dqda = nest_utils.grad(action, q_value.sum(), retain_graph=True)
+
         # need to exclude the input actor_eval_samples, since they don't requires_grad
         # for actor TrainMode
         if self._actor_eval_include_input:
@@ -489,6 +491,12 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
             eval_action_in_graph = eval_action
         dqde = nest_utils.grad(eval_action_in_graph, q_value.sum(), 
                                retain_graph=not output_only)
+        ## experiment-1
+        # dqde = nest_utils.grad(actor_tokens, q_value.sum(), 
+        #                        retain_graph=not output_only)
+        ## experiment-2
+        # dqde = nest_utils.grad(actor_encoding, q_value.sum(), 
+        #                        retain_graph=False)
 
         def action_loss_fn(dqda, a_in):
             if self._dqda_clipping:
@@ -505,8 +513,16 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
         action_loss = action_loss.sum(-1)
 
         # 2nd term of OPG: loss corresponding to input eval_action
+
         eval_action_loss = nest.map_structure(
             action_loss_fn, dqde, eval_action_in_graph)
+        ## experiment-1
+        # eval_action_loss = nest.map_structure(
+        #     action_loss_fn, dqde, actor_tokens)
+        ## experiment-2
+        # eval_action_loss = nest.map_structure(
+        #     action_loss_fn, dqde, actor_encoding)
+
         # ALF workaround: reduce to scalar_loss and repeat to [T*B]
         # Will be averaged to a scalar_loss in calc_loss
         eval_action_loss = math_ops.add_n(eval_action_loss).mean().repeat(
@@ -602,6 +618,9 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                     p.requires_grad_(False)
                 if self._eval_samples_utd is None:
                     self._actor_eval_samples.requires_grad_(True)
+                elif self._critic_update_counter % self._eval_samples_utd == (
+                        self._eval_samples_utd - 1):
+                    self._actor_eval_samples.requires_grad_(True)
         elif self._train_mode == TrainMode.critic:
             if self._critic_update_counter % self._critic_utd == 0:
                 self._train_mode = TrainMode.actor
@@ -609,7 +628,7 @@ class BafcAlgorithmV4(OffPolicyAlgorithm):
                 for p in self._actor_networks.parameters():
                     p.requires_grad_(True)
                 self._actor_eval_samples.requires_grad_(False)
-            if self._eval_samples_utd is not None:
+            elif self._eval_samples_utd is not None:
                 if self._critic_update_counter % self._eval_samples_utd == (
                    self._eval_samples_utd - 1):
                     self._actor_eval_samples.requires_grad_(True)
