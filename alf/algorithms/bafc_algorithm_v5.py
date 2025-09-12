@@ -76,7 +76,7 @@ class BafcAlgorithmV5(OffPolicyAlgorithm):
 
         Bai et al "Bootstrapped Actors and Functional Critic", arXiv, 2025
 
-    V5 is based on V4. The only difference is to use samples from the training batch
+    V5 is based on V4. The only difference is to use samples sampled on-the-fly
     as actor_eval_samples rather than training it from initialization.
 
     """
@@ -174,6 +174,8 @@ class BafcAlgorithmV5(OffPolicyAlgorithm):
         self._bootstrap_mask_prob = bootstrap_mask_prob
         self._bootstrap_mask_type = bootstrap_mask_type
         self._bootstrap_mask = ()
+        self._actor_eval_samples = torch.randn(
+            num_actor_eval_samples, observation_spec.shape[0])
         actor_networks = actor_network_cls(
             input_tensor_spec=observation_spec,
             action_spec=action_spec,
@@ -414,9 +416,12 @@ class BafcAlgorithmV5(OffPolicyAlgorithm):
 
         output_only = (self._actor_eval_type == 'output') and (
             not self._actor_eval_include_input)
-        actor_eval_samples = observation[:self._num_actor_eval_samples]
+        # actor_eval_samples = torch.randn(
+        #     self._num_actor_eval_samples, observation.shape[-1])
         eval_action = self._actor_networks(
-            actor_eval_samples, 
+            # observation[:self._num_actor_eval_samples],
+            self._actor_eval_samples, 
+            # actor_eval_samples,
             full_neurons=not output_only,
             noise=actor_noise)[0]
 
@@ -525,9 +530,12 @@ class BafcAlgorithmV5(OffPolicyAlgorithm):
 
         output_only = (self._actor_eval_type == 'output') and (
             not self._actor_eval_include_input)
-        actor_eval_samples = observation[:self._num_actor_eval_samples]
+        # actor_eval_samples = torch.randn(
+        #     self._num_actor_eval_samples, observation.shape[-1])
         eval_action = self._actor_networks(
-            actor_eval_samples, 
+            # observation[:self._num_actor_eval_samples],
+            self._actor_eval_samples, 
+            # actor_eval_samples,
             full_neurons=not output_only,
             noise=actor_noise)[0]
 
