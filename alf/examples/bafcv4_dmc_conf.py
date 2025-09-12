@@ -20,13 +20,22 @@ from alf.algorithms.agent import Agent
 from alf.algorithms.bafc_algorithm_v4 import BafcAlgorithmV4
 from alf.algorithms.data_transformer import ObservationNormalizer
 from alf.examples.benchmarks.dm_control import dmc_conf
-from alf.optimizers import Adam
+from alf.optimizers import Adam, AdamW
 
 debug_mode = False
-optimizer = Adam(lr=3e-4)
+# optimizer = Adam(lr=3e-4)
+optimizer = AdamW(lr=3e-4, weight_decay=0)
+# optimizer = Adam(lr=3e-4, gradient_clipping=10.0)
+# actor_optimizer = AdamW(lr=3e-4)
+# actor_encoder_optimizer = AdamW(lr=3e-4)
+actor_encoder_optimizer = AdamW(lr=3e-4, weight_decay=0.001)
+# actor_encoder_optimizer = Adam(lr=3e-4, weight_decay=0.05)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
+actor_use_bn = False
 actor_use_ln = False
+action_layer_use_ln = False
+actor_use_norm = actor_use_bn or (actor_use_ln or action_layer_use_ln)
 
 if debug_mode:
     actor_hidden_layers = (32, 32)
@@ -47,14 +56,22 @@ if obs_normalizer_clipping:
 actor_network_cls = partial(
     alf.networks.ActorFCNetwork,
     fc_layer_params=actor_hidden_layers,
+    use_bn=actor_use_bn,
     use_ln=actor_use_ln,
-    last_stochastic=True)
+    first_layer_modulated=False,
+    action_layer_modulated=False,
+    action_layer_use_ln=action_layer_use_ln,
+    demodulate=True,
+    detach_demodulate=True)
 
 critic_network_cls = partial(
     alf.networks.FuncCriticNetwork,
     obs_action_joint_fc_layer_params=dmc_conf.hidden_layers,
     actor_obs_action_joint_fc_layer_params=joint_hidden_layers,
     use_fc_ln=True)  # turning on critic layernorm is crucial for high utd
+
+actor_encoder_cls = partial(
+    alf.networks.TransformerEncoder, norm_first=True)
 
 alf.config('Agent',
            optimizer=optimizer,
@@ -65,22 +82,28 @@ alf.config(
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
     num_actor_critic=10,
-    actor_critic_pairing=True,
+    actor_critic_pairing=False,
     use_bootstrap_actors=False,
     use_bootstrap_critics=True,
-    actor_use_ln=actor_use_ln,
+    use_sample_wise_actor_noise=False,
+    use_indep_actor_noise=False,
+    actor_use_norm=actor_use_norm,
     bootstrap_mask_prob=0.9,
     bootstrap_mask_type='step',
     num_actor_eval_samples=num_actor_eval_samples,
     eval_samples_init_method='normal',
     eval_samples_clipping=obs_normalizer_clipping,
-    actor_eval_type='output',
+    actor_eval_type='last_three',
+    actor_eval_include_input=True,
+    actor_encoder_cls=actor_encoder_cls,
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,
     actor_utd=1,
     critic_utd=3,
-    # actor_encoder_optimizer=Adam(lr=4e-5),
+    eval_samples_slow_timescale=20,
     # eval_samples_optimizer=Adam(lr=4e-5),
+    # actor_optimizer=actor_optimizer,
+    actor_encoder_optimizer=actor_encoder_optimizer,
     target_critic_tau=0.005,
     target_critic_period=1,
     target_critic_use_ema=False)
@@ -102,10 +125,10 @@ alf.config(
     num_env_steps=int(1e6),
     mini_batch_size=256,
     evaluate=False,
-    debug_summaries=True,
-    summary_interval=100,
-    summarize_grads_and_vars=True,
+    debug_summaries=False,
+    summary_interval=1000,
+    summarize_grads_and_vars=False,
     summarize_gradient_noise_scale=False,
     summarize_action_distributions=False,
     summarize_train_every_mini_batch=True,
-    random_seed=0)
+    random_seed=3)

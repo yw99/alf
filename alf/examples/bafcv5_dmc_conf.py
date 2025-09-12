@@ -24,8 +24,12 @@ from alf.optimizers import Adam, AdamW
 
 debug_mode = False
 optimizer = Adam(lr=3e-4)
+# optimizer = AdamW(lr=3e-4, weight_decay=0)
 # optimizer = Adam(lr=3e-4, gradient_clipping=10.0)
-# optimizer = AdamW(lr=3e-4)
+# actor_optimizer = AdamW(lr=3e-4)
+# actor_encoder_optimizer = AdamW(lr=3e-4)
+# actor_encoder_optimizer = AdamW(lr=3e-4, weight_decay=0.001)
+actor_encoder_optimizer = Adam(lr=3e-4, weight_decay=0.01)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
 actor_use_bn = False
@@ -85,20 +89,21 @@ alf.config(
     use_indep_actor_noise=False,
     actor_use_norm=actor_use_norm,
     bootstrap_mask_prob=0.9,
-    bootstrap_mask_type='step',
+    bootstrap_mask_type='episode',
     num_actor_eval_samples=num_actor_eval_samples,
-    actor_eval_type='last_two',
+    actor_eval_type='last_three',
     actor_eval_include_input=True,
     actor_encoder_cls=actor_encoder_cls,
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,
     actor_utd=1,
     critic_utd=3,
-    # actor_encoder_optimizer=Adam(lr=4e-5),
     # eval_samples_optimizer=Adam(lr=4e-5),
     target_critic_tau=0.005,
     target_critic_period=1,
-    target_critic_use_ema=False)
+    target_critic_use_ema=False,
+    # actor_optimizer=actor_optimizer,
+    actor_encoder_optimizer=actor_encoder_optimizer)
 
 alf.config(
     'TransformerEncoder',
@@ -117,10 +122,10 @@ alf.config(
     num_env_steps=int(1e6),
     mini_batch_size=256,
     evaluate=False,
-    debug_summaries=True,
+    debug_summaries=False,
     summary_interval=1000,
-    summarize_grads_and_vars=True,
+    summarize_grads_and_vars=False,
     summarize_gradient_noise_scale=False,
     summarize_action_distributions=False,
     summarize_train_every_mini_batch=True,
-    random_seed=0)
+    random_seed=2)
