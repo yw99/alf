@@ -33,6 +33,7 @@ from alf.algorithms.config import TrainerConfig
 from alf.environments.alf_environment import AlfEnvironment
 from alf.experience_replayers.replay_buffer import ReplayBuffer
 from alf.data_structures import Experience, make_experience, StepType
+from alf.trainers.evaluator import _allow_child_to_ptrace
 from alf.utils.per_process_context import PerProcessContext
 from alf.utils import dist_utils
 from alf.utils.summary_utils import record_time
@@ -517,6 +518,7 @@ class DistributedTrainer(DistributedOffPolicyAlgorithm):
                                    self._ddp_rank),
                              daemon=True)
         process.start()
+        _allow_child_to_ptrace(process.pid)
 
     def utd(self):
         total_exps = int(self._replay_buffer.get_current_position().sum())
@@ -600,8 +602,10 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
                 user's responsibility to make sure that the env returns ``StepType.LAST``.
                 Otherwise, for every so many experiences, it will set the last exp
                 step type to an artificial ``StepType.LAST``, and switching.
-                For traing safety, it is recommended to always set this value to a
-                positive number.
+                For the RL in real setting where the env never ends an episode,
+                the rl_algorithm needs to use preprocess_experience_for_replay to
+                correctly override the step_type from the env with the one from
+                rollout_info, only then can we set this value to 0.
             unroller_only: if True, will skip the training related steps (including
                 registering to all trainer workers, _create_pull_params_subprocess,
                 _check_params_update observe_for_replay) and do unroll only. Therefore,
@@ -704,6 +708,7 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
                                    self._params_socket_rank),
                              daemon=True)
         process.start()
+        _allow_child_to_ptrace(process.pid)
 
     def observe_for_replay(self, exp: Experience):
         """Send experience data to the trainer.
@@ -713,6 +718,11 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
         """
         if self._unroller_only:
             return
+
+        # Populate information from algorithm (rollout_info) to time_step.
+        # Used to overwrite env reward etc. with task reward generator's output
+        # during async unroll.
+        exp = self._core_alg.preprocess_experience_for_replay(exp)
 
         # Get the current worker id to send the exp to
         worker_id = f'worker-{self._current_worker}'
