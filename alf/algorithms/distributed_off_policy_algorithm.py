@@ -33,7 +33,7 @@ from alf.algorithms.config import TrainerConfig
 from alf.environments.alf_environment import AlfEnvironment
 from alf.experience_replayers.replay_buffer import ReplayBuffer
 from alf.data_structures import Experience, make_experience, StepType
-from alf.trainers.evaluator import _allow_child_to_ptrace
+from alf.utils.common import allow_child_to_ptrace
 from alf.utils.per_process_context import PerProcessContext
 from alf.utils import dist_utils
 from alf.utils.summary_utils import record_time
@@ -218,8 +218,8 @@ def receive_experience_data(replay_buffer: ReplayBuffer,
     conflicts with the training code.
 
     Args:
-        replay_buffer: an instance of ``RelayBuffer`` to store the received
-            experience data. It must have the flag ``allow_multiprocess=True``.
+        replay_buffer: an instance of ``ReplayBuffer`` to store the received
+            experience data.  It must allow multi-processing.
         new_unroller_ips_and_ports: a queue to store the ip and port of
             new unrollers.
         worker_id: the id of the worker; used by each unroller to route the
@@ -506,19 +506,24 @@ class DistributedTrainer(DistributedOffPolicyAlgorithm):
                                                       self._use_rollout_state,
                                                       self.rollout_state_spec,
                                                       self.train_state_spec)
-        self._set_replay_buffer(exp)
 
-        mp.set_start_method('spawn', force=True)
+        # enable multi_processing in replay_buffer here, because we need to
+        # receive data in a subprocess and process the data in the main process.
+        ctx = mp.get_context('spawn')
+        self._set_replay_buffer(exp, mp_context=ctx)
+        assert self._replay_buffer._allow_multiprocess, (
+            "The replay buffer must allow multi-processing.")
+
         # start the data receiver subprocess
         # Need to create the subprocess with 'spawn' so that we can pass a Module
         # object to subprocess with tensors in shared memory.
-        process = mp.Process(target=receive_experience_data,
-                             args=(self._replay_buffer,
-                                   self._new_unroller_ips_and_ports,
-                                   self._ddp_rank),
-                             daemon=True)
+        process = ctx.Process(target=receive_experience_data,
+                              args=(self._replay_buffer,
+                                    self._new_unroller_ips_and_ports,
+                                    self._ddp_rank),
+                              daemon=True)
         process.start()
-        _allow_child_to_ptrace(process.pid)
+        allow_child_to_ptrace(process.pid)
 
     def utd(self):
         total_exps = int(self._replay_buffer.get_current_position().sum())
@@ -708,7 +713,7 @@ class DistributedUnroller(DistributedOffPolicyAlgorithm):
                                    self._params_socket_rank),
                              daemon=True)
         process.start()
-        _allow_child_to_ptrace(process.pid)
+        allow_child_to_ptrace(process.pid)
 
     def observe_for_replay(self, exp: Experience):
         """Send experience data to the trainer.
