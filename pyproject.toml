@@ -3,7 +3,7 @@ requires = [
     "setuptools>=42",
     "wheel",
     "pybind11",
-    "tomli>=1.1; python_version < \"3.11\"",
+    "tomli>=1.1; python_version <= \"3.11\"",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -31,10 +31,10 @@ dependencies = [
     "matplotlib==3.10.1",
     "numpy==1.26",
     "opencv-python==4.11.0.86",
-    "pathos==0.3.3",
+    # "pathos==0.3.4",  pathos removed due to conflict with lerobot (from openpi)
     "pillow>=8",
     "pre-commit==3.6.2",
-    "protobuf>=6.31.1",
+    "protobuf<=4.23",  # to be compatible with openpi/tensorboard 2.15
     "psutil==7.0.0",
     "pybind11==2.13.6",
     "pybullet==2.5.0",
@@ -42,11 +42,11 @@ dependencies = [
     "pylint==2.17.7",
     "pyglet==1.3.2",
     "rectangle-packer==2.0.4",
-    "tensorboard==2.19.0",
+    "tensorboard==2.15.0",
     "threadpoolctl==3.6.0",
-    "torch==2.8.0+cu128",
+    "torch==2.7.1+cu128",
     "torchtext==0.18.0",
-    "torchvision==0.23.0+cu128",
+    "torchvision==0.22.1+cu128",
     "wheel",
     "yapf==0.43.0",
 ]
