@@ -28,7 +28,7 @@ optimizer = AdamW(lr=3e-4, weight_decay=0)
 # optimizer = Adam(lr=3e-4, gradient_clipping=10.0)
 # actor_optimizer = AdamW(lr=3e-4)
 # actor_encoder_optimizer = AdamW(lr=3e-4)
-actor_encoder_optimizer = AdamW(lr=3e-4, weight_decay=0.001)
+actor_encoder_optimizer = AdamW(lr=3e-4, weight_decay=0.005)
 # actor_encoder_optimizer = Adam(lr=3e-4, weight_decay=0.05)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
@@ -100,7 +100,7 @@ alf.config(
     obs_action_encoding_dim=128,
     actor_utd=1,
     critic_utd=3,
-    eval_samples_slow_timescale=20,
+    eval_samples_slow_timescale=50,
     # eval_samples_optimizer=Adam(lr=4e-5),
     # actor_optimizer=actor_optimizer,
     actor_encoder_optimizer=actor_encoder_optimizer,
@@ -121,7 +121,7 @@ alf.config(
     enable_amp=False,
     whole_replay_buffer_training=False,
     clear_replay_buffer=False,
-    num_updates_per_train_iter=8,
+    num_updates_per_train_iter=12,
     num_env_steps=int(1e6),
     mini_batch_size=256,
     evaluate=False,

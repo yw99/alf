@@ -23,13 +23,13 @@ from alf.examples.benchmarks.dm_control import dmc_conf
 from alf.optimizers import Adam, AdamW
 
 debug_mode = False
-optimizer = Adam(lr=3e-4)
-# optimizer = AdamW(lr=3e-4, weight_decay=0)
+# optimizer = Adam(lr=3e-4)
+optimizer = AdamW(lr=3e-4, weight_decay=0)
 # optimizer = Adam(lr=3e-4, gradient_clipping=10.0)
 # actor_optimizer = AdamW(lr=3e-4)
-# actor_encoder_optimizer = AdamW(lr=3e-4)
+actor_encoder_optimizer = AdamW(lr=3e-4)
 # actor_encoder_optimizer = AdamW(lr=3e-4, weight_decay=0.001)
-actor_encoder_optimizer = Adam(lr=3e-4, weight_decay=0.01)
+# actor_encoder_optimizer = Adam(lr=3e-4, weight_decay=0.01)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
 actor_use_bn = False
@@ -89,7 +89,7 @@ alf.config(
     use_indep_actor_noise=False,
     actor_use_norm=actor_use_norm,
     bootstrap_mask_prob=0.9,
-    bootstrap_mask_type='episode',
+    bootstrap_mask_type='step',
     num_actor_eval_samples=num_actor_eval_samples,
     actor_eval_type='last_three',
     actor_eval_include_input=True,
@@ -128,4 +128,4 @@ alf.config(
     summarize_gradient_noise_scale=False,
     summarize_action_distributions=False,
     summarize_train_every_mini_batch=True,
-    random_seed=2)
+    random_seed=0)

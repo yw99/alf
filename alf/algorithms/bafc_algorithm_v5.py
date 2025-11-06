@@ -419,8 +419,8 @@ class BafcAlgorithmV5(OffPolicyAlgorithm):
         # actor_eval_samples = torch.randn(
         #     self._num_actor_eval_samples, observation.shape[-1])
         eval_action = self._actor_networks(
-            # observation[:self._num_actor_eval_samples],
-            self._actor_eval_samples, 
+            observation[:self._num_actor_eval_samples],
+            # self._actor_eval_samples, 
             # actor_eval_samples,
             full_neurons=not output_only,
             noise=actor_noise)[0]
@@ -533,8 +533,8 @@ class BafcAlgorithmV5(OffPolicyAlgorithm):
         # actor_eval_samples = torch.randn(
         #     self._num_actor_eval_samples, observation.shape[-1])
         eval_action = self._actor_networks(
-            # observation[:self._num_actor_eval_samples],
-            self._actor_eval_samples, 
+            observation[:self._num_actor_eval_samples],
+            # self._actor_eval_samples, 
             # actor_eval_samples,
             full_neurons=not output_only,
             noise=actor_noise)[0]

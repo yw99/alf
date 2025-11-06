@@ -37,15 +37,22 @@ import gin
 import itertools
 import json
 from multiprocessing import Queue, Manager
+
+import multiprocessing as std_mp
+if std_mp.get_start_method(allow_none=True) != 'spawn':
+    std_mp.set_start_method('spawn', force=True)
+
 import os
 # `pathos.multiprocessing` provides a consistent interface with std lib `multiprocessing`
 # and it's more flexible
-from pathos import multiprocessing
+# from pathos import multiprocessing
 import pathlib
 import random
 import re
 import subprocess
 import sys
+import stat
+import shutil
 import time
 import torch
 import traceback
@@ -56,6 +63,23 @@ import alf
 from alf.bin.train import _define_flags as _train_define_flags
 from alf.bin.train import _train
 from alf.utils import common
+
+
+def rmtree_force(path):
+    """Remove directory tree, fixing permissions if necessary."""
+    if not os.path.exists(path):
+        return
+    def onerror(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+        except Exception:
+            pass
+        try:
+            func(p)
+        except Exception:
+            logging.exception("Failed to remove %s in onerror", p)
+
+    shutil.rmtree(path, onerror=onerror)
 
 
 def _slugify(value, allow_unicode=False):
@@ -215,6 +239,7 @@ class GridSearch(object):
             conf_file (str): Path to the config file.
         """
         self._conf = GridSearchConfig(conf_file)
+        self._root_dir = FLAGS.root_dir
 
     def _init_device_queue(self, max_worker_num):
         m = Manager()
@@ -315,8 +340,8 @@ class GridSearch(object):
         param_values = self._conf.param_values
         max_worker_num = self._conf.max_worker_num
 
-        process_pool = multiprocessing.Pool(processes=max_worker_num,
-                                            maxtasksperchild=1)
+        process_pool = std_mp.Pool(processes=max_worker_num,
+                                   maxtasksperchild=1)
         device_queue = self._init_device_queue(max_worker_num)
 
         for repeat in range(self._conf.repeats):
@@ -329,7 +354,7 @@ class GridSearch(object):
                 root_dir = common.abs_path(root_dir)
                 process_pool.apply_async(
                     func=self._worker,
-                    args=[root_dir, parameters, device_queue],
+                    args=[root_dir, common.get_conf_file(), parameters, device_queue],
                     error_callback=lambda e: logging.error(e))
 
         process_pool.close()
@@ -338,19 +363,39 @@ class GridSearch(object):
         # Remove the alf snapshot so that it won't waste disk space (we only
         # need snapshots under each search run dir).
         alf_repo = common.abs_path(os.path.join(FLAGS.root_dir, "alf"))
-        os.system("rm -rf %s*" % alf_repo)
+        # os.system("rm -rf %s*" % alf_repo)
+        # use robust removal to avoid permissions/partial-delete issues
+        rmtree_force(alf_repo)
 
-    def _worker(self, root_dir, parameters, device_queue):
+    def _worker(self, root_dir, conf_file, parameters, device_queue):
         # sleep for random seconds to avoid crowded launching
         try:
+            logging.info(">> Entering worker: root_dir=%s; parameters=%s", root_dir, parameters)
             time.sleep(random.uniform(0, 3))
 
-            conf_file = common.get_conf_file()
+            # conf_file = common.get_conf_file()
 
             # We still need to keep a snapshot of ALF repo at ``<root_dir>``
             # for playing individual searching job later
-            os.system(f"mkdir -p {root_dir}; "
-                      f"cp {FLAGS.root_dir}/*.tar.gz {root_dir}/")
+            # os.system(f"mkdir -p {root_dir}; "
+            #           f"cp {FLAGS.root_dir}/*.tar.gz {root_dir}/")
+
+            # # create root_dir and copy any tar.gz snapshots (use Python APIs)
+            # os.makedirs(root_dir, exist_ok=True)
+            # for p in pathlib.Path(FLAGS.root_dir).glob("*.tar.gz"):
+            #     try:
+            #         shutil.copy(p, root_dir)
+            #     except Exception:
+            #         logging.exception("Failed to copy snapshot %s to %s", p, root_dir)
+
+            # create root_dir and copy any tar.gz snapshots from the top-level FLAGS.root_dir once,
+            # but since FLAGS may not be accessible inside subprocess, derive from our own self._root_dir
+            os.makedirs(root_dir, exist_ok=True)
+            for p in pathlib.Path(self._root_dir).glob("*.tar.gz"):
+                try:
+                    shutil.copy(p, root_dir)
+                except Exception:
+                    logging.exception("Failed to copy snapshot %s to %s", p, root_dir)
 
             device = device_queue.get()
             if self._conf.use_gpu:
@@ -364,31 +409,25 @@ class GridSearch(object):
 
             logging.info("Search parameters %s" % parameters)
 
-            if conf_file.endswith('.gin'):
-                common.parse_conf_file(conf_file)
-                # re-bind gin conf params
-                with gin.unlock_config():
-                    gin.parse_config(
-                        ['%s=%s' % (k, v) for k, v in parameters.items()])
-                    gin.parse_config(
-                        "TrainerConfig.confirm_checkpoint_upon_crash=False")
-            else:
-                # need to first pre_config before parsing the conf file
-                confs = copy.copy(parameters)
-                confs.update({
-                    'TrainerConfig.confirm_checkpoint_upon_crash': False
-                })
-                for k, v in confs.items():
-                    if 'version' in k:
-                        continue
-                    if isinstance(v, str):
-                        try:
-                            confs[k] = eval(v)
-                        except NameError:
-                            confs[k] = v
+            # need to first pre_config before parsing the conf file
+            confs = copy.copy(parameters)
+            confs.update({
+                'TrainerConfig.confirm_checkpoint_upon_crash': False
+            })
+            for k, v in confs.items():
+                if 'version' in k:
+                    continue
+                if isinstance(v, str):
+                    try:
+                        confs[k] = eval(v)
+                    except NameError:
+                        confs[k] = v
 
-                alf.pre_config(confs)
+            alf.pre_config(confs)
+            if conf_file is not None:
                 common.parse_conf_file(conf_file)
+            else:
+                logging.warning("No conf_file provided for root_dir=%s", root_dir)
 
             # init env random seed differently for each worker
             alf.get_env()
@@ -397,9 +436,12 @@ class GridSearch(object):
             _train(root_dir)
 
             device_queue.put(device)
-        except Exception as e:
-            logging.info(traceback.format_exc())
-            raise e
+        # except Exception as e:
+        #     logging.info(traceback.format_exc())
+        #     raise e
+        except Exception:
+            logging.exception("Exception in worker for root_dir=%s", root_dir)
+            raise
         finally:
             alf.close_env()
 
@@ -423,20 +465,6 @@ def launch_snapshot_gridsearch():
     # ``<root_dir>/alf_config.py`` or ``<root_dir>/configured.gin``
     conf_file = common.get_conf_file()
     common.parse_conf_file(conf_file)
-    # add version name into root_dir
-    if not conf_file.endswith('.gin'):
-        with open(FLAGS.search_config) as f:
-            search_conf = json.loads(f.read())
-        version = search_conf.get('version', "")
-        # conf_name = conf_file.split('/')[-1].split('_conf.py')[0]
-        root_dir = os.path.join(root_dir, version)
-        os.makedirs(root_dir, exist_ok=True)
-        for i in range(len(sys.argv)):
-            if sys.argv[i] == '--root_dir':
-                sys.argv[i + 1] = root_dir
-            elif '--root_dir' in sys.argv[i]:
-                sys.argv[i] = f"--root_dir={root_dir}"
-
     common.write_config(root_dir)
 
     # generate a snapshot of ALF repo as ``<root_dir>/alf``

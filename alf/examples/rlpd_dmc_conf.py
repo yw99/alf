@@ -39,7 +39,7 @@ alf.config(
     num_sampled_critic_targets=1,  # should be 1 or 2 depending on tasks
     use_bootstrap_critics=False,  # turning to True might lead to larger variance
     bootstrap_mask_prob=0.8,
-    actor_utd=3,
+    actor_utd=1,
     critic_utd=
     10,  # the suggesting utd ratio between critic and actor is [2, 10]
     use_entropy_reward=True,
@@ -52,7 +52,8 @@ alf.config(
     algorithm_ctor=Agent,
     whole_replay_buffer_training=False,
     clear_replay_buffer=False,
-    num_updates_per_train_iter=13,  # actor_utd + critic_utd
+    num_updates_per_train_iter=11,  # actor_utd + critic_utd
+    evaluate=False,
     summarize_gradient_noise_scale=False,
     summarize_action_distributions=False,
     random_seed=0)
