@@ -242,7 +242,7 @@ def training_worker(rank: int,
                 FLAGS(sys.argv, known_only=True)
                 FLAGS.mark_as_parsed()
             dist.init_process_group(
-                'nccl',
+                'gloo',
                 rank=rank,
                 world_size=world_size,
                 timeout=datetime.timedelta(minutes=FLAGS.nccl_timeout))
@@ -302,7 +302,7 @@ def training_worker_multi_node(local_rank: int,
         _setup_device()
 
         # Specialization for distributed mode
-        dist.init_process_group('nccl', rank=rank, world_size=world_size)
+        dist.init_process_group('gloo', rank=rank, world_size=world_size)
         # Recover the flags when spawned as a sub process
         # _define_flags()
         FLAGS(sys.argv, known_only=True)
