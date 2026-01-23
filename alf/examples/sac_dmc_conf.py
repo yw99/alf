@@ -17,7 +17,7 @@ import torch
 
 import alf
 from alf.algorithms.agent import Agent
-from alf.algorithms.bafc_algorithm_v3 import BafcAlgorithmV3
+from alf.algorithms.sac_algorithm import SacAlgorithm
 from alf.algorithms.data_transformer import ObservationNormalizer
 from alf.examples.benchmarks.dm_control import dmc_conf
 from alf.optimizers import Adam
@@ -31,16 +31,11 @@ alf.config('make_ddp_performer', find_unused_parameters=True)
 optimizer = Adam(lr=3e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
-actor_use_ln = False
 
 if debug_mode:
-    actor_hidden_layers = (32, 32)
-    joint_hidden_layers = (32, 32)
-    num_actor_eval_samples = 64
+    hidden_layers = (32, 32)
 else:
-    actor_hidden_layers = (256, 256)
-    joint_hidden_layers = (256, 256)
-    num_actor_eval_samples = 512
+    hidden_layers = (256, 256)
 
 if use_obs_normalizer:
     data_transformer_ctor = ObservationNormalizer
@@ -50,50 +45,25 @@ if obs_normalizer_clipping:
     alf.config('ObservationNormalizer', clipping=1.)
 
 actor_network_cls = partial(
-    alf.networks.ActorFCNetwork,
-    fc_layer_params=actor_hidden_layers,
-    use_ln=actor_use_ln)
+    alf.networks.ActorDistributionNetwork,
+    fc_layer_params=hidden_layers,
+    continuous_projection_net_ctor=dmc_conf.proj_net)
 
 critic_network_cls = partial(
-    alf.networks.FuncCriticNetwork,
-    obs_action_joint_fc_layer_params=dmc_conf.hidden_layers,
-    actor_obs_action_joint_fc_layer_params=joint_hidden_layers,
-    use_fc_ln=True)  # turning on critic layernorm is crucial for high utd
+    alf.networks.CriticNetwork,
+    joint_fc_layer_params=hidden_layers)
 
 alf.config('Agent',
            optimizer=optimizer,
-           rl_algorithm_cls=BafcAlgorithmV3)
+           rl_algorithm_cls=SacAlgorithm)
 
 alf.config(
-    'BafcAlgorithmV3',
+    'SacAlgorithm',
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
-    num_actor_critic=10,
-    actor_critic_pairing=True,
-    use_bootstrap_actors=False,
-    use_bootstrap_critics=False,
-    actor_use_ln=actor_use_ln,
-    bootstrap_mask_prob=0.9,
-    bootstrap_mask_type='episode',
-    num_actor_eval_samples=num_actor_eval_samples,
-    eval_samples_init_method='normal',
-    eval_samples_clipping=obs_normalizer_clipping,
-    actor_eval_type='last_two',
-    actor_encoding_dim=None,
-    obs_action_encoding_dim=128,
-    actor_utd=1,
-    critic_utd=3,
-    # actor_encoder_optimizer=Adam(lr=4e-5),
-    # eval_samples_optimizer=Adam(lr=4e-5),
-    target_critic_tau=0.005,
-    target_critic_period=1,
-    target_critic_use_ema=False)
-
-alf.config(
-    'TransformerEncoder',
-    num_layers=4,
-    num_attention_heads=1,
-    dropout=0.0)
+    num_critic_replicas=2,
+    target_update_tau=0.005,
+    target_update_period=1)
 
 alf.config(
     'TrainerConfig',
@@ -112,4 +82,4 @@ alf.config(
     summarize_gradient_noise_scale=False,
     summarize_action_distributions=False,
     summarize_train_every_mini_batch=True,
-    random_seed=2)
+    random_seed=0)
