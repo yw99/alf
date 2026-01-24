@@ -80,21 +80,24 @@ cd alf
 pip install -e .
 ```
 
+#### Verify Installation
+
+After installation, verify ALF can be imported:
+
+```bash
+python -c "import alf; print('ALF installed successfully')"
+```
+
+If you see CUDA compatibility warnings (e.g., "not compatible with the current PyTorch installation"), see the "Newer GPU Support" section below.
+
+**Note:** To run DMC (DeepMind Control Suite) examples like `td3_dmc_conf.py` or `sac_dmc_conf.py`, you must also install `dm_control`. See the "DeepMind Control Suite" section below.
+
 #### Newer GPU Support (RTX 40/50 series)
 
 ALF's default PyTorch version (2.6.0) only supports CUDA architectures up to sm_90. If you have a newer GPU (e.g., RTX 4090, RTX 5090), you need to upgrade PyTorch:
 
 ```bash
 pip install --upgrade torch torchvision
-```
-
-#### Additional Dependencies
-
-Some ALF features require additional packages not included in the base installation:
-
-```bash
-# Required for neural graph networks
-pip install einops torch_geometric random-fourier-features-pytorch
 ```
 
 #### DeepMind Control Suite

@@ -26,6 +26,7 @@ setup(
         'clang-format==17.0.6',
         'cnest@git+https://github.com/HorizonRobotics/cnest.git',
         'cpplint==2.0.1',
+        'einops',  # required for neural graph networks (relational_transformer.py)
         'fasteners==0.19',
         'gin-config@git+https://github.com/HorizonRobotics/gin-config.git',
         'gym==0.15.4',
@@ -47,6 +48,7 @@ setup(
         'tensorboard==2.19.0',
         'threadpoolctl==3.6.0',
         'torch==2.6.0',
+        'torch_geometric',  # required for neural graph networks (pooling.py)
         'torchtext==0.18.0',
         'torchvision==0.21.0',
         'wheel'
