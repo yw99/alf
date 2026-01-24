@@ -1,18 +1,20 @@
 #!/bin/bash
-# Launcher script for running SAC with 2 seeds in parallel
+# Launcher script for running SAC with 4 seeds in parallel
+# Seeds 0,1 share GPUs 0,1; Seeds 2,3 share GPUs 2,3
 # Each seed uses 2 GPUs via DDP for 2 parallel environments
 
 CONF_FILE="alf/examples/sac_dmc_conf.py"
 ROOT_DIR=${1:-"/workspace/results/sac_dmc"}
 
-echo "Starting SAC training with 2 seeds"
+echo "Starting SAC training with 4 seeds"
 echo "  Config: $CONF_FILE"
 echo "  Root dir: $ROOT_DIR"
 echo ""
 
-mkdir -p "${ROOT_DIR}/seed_0" "${ROOT_DIR}/seed_1"
+mkdir -p "${ROOT_DIR}/seed_0" "${ROOT_DIR}/seed_1" "${ROOT_DIR}/seed_2" "${ROOT_DIR}/seed_3"
 
-CUDA_VISIBLE_DEVICES=0,1 python -m alf.bin.train \
+# Seeds 0,1 share GPUs 0,1 (different MASTER_PORT)
+CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29500 python -m alf.bin.train \
     --conf "$CONF_FILE" \
     --root_dir "${ROOT_DIR}/seed_0" \
     --conf_param "TrainerConfig.random_seed=0" \
@@ -20,7 +22,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m alf.bin.train \
     > "${ROOT_DIR}/seed_0/out.log" 2>&1 &
 PID0=$!
 
-CUDA_VISIBLE_DEVICES=2,3 python -m alf.bin.train \
+CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29501 python -m alf.bin.train \
     --conf "$CONF_FILE" \
     --root_dir "${ROOT_DIR}/seed_1" \
     --conf_param "TrainerConfig.random_seed=1" \
@@ -28,7 +30,26 @@ CUDA_VISIBLE_DEVICES=2,3 python -m alf.bin.train \
     > "${ROOT_DIR}/seed_1/out.log" 2>&1 &
 PID1=$!
 
-echo "Seed 0 running on GPUs 0,1 (PID: $PID0)"
-echo "Seed 1 running on GPUs 2,3 (PID: $PID1)"
+# Seeds 2,3 share GPUs 2,3 (different MASTER_PORT)
+CUDA_VISIBLE_DEVICES=2,3 MASTER_PORT=29502 python -m alf.bin.train \
+    --conf "$CONF_FILE" \
+    --root_dir "${ROOT_DIR}/seed_2" \
+    --conf_param "TrainerConfig.random_seed=2" \
+    --distributed multi-gpu \
+    > "${ROOT_DIR}/seed_2/out.log" 2>&1 &
+PID2=$!
+
+CUDA_VISIBLE_DEVICES=2,3 MASTER_PORT=29503 python -m alf.bin.train \
+    --conf "$CONF_FILE" \
+    --root_dir "${ROOT_DIR}/seed_3" \
+    --conf_param "TrainerConfig.random_seed=3" \
+    --distributed multi-gpu \
+    > "${ROOT_DIR}/seed_3/out.log" 2>&1 &
+PID3=$!
+
+echo "Seed 0 running on GPUs 0,1 port 29500 (PID: $PID0)"
+echo "Seed 1 running on GPUs 0,1 port 29501 (PID: $PID1)"
+echo "Seed 2 running on GPUs 2,3 port 29502 (PID: $PID2)"
+echo "Seed 3 running on GPUs 2,3 port 29503 (PID: $PID3)"
 echo ""
 echo "To monitor: tail -f ${ROOT_DIR}/seed_*/out.log"
