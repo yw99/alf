@@ -80,6 +80,35 @@ cd alf
 pip install -e .
 ```
 
+#### Newer GPU Support (RTX 40/50 series)
+
+ALF's default PyTorch version (2.6.0) only supports CUDA architectures up to sm_90. If you have a newer GPU (e.g., RTX 4090, RTX 5090), you need to upgrade PyTorch:
+
+```bash
+pip install --upgrade torch torchvision
+```
+
+#### Additional Dependencies
+
+Some ALF features require additional packages not included in the base installation:
+
+```bash
+# Required for neural graph networks
+pip install einops torch_geometric random-fourier-features-pytorch
+```
+
+#### DeepMind Control Suite
+
+To run DMC environments (e.g., `td3_dmc_conf.py`, `sac_dmc_conf.py`), install `dm_control`:
+
+```bash
+# Install EGL/OpenGL libraries for headless rendering
+sudo apt install -y libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev
+
+# Install dm_control
+pip install dm_control
+```
+
 #### For Nix Users
 
 There is a built-in Nix-based development environment defined in [flake.nix](./flake.nix). To activate it, run
