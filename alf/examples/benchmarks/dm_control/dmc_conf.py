@@ -69,7 +69,7 @@ optimizer = Adam(lr=3e-4)
 alf.config(
     "TrainerConfig",
     temporally_independent_train_step=True,
-    use_rollout_state=True,
+    use_rollout_state=False,
     async_eval=True,
     initial_collect_steps=10000,
     unroll_length=1,

@@ -34,8 +34,10 @@ obs_normalizer_clipping = False
 
 if debug_mode:
     hidden_layers = (32, 32)
+    initial_collect_steps = 1000
 else:
     hidden_layers = (256, 256)
+    initial_collect_steps = None  # use default from dmc_conf
 
 if use_obs_normalizer:
     data_transformer_ctor = ObservationNormalizer
@@ -83,3 +85,6 @@ alf.config(
     summarize_action_distributions=False,
     summarize_train_every_mini_batch=True,
     random_seed=0)
+
+if initial_collect_steps is not None:
+    alf.config('TrainerConfig', initial_collect_steps=initial_collect_steps)

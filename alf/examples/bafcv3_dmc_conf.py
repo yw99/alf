@@ -37,10 +37,12 @@ if debug_mode:
     actor_hidden_layers = (32, 32)
     joint_hidden_layers = (32, 32)
     num_actor_eval_samples = 64
+    initial_collect_steps = 1000
 else:
     actor_hidden_layers = (256, 256)
     joint_hidden_layers = (256, 256)
     num_actor_eval_samples = 512
+    initial_collect_steps = None  # use default from dmc_conf
 
 if use_obs_normalizer:
     data_transformer_ctor = ObservationNormalizer
@@ -113,3 +115,6 @@ alf.config(
     summarize_action_distributions=False,
     summarize_train_every_mini_batch=True,
     random_seed=2)
+
+if initial_collect_steps is not None:
+    alf.config('TrainerConfig', initial_collect_steps=initial_collect_steps)
