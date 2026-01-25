@@ -44,6 +44,7 @@ setup(
         'pybullet==2.5.0',
         'pylint==3.3.6',
         'pyglet==1.3.2',  # higher version breaks classic control rendering
+        'random-fourier-features-pytorch',  # provides rff module for neural graph networks
         'rectangle-packer==2.0.4',
         'tensorboard==2.19.0',
         'threadpoolctl==3.6.0',

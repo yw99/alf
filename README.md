@@ -100,6 +100,8 @@ ALF's default PyTorch version (2.6.0) only supports CUDA architectures up to sm_
 pip install --upgrade torch torchvision
 ```
 
+**Note:** You will see a pip warning about version incompatibility with ALF's pinned torch version. This is expected and can be safely ignored.
+
 #### DeepMind Control Suite
 
 To run DMC environments (e.g., `td3_dmc_conf.py`, `sac_dmc_conf.py`), install `dm_control`:
