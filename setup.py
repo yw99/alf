@@ -26,6 +26,7 @@ setup(
         'clang-format==17.0.6',
         'cnest@git+https://github.com/HorizonRobotics/cnest.git',
         'cpplint==2.0.1',
+        'dm_control',  # DeepMind Control Suite environments
         'einops',  # required for neural graph networks (relational_transformer.py)
         'fasteners==0.19',
         'gin-config@git+https://github.com/HorizonRobotics/gin-config.git',

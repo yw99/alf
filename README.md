@@ -55,66 +55,51 @@ Read the ALF documentation [here](https://alf.readthedocs.io/).
 
 ## Installation
 
-#### OS software
-The following installation has been tested on Ubuntu22.04 and Ubuntu24.04 with CUDA 11.8.
+### Quick Install (Ubuntu 22.04/24.04)
 
-Python3.10-3.12 is currently supported by ALF. Note that some pip packages (e.g., pybullet) need python dev files, so make sure the corresponding python3-dev package is installed:
+**Prerequisites:** Python 3.10-3.12, CUDA-capable GPU
 
-```
-sudo apt install -y python3.11 python3.11-dev
-```
-
-We also require the following packages: 
-```
-sudo apt install libboost-all-dev   # required by ALF for fast parallel environments.
-sudo apt install ninja-build        # required to build modules via torch.utils.cpp_extension
-sudo apt install swig               # required to build box2d-py
+**Step 1: Install all system dependencies**
+```bash
+sudo apt install -y python3-dev libboost-all-dev ninja-build swig libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev
 ```
 
-#### Python environment
-[Virtualenv](https://virtualenv.pypa.io/en/latest/) is recommended for the installation. After creating and activating a virtual env, you can run the following commands to install ALF:
-
-```
+**Step 2: Install ALF** ([Virtualenv](https://virtualenv.pypa.io/en/latest/) recommended)
+```bash
 git clone https://github.com/HorizonRobotics/alf
 cd alf
 pip install -e .
 ```
 
-#### Verify Installation
+**Step 3: Upgrade PyTorch for newer GPUs (RTX 40/50 series)**
 
-After installation, verify ALF can be imported:
-
-```bash
-python -c "import alf; print('ALF installed successfully')"
-```
-
-If you see CUDA compatibility warnings (e.g., "not compatible with the current PyTorch installation"), see the "Newer GPU Support" section below.
-
-**Note:** To run DMC (DeepMind Control Suite) examples like `td3_dmc_conf.py` or `sac_dmc_conf.py`, you must also install `dm_control`. See the "DeepMind Control Suite" section below.
-
-#### Newer GPU Support (RTX 40/50 series)
-
-ALF's default PyTorch version (2.6.0) only supports CUDA architectures up to sm_90. If you have a newer GPU (e.g., RTX 4090, RTX 5090), you need to upgrade PyTorch:
-
+If you have an RTX 40 series (e.g., RTX 4090) or RTX 50 series (e.g., RTX 5090) GPU, you must upgrade PyTorch:
 ```bash
 pip install --upgrade torch torchvision
 ```
+You will see a pip warning about version incompatibility with ALF's pinned torch version. This is expected and can be safely ignored.
 
-**Note:** You will see a pip warning about version incompatibility with ALF's pinned torch version. This is expected and can be safely ignored.
-
-#### DeepMind Control Suite
-
-To run DMC environments (e.g., `td3_dmc_conf.py`, `sac_dmc_conf.py`), install `dm_control`:
-
+**Step 4: Verify installation**
 ```bash
-# Install EGL/OpenGL libraries for headless rendering
-sudo apt install -y libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev
-
-# Install dm_control
-pip install dm_control
+python -c "import alf; from dm_control import suite; import torch; print(f'ALF installed successfully. CUDA available: {torch.cuda.is_available()}')"
 ```
 
-#### For Nix Users
+If verification fails with `NameError: name 'suite' is not defined`, dm_control was not installed correctly - re-run Step 2.
+If verification fails with CUDA compatibility warnings, you need to run Step 3.
+
+---
+
+### System Dependencies Reference
+
+| Package | Purpose |
+|---------|---------|
+| `python3-dev` | Python development headers (required by pybullet, etc.) |
+| `libboost-all-dev` | Fast parallel environments |
+| `ninja-build` | Building modules via torch.utils.cpp_extension |
+| `swig` | Building box2d-py |
+| `libegl1-mesa-dev`, `libgl1-mesa-dev`, `libgles2-mesa-dev` | DeepMind Control Suite headless rendering |
+
+### For Nix Users
 
 There is a built-in Nix-based development environment defined in [flake.nix](./flake.nix). To activate it, run
 
