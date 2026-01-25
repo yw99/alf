@@ -18,7 +18,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="${SCRIPT_DIR}/td3_dmc_conf.py"
 ENV_NAME="hopper:hop"
-BASE_DIR="/workspace/results-4g"
+BASE_DIR="/workspace/results"
 NUM_ENV_STEPS=1000000
 
 # Parse command line arguments
@@ -50,7 +50,7 @@ done
 
 # Extract domain name for directory (e.g., hopper:hop -> hopper)
 ENV_DIR=$(echo "$ENV_NAME" | cut -d':' -f1)
-ROOT_DIR="${BASE_DIR}/${ENV_DIR}/td3_dmc"
+ROOT_DIR="${BASE_DIR}/${ENV_DIR}/td3_dmc_4g"
 
 echo "Starting TD3 training with 2 seeds"
 echo "  Config: $CONF_FILE"
