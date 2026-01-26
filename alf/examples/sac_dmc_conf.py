@@ -67,6 +67,8 @@ alf.config(
     target_update_tau=0.005,
     target_update_period=1)
 
+alf.config('calc_default_target_entropy', min_prob=0.184)
+
 alf.config(
     'TrainerConfig',
     algorithm_ctor=Agent,
@@ -74,7 +76,7 @@ alf.config(
     enable_amp=False,
     whole_replay_buffer_training=False,
     clear_replay_buffer=False,
-    num_updates_per_train_iter=12,
+    num_updates_per_train_iter=1,
     num_env_steps=int(1e6),
     mini_batch_size=256,
     evaluate=False,
