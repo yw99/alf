@@ -49,7 +49,7 @@ setup(
         'rectangle-packer==2.0.4',
         'tensorboard==2.19.0',
         'threadpoolctl==3.6.0',
-        'torch==2.6.0',
+        # 'torch==2.6.0',
         'torch_geometric',  # required for neural graph networks (pooling.py)
         'torchtext==0.18.0',
         'torchvision==0.21.0',
