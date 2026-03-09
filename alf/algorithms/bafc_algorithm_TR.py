@@ -32,7 +32,7 @@ from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import TensorSpec, BoundedTensorSpec
 from alf.utils import losses, common, math_ops
 from alf.utils.schedulers import Scheduler
-from alf.utils.summary_utils import safe_mean_hist_summary
+from alf.utils.summary_utils import safe_mean_hist_summary, record_time
 
 
 class _Phase(Enum):
@@ -138,9 +138,12 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             trust_metric_num_obs (int): max number of observations used to
                 estimate the Eq. (3.4)-style gradient trust metric each update.
             on_policy_adaptation (bool): if True, set behavior policy equal to
-                reference policy at each epoch start.
+                reference policy at each epoch start so that the rollout policy
+                stays fixed for the full epoch.
             update_critic_in_improve (bool): if True, also update critic during
-                improvement phase.
+                improvement phase. This is kept only as a non-Remark-3 variant;
+                the on-policy adaptation path expects actor-only updates during
+                improvement.
         """
         del calculate_priority, parameter_reset_period, reproduce_locomotion
 
@@ -156,6 +159,10 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             "max_improve_steps_per_epoch must be >= 1")
         assert trust_cov_reg > 0, "trust_cov_reg must be > 0"
         assert trust_metric_num_obs >= 1, "trust_metric_num_obs must be >= 1"
+        assert not (on_policy_adaptation and update_critic_in_improve), (
+            "update_critic_in_improve=True deviates from the Remark-3 "
+            "on-policy adaptation path; disable it or turn off "
+            "on_policy_adaptation.")
 
         self._num_actor_critic = num_actor_critic
         self._actor_critic_pairing = actor_critic_pairing
@@ -503,9 +510,11 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
 
         self._sync_reference_from_current()
         if self._on_policy_adaptation:
+            # Remark 3's on-policy adaptation keeps behavior equal to the
+            # epoch reference policy for the entire epoch.
             self._sync_behavior_from_reference()
 
-        eval_trust = self._compute_eval_trust_metric()
+        # eval_trust = self._compute_eval_trust_metric()
         self._epoch_reset_flag = False
 
         # TODO: Re-enable eval-trust gate (C > C_max) for full Algorithm-3
@@ -516,7 +525,7 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
         #     self._epoch_reset_flag = True
         #     eval_trust = self._compute_eval_trust_metric()
 
-        self._last_eval_trust = eval_trust.detach()
+        self._last_eval_trust = torch.ones_like(self._last_eval_trust) # eval_trust.detach()
         self._last_grad_trust = torch.ones_like(self._last_eval_trust)
         self._eval_step_idx = 0
         self._improve_step_idx = 0
@@ -567,6 +576,9 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
 
     def rollout_step(self, inputs: TimeStep, state: BafcState):
         assert not self._is_eval
+        # Start a new epoch only at rollout boundary (before collecting data).
+        if self._pending_epoch_refresh:
+            self._start_new_epoch(increment_epoch=True)
         first_mask = (inputs.step_type == StepType.FIRST)
         has_first = bool(torch.any(first_mask).item())
         if has_first or self._bootstrap_mask_type == 'step':
@@ -740,116 +752,161 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             mask_flat = info.bootstrap_mask
         return batch_shape, obs_flat, action_flat, mask_flat
 
+    def _build_phase_metrics(self, batch_shape, device):
+        eval_trust = torch.full(
+            batch_shape,
+            float(self._last_eval_trust.item()),
+            dtype=torch.float32,
+            device=device)
+        grad_trust = torch.full(
+            batch_shape,
+            float(self._last_grad_trust.item()),
+            dtype=torch.float32,
+            device=device)
+        return eval_trust, grad_trust
+
+    def _compute_reference_critic_info(self, batch_shape, obs_flat,
+                                       rollout_action_flat, device):
+        ref_action = self._reference_actor_networks(obs_flat)[0]
+        critic_action = ref_action.reshape(-1, ref_action.shape[-1])
+
+        state, critic_info_flat = self._critic_train_step(
+            obs_flat,
+            BafcCriticState(critic=(), target_critic=()),
+            BafcInfo(action=rollout_action_flat),
+            critic_action,
+            actor_source_network=self._reference_actor_networks)
+        del state
+
+        critics = critic_info_flat.critic.reshape(
+            *batch_shape, *critic_info_flat.critic.shape[1:])
+        target_critics = critic_info_flat.target_critic.reshape(
+            *batch_shape, *critic_info_flat.target_critic.shape[1:])
+        eval_trust, _ = self._build_phase_metrics(batch_shape, device)
+
+        return BafcCriticInfo(
+            critic=critics,
+            target_critic=target_critics,
+            eval_trust_metric=eval_trust)
+
+    def _calc_eval_phase_loss(self, info: BafcInfo, batch_shape, obs_flat,
+                              rollout_action_flat, device):
+        eval_trust, grad_trust = self._build_phase_metrics(batch_shape, device)
+        actor_info = LossInfo(extra=BafcActorInfo(
+            eval_action_loss=torch.zeros(batch_shape, device=device),
+            grad_trust_metric=grad_trust))
+        critic_info = self._compute_reference_critic_info(
+            batch_shape, obs_flat, rollout_action_flat, device)
+        merged_info = info._replace(
+            actor=actor_info,
+            critic=critic_info,
+            eval_trust_metric=eval_trust,
+            grad_trust_metric=grad_trust)
+        critic_loss = self._calc_critic_loss(merged_info)
+
+        return LossInfo(
+            loss=critic_loss.loss,
+            scalar_loss=torch.zeros((), dtype=torch.float32, device=device),
+            extra=BafcLossInfo(
+                actor=actor_info.extra, critic=critic_loss.extra))
+
+    def _calc_improve_phase_loss(self, info: BafcInfo, batch_shape, obs_flat,
+                                 rollout_action_flat, mask_flat, device):
+        _, grad_trust = self._build_phase_metrics(batch_shape, device)
+        actor_action = self._actor_networks(obs_flat)[0]
+        _, actor_info_flat = self._actor_train_step(
+            obs_flat, actor_action, mask_flat, ())
+
+        action_loss = actor_info_flat.loss.reshape(batch_shape)
+        eval_action_loss = actor_info_flat.extra.eval_action_loss.reshape(
+            batch_shape)
+        actor_info = LossInfo(
+            loss=action_loss,
+            extra=BafcActorInfo(
+                eval_action_loss=eval_action_loss,
+                grad_trust_metric=grad_trust))
+
+        if self._update_critic_in_improve:
+            critic_info = self._compute_reference_critic_info(
+                batch_shape, obs_flat, rollout_action_flat, device)
+            critic_loss = self._calc_critic_loss(
+                info._replace(actor=actor_info, critic=critic_info))
+        else:
+            critic_loss = LossInfo()
+
+        return LossInfo(
+            loss=math_ops.add_ignore_empty(actor_info.loss, critic_loss.loss),
+            scalar_loss=eval_action_loss.mean(),
+            extra=BafcLossInfo(
+                actor=actor_info.extra, critic=critic_loss.extra))
+
     def calc_loss(self, info: BafcInfo):
+        """Build the per-phase loss for one ALF optimizer update.
+
+        The current on-policy adaptation maps the epoch logic from Remark 3 to
+        ALF as:
+        - EVAL phase: refresh the anchored critic against the epoch reference
+          policy.
+        - IMPROVE phase: keep behavior fixed to the epoch reference policy and
+          take actor-only improvement steps with that anchored critic.
+
+        The explicit trust-metric gates remain disabled for now; epoch
+        termination is still controlled by ``max_improve_steps_per_epoch`` in
+        ``after_update()``.
+        """
         assert not self._is_eval
         self._training_started = True
 
         batch_shape, obs_flat, rollout_action_flat, mask_flat = (
             self._prepare_eval_or_improve_batches(info))
-        t, b = batch_shape
         device = obs_flat.device
 
-        actor_info = LossInfo(extra=BafcActorInfo(
-            eval_action_loss=torch.zeros((t, b), device=device),
-            grad_trust_metric=torch.full(
-                (t, b), float(self._last_grad_trust.item()),
-                dtype=torch.float32,
-                device=device)))
-        critic_info = BafcCriticInfo()
-
         if self._phase == _Phase.EVAL:
-            ref_action = self._reference_actor_networks(obs_flat)[0]
-            critic_action = ref_action.reshape(-1, ref_action.shape[-1])
+            return self._calc_eval_phase_loss(
+                info, batch_shape, obs_flat, rollout_action_flat, device)
 
-            state, critic_info_flat = self._critic_train_step(
-                obs_flat,
-                BafcCriticState(critic=(), target_critic=()),
-                BafcInfo(action=rollout_action_flat),
-                critic_action,
-                actor_source_network=self._reference_actor_networks)
-            del state
+        return self._calc_improve_phase_loss(
+            info, batch_shape, obs_flat, rollout_action_flat, mask_flat,
+            device)
 
-            critics = critic_info_flat.critic.reshape(
-                t, b, *critic_info_flat.critic.shape[1:])
-            target_critics = critic_info_flat.target_critic.reshape(
-                t, b, *critic_info_flat.target_critic.shape[1:])
-            critic_info = BafcCriticInfo(
-                critic=critics,
-                target_critic=target_critics,
-                eval_trust_metric=torch.full(
-                    (t, b), float(self._last_eval_trust.item()),
-                    dtype=torch.float32,
-                    device=device))
+    def _train_iter_on_policy(self):
+        """Run multiple updates per rollout for on-policy BAFC-TR.
 
-            merged_info = info._replace(
-                actor=actor_info,
-                critic=critic_info,
-                eval_trust_metric=torch.full(
-                    (t, b), float(self._last_eval_trust.item()),
-                    dtype=torch.float32,
-                    device=device),
-                grad_trust_metric=torch.full(
-                    (t, b), float(self._last_grad_trust.item()),
-                    dtype=torch.float32,
-                    device=device))
-            critic_loss = self._calc_critic_loss(merged_info)
-            loss = critic_loss.loss
-            scalar_loss = torch.zeros((), dtype=torch.float32, device=device)
-        else:
-            actor_action = self._actor_networks(obs_flat)[0]
-            _, actor_info_flat = self._actor_train_step(
-                obs_flat,
-                actor_action,
-                mask_flat,
-                ())
+        This keeps rollout collection at the train-iter boundary while allowing
+        ``num_updates_per_train_iter`` optimization steps on the same rollout.
+        Epoch refresh is deferred to the next rollout boundary.
+        """
+        alf.summary.increment_global_counter()
 
-            action_loss = actor_info_flat.loss.reshape(t, b)
-            eval_action_loss = actor_info_flat.extra.eval_action_loss.reshape(t, b)
-            actor_info = LossInfo(
-                loss=action_loss,
-                extra=BafcActorInfo(
-                    eval_action_loss=eval_action_loss,
-                    grad_trust_metric=torch.full(
-                        (t, b), float(self._last_grad_trust.item()),
-                        dtype=torch.float32,
-                        device=device)))
+        train_info, loss_info, experience = self._compute_train_info_and_loss_info_on_policy(
+            self._config.unroll_length)
 
-            if self._update_critic_in_improve:
-                ref_action = self._reference_actor_networks(obs_flat)[0]
-                critic_action = ref_action.reshape(-1, ref_action.shape[-1])
-                state, critic_info_flat = self._critic_train_step(
-                    obs_flat,
-                    BafcCriticState(critic=(), target_critic=()),
-                    BafcInfo(action=rollout_action_flat),
-                    critic_action,
-                    actor_source_network=self._reference_actor_networks)
-                del state
-                critics = critic_info_flat.critic.reshape(
-                    t, b, *critic_info_flat.critic.shape[1:])
-                target_critics = critic_info_flat.target_critic.reshape(
-                    t, b, *critic_info_flat.target_critic.shape[1:])
-                critic_info = BafcCriticInfo(
-                    critic=critics,
-                    target_critic=target_critics,
-                    eval_trust_metric=torch.full(
-                        (t, b), float(self._last_eval_trust.item()),
-                        dtype=torch.float32,
-                        device=device))
+        with record_time("time/train"):
+            valid_masks = (experience.step_type != StepType.LAST).to(torch.float32)
+            num_updates = max(1, int(self._config.num_updates_per_train_iter))
+            params = None
+            for update_idx in range(num_updates):
+                # Recompute loss against the current model for additional updates.
+                if update_idx > 0:
+                    loss_info = self.calc_loss(train_info)
+                loss_info, params = self.update_with_gradient(
+                    loss_info, valid_masks)
+                self.after_update(experience.time_step, train_info)
+                # Stop updates for this rollout once the epoch budget is reached.
+                if self._pending_epoch_refresh:
+                    break
 
-                merged_info = info._replace(actor=actor_info, critic=critic_info)
-                critic_loss = self._calc_critic_loss(merged_info)
-            else:
-                critic_loss = LossInfo()
+            self.summarize_train(experience, train_info, loss_info, params)
+            shape = alf.nest.get_nest_shape(experience)
+            steps = shape[0] * shape[1]
 
-            loss = math_ops.add_ignore_empty(actor_info.loss, critic_loss.loss)
-            scalar_loss = eval_action_loss.mean()
+        with record_time("time/after_train_iter"):
+            root_inputs = (
+                experience.time_step
+                if self._config.use_root_inputs_for_after_train_iter else None)
+            self.after_train_iter(root_inputs, train_info)
 
-        return LossInfo(
-            loss=loss,
-            scalar_loss=scalar_loss,
-            extra=BafcLossInfo(
-                actor=actor_info.extra,
-                critic=critic_loss.extra))
+        return steps
 
     def _calc_critic_loss(self, info: BafcInfo):
         if not isinstance(info.critic, BafcCriticInfo) or not isinstance(
@@ -889,6 +946,8 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
         self._update_target_critic()
 
         if self._phase == _Phase.EVAL:
+            # ``policy_eval_updates_per_epoch`` approximates the epoch-local
+            # policy-evaluation subroutine before improvement begins.
             self._eval_step_idx += 1
             if self._eval_step_idx >= self._policy_eval_updates_per_epoch:
                 self._set_phase(_Phase.IMPROVE)
@@ -907,11 +966,11 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
 
             # if (self._last_grad_trust.item() > self._delta_trust_max
             #         or self._improve_step_idx >= self._max_improve_steps_per_epoch):
+            # Until the explicit trust trigger is re-enabled, the current
+            # variant uses ``max_improve_steps_per_epoch`` as a fixed epoch
+            # budget before refreshing the anchored critic.
             if (self._improve_step_idx >= self._max_improve_steps_per_epoch):
                 self._pending_epoch_refresh = True
-
-        if self._pending_epoch_refresh:
-            self._start_new_epoch(increment_epoch=True)
 
         if self._debug_summaries and alf.summary.should_record_summaries():
             self._do_critic_summary = True
