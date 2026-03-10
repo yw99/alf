@@ -28,6 +28,8 @@ optimizer = Adam(lr=3e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
 actor_use_ln = False
+policy_eval_updates_per_epoch = 2
+max_improve_steps_per_epoch = 8
 
 if debug_mode:
     actor_hidden_layers = (32, 32)
@@ -77,8 +79,8 @@ alf.config(
     obs_action_encoding_dim=128,
     eval_trust_max=2.0,
     delta_trust_max=2.0,
-    policy_eval_updates_per_epoch=2,
-    max_improve_steps_per_epoch=8,
+    policy_eval_updates_per_epoch=policy_eval_updates_per_epoch,
+    max_improve_steps_per_epoch=max_improve_steps_per_epoch,
     trust_cov_reg=1e-4,
     on_policy_adaptation=True,
     update_critic_in_improve=False,
@@ -101,7 +103,10 @@ alf.config(
     unroll_length=32,
     mini_batch_length=32,
     mini_batch_size=256,
-    num_updates_per_train_iter=4,
+    # BAFC-TR runs one full epoch per train_iter: all critic eval updates
+    # followed by all actor improve updates on the same rollout.
+    num_updates_per_train_iter=(policy_eval_updates_per_epoch +
+                                max_improve_steps_per_epoch),
     evaluate=False,
     debug_summaries=False,
     summary_interval=1000,

@@ -870,31 +870,48 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             device)
 
     def _train_iter_on_policy(self):
-        """Run multiple updates per rollout for on-policy BAFC-TR.
+        """Run one full BAFC-TR epoch per rollout.
 
-        This keeps rollout collection at the train-iter boundary while allowing
-        ``num_updates_per_train_iter`` optimization steps on the same rollout.
-        Epoch refresh is deferred to the next rollout boundary.
+        Each train iteration starts a fresh epoch, collects one rollout, then
+        runs all policy-evaluation critic updates followed by all policy-
+        improvement actor updates on that same rollout.
         """
         alf.summary.increment_global_counter()
+
+        total_updates = (self._policy_eval_updates_per_epoch +
+                         self._max_improve_steps_per_epoch)
+        if int(self._config.num_updates_per_train_iter) != total_updates:
+            common.warning_once(
+                "BafcAlgorithmTR runs one full epoch per train_iter and "
+                "ignores TrainerConfig.num_updates_per_train_iter=%s; "
+                "using %s updates (%s eval + %s improve)." %
+                (self._config.num_updates_per_train_iter, total_updates,
+                 self._policy_eval_updates_per_epoch,
+                 self._max_improve_steps_per_epoch))
+
+        increment_epoch = (self._phase != _Phase.EVAL or self._eval_step_idx >
+                           0 or self._improve_step_idx > 0
+                           or self._pending_epoch_refresh)
+        self._start_new_epoch(increment_epoch=increment_epoch)
 
         train_info, loss_info, experience = self._compute_train_info_and_loss_info_on_policy(
             self._config.unroll_length)
 
         with record_time("time/train"):
             valid_masks = (experience.step_type != StepType.LAST).to(torch.float32)
-            num_updates = max(1, int(self._config.num_updates_per_train_iter))
             params = None
-            for update_idx in range(num_updates):
-                # Recompute loss against the current model for additional updates.
+            for update_idx in range(self._policy_eval_updates_per_epoch):
                 if update_idx > 0:
                     loss_info = self.calc_loss(train_info)
                 loss_info, params = self.update_with_gradient(
                     loss_info, valid_masks)
                 self.after_update(experience.time_step, train_info)
-                # Stop updates for this rollout once the epoch budget is reached.
-                if self._pending_epoch_refresh:
-                    break
+
+            for _ in range(self._max_improve_steps_per_epoch):
+                loss_info = self.calc_loss(train_info)
+                loss_info, params = self.update_with_gradient(
+                    loss_info, valid_masks)
+                self.after_update(experience.time_step, train_info)
 
             self.summarize_train(experience, train_info, loss_info, params)
             shape = alf.nest.get_nest_shape(experience)

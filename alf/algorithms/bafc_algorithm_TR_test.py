@@ -28,7 +28,13 @@ from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 class BafcAlgorithmTRTest(alf.test.TestCase):
 
     def _make_alg(self, **kwargs):
-        num_updates_per_train_iter = kwargs.pop("num_updates_per_train_iter", 1)
+        policy_eval_updates_per_epoch = kwargs.pop(
+            "policy_eval_updates_per_epoch", 1)
+        max_improve_steps_per_epoch = kwargs.pop("max_improve_steps_per_epoch",
+                                                 1)
+        num_updates_per_train_iter = kwargs.pop(
+            "num_updates_per_train_iter",
+            policy_eval_updates_per_epoch + max_improve_steps_per_epoch)
         obs_spec = TensorSpec((4, ))
         action_spec = BoundedTensorSpec((2, ), minimum=-1.0, maximum=1.0)
         config = TrainerConfig(
@@ -50,8 +56,8 @@ class BafcAlgorithmTRTest(alf.test.TestCase):
                 TransformerEncoder, num_layers=2, num_attention_heads=1),
             num_actor_critic=3,
             num_actor_eval_samples=32,
-            policy_eval_updates_per_epoch=1,
-            max_improve_steps_per_epoch=1,
+            policy_eval_updates_per_epoch=policy_eval_updates_per_epoch,
+            max_improve_steps_per_epoch=max_improve_steps_per_epoch,
             **kwargs)
 
     def _make_update_time_step(self, t=2, b=3):
@@ -169,8 +175,11 @@ class BafcAlgorithmTRTest(alf.test.TestCase):
                 AssertionError, "update_critic_in_improve=True deviates"):
             self._make_alg(update_critic_in_improve=True)
 
-    def test_train_iter_on_policy_reuses_rollout_for_multiple_updates(self):
-        alg = self._make_alg(num_updates_per_train_iter=3)
+    def test_train_iter_on_policy_runs_full_epoch(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=1,
+            policy_eval_updates_per_epoch=2,
+            max_improve_steps_per_epoch=3)
         Experience = namedtuple("Experience", ["step_type", "time_step"])
         time_step = self._make_update_time_step()
         experience = Experience(
@@ -183,6 +192,7 @@ class BafcAlgorithmTRTest(alf.test.TestCase):
             "after_iter": 0,
         }
         calc_phases = []
+        update_phases = []
 
         def fake_compute(self, unroll_length):
             del unroll_length
@@ -198,6 +208,7 @@ class BafcAlgorithmTRTest(alf.test.TestCase):
         def fake_update(self, loss_info, valid_masks):
             del valid_masks
             call_counts["update"] += 1
+            update_phases.append(self._phase.value)
             return loss_info, ["param"]
 
         def fake_summarize(self, experience, train_info, loss_info, params):
@@ -218,13 +229,59 @@ class BafcAlgorithmTRTest(alf.test.TestCase):
         alg.train_iter()
 
         self.assertEqual(call_counts["compute"], 1)
-        self.assertEqual(call_counts["update"], 2)
-        self.assertEqual(call_counts["calc"], 1)
-        self.assertEqual(calc_phases, ["improve"])
+        self.assertEqual(call_counts["update"], 5)
+        self.assertEqual(call_counts["calc"], 4)
+        self.assertEqual(calc_phases, ["eval", "improve", "improve", "improve"])
+        self.assertEqual(update_phases,
+                         ["eval", "eval", "improve", "improve", "improve"])
         self.assertEqual(call_counts["summarize"], 1)
         self.assertEqual(call_counts["after_iter"], 1)
         self.assertEqual(alg._phase.value, "improve")
         self.assertTrue(alg._pending_epoch_refresh)
+
+    def test_train_iter_starts_new_epoch_before_rollout(self):
+        alg = self._make_alg(
+            policy_eval_updates_per_epoch=1,
+            max_improve_steps_per_epoch=1)
+        Experience = namedtuple("Experience", ["step_type", "time_step"])
+        time_step = self._make_update_time_step()
+        experience = Experience(
+            step_type=time_step.step_type, time_step=time_step)
+        compute_epochs = []
+        compute_phases = []
+
+        def fake_compute(self, unroll_length):
+            del unroll_length
+            compute_epochs.append(self._epoch_idx)
+            compute_phases.append(self._phase.value)
+            return BafcInfo(), LossInfo(loss=torch.ones(2, 3)), experience
+
+        def fake_update(self, loss_info, valid_masks):
+            del valid_masks
+            return loss_info, ["param"]
+
+        def fake_calc(self, info):
+            del info
+            return LossInfo(loss=torch.ones(2, 3))
+
+        def fake_summarize(self, experience, train_info, loss_info, params):
+            del experience, train_info, loss_info, params
+
+        def fake_after_iter(self, root_inputs, train_info):
+            del root_inputs, train_info
+
+        alg._compute_train_info_and_loss_info_on_policy = MethodType(
+            fake_compute, alg)
+        alg.calc_loss = MethodType(fake_calc, alg)
+        alg.update_with_gradient = MethodType(fake_update, alg)
+        alg.summarize_train = MethodType(fake_summarize, alg)
+        alg.after_train_iter = MethodType(fake_after_iter, alg)
+
+        alg.train_iter()
+        alg.train_iter()
+
+        self.assertEqual(compute_epochs, [0, 1])
+        self.assertEqual(compute_phases, ["eval", "eval"])
 
 
 if __name__ == "__main__":
