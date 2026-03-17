@@ -666,6 +666,8 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             (actor_encoding, (critic_observation, action)), ())
 
         dqda = nest_utils.grad(action, q_value.sum(), retain_graph=True)
+        clipped_dqda = self._clip_gradient(dqda)
+        self._summarize_dqda_norms(dqda, clipped_dqda)
         if self._actor_eval_type == 'full':
             eval_action_in_graph = eval_action[1:]
         else:
@@ -674,22 +676,20 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             eval_action_in_graph,
             q_value.sum(),
             retain_graph=self._actor_eval_type != 'output')
+        clipped_dqde = self._clip_gradient(dqde)
 
-        def action_loss_fn(dqda, a_in):
-            if self._dqda_clipping:
-                dqda = torch.clamp(dqda, -self._dqda_clipping,
-                                   self._dqda_clipping)
+        def action_loss_fn(grad, a_in):
             loss = 0.5 * losses.element_wise_squared_loss(
-                (dqda + a_in).detach(), a_in)
+                (grad + a_in).detach(), a_in)
             return loss.sum(list(range(2, loss.ndim)))
 
-        action_loss = nest.map_structure(action_loss_fn, dqda, action)
+        action_loss = nest.map_structure(action_loss_fn, clipped_dqda, action)
         if self._use_bootstrap_actors and isinstance(mask, torch.Tensor):
             action_loss = action_loss * mask / self._bootstrap_mask_prob
         action_loss = action_loss.sum(-1)
 
         eval_action_loss = nest.map_structure(
-            action_loss_fn, dqde, eval_action_in_graph)
+            action_loss_fn, clipped_dqde, eval_action_in_graph)
         eval_action_loss = math_ops.add_n(eval_action_loss).mean().repeat(
             action_loss.shape[0])
 
@@ -765,6 +765,65 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             device=device)
         return eval_trust, grad_trust
 
+    def _record_debug_scalar(self, name: str, value):
+        if not (self._debug_summaries and alf.summary.should_record_summaries()):
+            return
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            if value.numel() != 1:
+                value = value.mean()
+            value = float(value.item())
+        else:
+            value = float(value)
+        with alf.summary.scope(self._name):
+            alf.summary.scalar(name, value)
+
+    def _nested_global_norm(self, value):
+        sq_norm = None
+        for leaf in nest.flatten(value):
+            if leaf is None:
+                continue
+            leaf_sq_norm = leaf.detach().pow(2).sum()
+            sq_norm = leaf_sq_norm if sq_norm is None else sq_norm + leaf_sq_norm
+        if sq_norm is None:
+            return torch.zeros(())
+        return torch.sqrt(sq_norm)
+
+    def _clip_gradient(self, grad):
+        if not self._dqda_clipping:
+            return grad
+        return nest.map_structure(
+            lambda x: None if x is None else torch.clamp(
+                x, -self._dqda_clipping, self._dqda_clipping), grad)
+
+    def _summarize_action_bound_fraction(self, action, name: str):
+        if not isinstance(action, torch.Tensor):
+            return
+        bound_fraction = action.detach().abs().gt(0.95).to(
+            torch.float32).mean()
+        self._record_debug_scalar(name, bound_fraction)
+
+    def _summarize_dqda_norms(self, dqda, clipped_dqda):
+        self._record_debug_scalar("dqda_global_norm",
+                                  self._nested_global_norm(dqda))
+        self._record_debug_scalar("clipped_dqda_global_norm",
+                                  self._nested_global_norm(clipped_dqda))
+
+    @torch.no_grad()
+    def _summarize_policy_action_distances(self, observation, current_action):
+        if not isinstance(observation, torch.Tensor) or not isinstance(
+                current_action, torch.Tensor):
+            return
+        ref_action = self._reference_actor_networks(observation)[0]
+        beh_action = self._behavior_actor_networks(observation)[0]
+        current_action = current_action.detach()
+        current_vs_ref = (current_action - ref_action).pow(2).sum(-1).sqrt().mean()
+        current_vs_beh = (current_action - beh_action).pow(2).sum(-1).sqrt().mean()
+        self._record_debug_scalar("current_vs_reference_action_distance",
+                                  current_vs_ref)
+        self._record_debug_scalar("current_vs_behavior_action_distance",
+                                  current_vs_beh)
+
     def _compute_reference_critic_info(self, batch_shape, obs_flat,
                                        rollout_action_flat, device):
         ref_action = self._reference_actor_networks(obs_flat)[0]
@@ -814,6 +873,9 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
                                  rollout_action_flat, mask_flat, device):
         _, grad_trust = self._build_phase_metrics(batch_shape, device)
         actor_action = self._actor_networks(obs_flat)[0]
+        self._summarize_action_bound_fraction(
+            actor_action, "current_action_at_bounds_fraction")
+        self._summarize_policy_action_distances(obs_flat, actor_action)
         _, actor_info_flat = self._actor_train_step(
             obs_flat, actor_action, mask_flat, ())
 
@@ -998,3 +1060,8 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
                 alf.summary.scalar('eval_trust_metric', float(self._last_eval_trust.item()))
                 alf.summary.scalar('grad_trust_metric', float(self._last_grad_trust.item()))
                 alf.summary.scalar('epoch_reset_flag', float(self._epoch_reset_flag))
+
+
+# MEETING NOTE:
+# - Change to Beta projection network from Gaussian here for stability
+# - Run existing AC and PPO on Cheetah-run to see behaviors
