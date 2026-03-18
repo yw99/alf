@@ -39,9 +39,36 @@ from alf.utils.common import lazy_load_extension
 import pathlib
 
 DIR = pathlib.Path(__file__).parent.absolute()
+
+
+def _get_penv_include_paths():
+    """Get extra include paths for building the ``penv`` C++ extension.
+
+    ``torch.utils.cpp_extension.load`` does not include ``$CONDA_PREFIX/include``
+    by default. On conda-based setups this can hide Boost headers even when
+    they are installed in the active environment.
+    """
+    candidates = [os.path.join(sys.prefix, "include")]
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        candidates.append(os.path.join(conda_prefix, "include"))
+
+    include_paths = []
+    for path in candidates:
+        # Only append paths that contain the specific Boost header required by
+        # parallel_environment.cpp. This keeps behavior unchanged on setups
+        # where Boost is already in the default compiler search paths.
+        boost_header = os.path.join(
+            path, "boost", "interprocess", "ipc", "message_queue.hpp")
+        if os.path.isfile(boost_header) and path not in include_paths:
+            include_paths.append(path)
+    return include_paths
+
+
 _penv = lazy_load_extension(
     name="penv",
     sources=[os.path.join(DIR, "parallel_environment.cpp")],
+    extra_include_paths=_get_penv_include_paths(),
     extra_cflags=[
         '-O3', '-Wall', '-shared', '-std=c++17', '-fPIC', '-fvisibility=hidden'
     ],

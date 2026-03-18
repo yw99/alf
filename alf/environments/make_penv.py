@@ -13,8 +13,24 @@
 # limitations under the License.
 
 import os
+import shlex
 import sys
 import subprocess
+
+
+def _get_extra_include_flags():
+    include_paths = [os.path.join(sys.prefix, "include")]
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        include_paths.append(os.path.join(conda_prefix, "include"))
+
+    unique_paths = []
+    for path in include_paths:
+        boost_header = os.path.join(
+            path, "boost", "interprocess", "ipc", "message_queue.hpp")
+        if os.path.isfile(boost_header) and path not in unique_paths:
+            unique_paths.append(path)
+    return " ".join(f"-I{shlex.quote(path)}" for path in unique_paths)
 
 
 def gen_penv():
@@ -28,8 +44,10 @@ def gen_penv():
         assert os.system(
             "pip install pybind11") == 0, "Fail to pip install pybind11"
     python = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    include_flags = _get_extra_include_flags()
     cmd = (f"g++ -O3 -Wall -shared -std=c++17 -fPIC -fvisibility=hidden "
-           f"`{python} -m pybind11 --includes` parallel_environment.cpp "
+           f"`{python} -m pybind11 --includes` {include_flags} "
+           f"parallel_environment.cpp "
            f"-o _penv`{python}-config --extension-suffix` -lrt")
     ret = subprocess.run(["/bin/bash", "-c", cmd])
     assert ret.returncode == 0, "Fail to execute " + cmd
