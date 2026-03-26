@@ -1,14 +1,13 @@
 #!/bin/bash
 # Submit with:
-#   sbatch hpc_sbatchs/ppo_dmc_gpu_16env.sbatch
+#   sbatch hpc_sbatchs/bafc_tr_dmc_gpu_16env.sbatch
 
-#SBATCH --job-name=alf-ppo-dmc-gpu16
+#SBATCH --job-name=alf-bafctr-dmc-16env
 #SBATCH --account=torch_pr_741_general
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32GB
-#SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64GB
+#SBATCH --time=96:00:00
 #SBATCH --output=slurm-%j.out
 
 set -euo pipefail
@@ -20,8 +19,8 @@ if [[ ! -d "${REPO_ROOT}/alf" && -d "${SUBMIT_DIR}/.." && -d "${SUBMIT_DIR}/../a
 fi
 
 PYTHON_BIN="/scratch/${USER}/conda-envs/alf-bafc/bin/python"
-CONF_FILE="${REPO_ROOT}/alf/examples/ppo_dmc_conf.py"
-ROOT_DIR="/scratch/${USER}/alf_results/ppo_debug"
+CONF_FILE="${REPO_ROOT}/alf/examples/bafc_tr_dmc_conf.py"
+ROOT_DIR="/scratch/${USER}/alf_results/bafc_tr_debug"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python not found at ${PYTHON_BIN}"
@@ -44,7 +43,7 @@ export TORCH_EXTENSIONS_DIR="${REPO_ROOT}/.torch_extensions"
 # Required for deterministic CuBLAS ops when deterministic algorithms are enabled.
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 
-echo "Running PPO DMC train:"
+echo "Running BAFC-TR DMC train:"
 echo "  submit_dir: ${SUBMIT_DIR}"
 echo "  repo: ${REPO_ROOT}"
 echo "  conf: ${CONF_FILE}"
@@ -66,4 +65,4 @@ echo "  num_parallel_environments: 16"
     --conf_param="TrainerConfig.num_checkpoints=5" \
     --distributed=none
 
-echo "PPO run completed. Output root_dir: ${ROOT_DIR}"
+echo "BAFC-TR run completed. Output root_dir: ${ROOT_DIR}"

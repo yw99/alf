@@ -25,11 +25,13 @@ alf.define_config('debug_mode', False)
 debug_mode = alf.get_config_value('debug_mode')
 
 optimizer = Adam(lr=3e-4)
+actor_optimizer = Adam(lr=1e-4)
+
 use_obs_normalizer = True
 obs_normalizer_clipping = True # False
-actor_use_ln = False
-policy_eval_updates_per_epoch = 2
-max_improve_steps_per_epoch = 1
+actor_use_ln = True #False
+policy_eval_updates_per_epoch = 3
+max_improve_steps_per_epoch = 3
 
 if debug_mode:
     actor_hidden_layers = (32, 32)
@@ -64,6 +66,7 @@ alf.config(
     'BafcAlgorithmTR',
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
+    actor_optimizer=actor_optimizer,
     num_actor_critic=10,
     actor_critic_pairing=True,
     use_bootstrap_actors=False,

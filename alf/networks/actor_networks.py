@@ -503,6 +503,23 @@ class ActorFCNetwork(Network):
         action = self._squashing_func(pre_activation)
         action = spec_utils.scale_to_spec(action, self._output_spec)
 
+        if alf.summary.should_record_summaries():
+            mode = common.exe_mode_name()
+            prefix = 'summarize_output/' + self.name + '.action_layer.'
+            abs_pre_activation = pre_activation.detach().abs()
+            alf.summary.scalar(
+                name=prefix + 'pre_activation_abs_mean.' + mode,
+                data=abs_pre_activation.mean())
+            alf.summary.scalar(
+                name=prefix + 'pre_activation_abs_max.' + mode,
+                data=abs_pre_activation.max())
+            alf.summary.scalar(
+                name=prefix + 'pre_activation_frac_gt_3.' + mode,
+                data=abs_pre_activation.gt(3.).to(torch.float32).mean())
+            alf.summary.scalar(
+                name=prefix + 'pre_activation_frac_gt_5.' + mode,
+                data=abs_pre_activation.gt(5.).to(torch.float32).mean())
+
         if full_neurons:
             # uncomment below if actor_eval_type in ['output2', 'last_three']
             # neurons.append(pre_activation)  

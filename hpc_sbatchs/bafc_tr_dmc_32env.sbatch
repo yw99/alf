@@ -1,14 +1,13 @@
 #!/bin/bash
 # Submit with:
-#   sbatch hpc_sbatchs/bafc_tr_dmc_gpu_16env.sbatch
+#   sbatch hpc_sbatchs/bafc_tr_dmc_gpu_32env.sbatch
 
-#SBATCH --job-name=alf-bafctr-dmc-gpu16
+#SBATCH --job-name=alf-bafctr-dmc-32env-v2
 #SBATCH --account=torch_pr_741_general
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32GB
-#SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64GB
+#SBATCH --time=96:00:00
 #SBATCH --output=slurm-%j.out
 
 set -euo pipefail
@@ -21,7 +20,7 @@ fi
 
 PYTHON_BIN="/scratch/${USER}/conda-envs/alf-bafc/bin/python"
 CONF_FILE="${REPO_ROOT}/alf/examples/bafc_tr_dmc_conf.py"
-ROOT_DIR="/scratch/${USER}/alf_results/bafc_tr_debug"
+ROOT_DIR="/scratch/${USER}/alf_results/bafc_tr_debug_v3_2"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python not found at ${PYTHON_BIN}"
@@ -50,19 +49,19 @@ echo "  repo: ${REPO_ROOT}"
 echo "  conf: ${CONF_FILE}"
 echo "  root: ${ROOT_DIR}"
 echo "  python: ${PYTHON_BIN}"
-echo "  num_parallel_environments: 16"
+echo "  num_parallel_environments: 32"
 
 "${PYTHON_BIN}" -m alf.bin.train \
     --conf="${CONF_FILE}" \
     --root_dir="${ROOT_DIR}" \
-    --conf_param="create_environment.num_parallel_environments=16" \
+    --conf_param="create_environment.num_parallel_environments=32" \
     --conf_param="TrainerConfig.debug_summaries=True" \
     --conf_param="TrainerConfig.summarize_grads_and_vars=True" \
     --conf_param="TrainerConfig.summarize_gradient_noise_scale=False" \
     --conf_param="TrainerConfig.summarize_action_distributions=True" \
     --alsologtostderr \
     --conf_param="TrainerConfig.unroll_length=128" \
-    --conf_param="TrainerConfig.num_env_steps=50000000" \
+    --conf_param="TrainerConfig.num_env_steps=200000000" \
     --conf_param="TrainerConfig.num_checkpoints=5" \
     --distributed=none
 
