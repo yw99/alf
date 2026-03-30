@@ -20,12 +20,15 @@ from alf.algorithms.bafc_algorithm_TR import BafcAlgorithmTR
 from alf.algorithms.data_transformer import ObservationNormalizer
 from alf.examples.benchmarks.dm_control import dmc_conf
 from alf.optimizers import Adam
+from alf.utils.math_ops import clipped_exp
 
 alf.define_config('debug_mode', False)
 debug_mode = alf.get_config_value('debug_mode')
+alf.define_config('projection_type', 'normal')
+projection_type = alf.get_config_value('projection_type')
 
 optimizer = Adam(lr=3e-4)
-actor_optimizer = Adam(lr=5e-5)
+actor_optimizer = Adam(lr=1e-4)
 
 use_obs_normalizer = True
 obs_normalizer_clipping = True # False
@@ -49,10 +52,32 @@ else:
 if obs_normalizer_clipping:
     alf.config('ObservationNormalizer', clipping=1.)
 
+if projection_type == 'beta':
+    projection_net_ctor = partial(
+        alf.networks.BetaProjectionNetwork, min_concentration=1.)
+elif projection_type == 'normal':
+    projection_net_ctor = partial(
+        alf.networks.NormalProjectionNetwork,
+        state_dependent_std=True,
+        scale_distribution=True,
+        std_transform=clipped_exp)
+elif projection_type == 'stable_normal':
+    projection_net_ctor = partial(
+        alf.networks.StableNormalProjectionNetwork,
+        state_dependent_std=True,
+        scale_distribution=True)
+else:
+    raise ValueError(
+        "projection_type must be one of "
+        "'normal', 'stableNormal', 'stable_normal', or 'beta'. "
+        f"Got: {projection_type}")
+
+
 actor_network_cls = partial(
-    alf.networks.ActorFCNetwork,
+    alf.networks.ActorProjectionFCNetwork,
     fc_layer_params=actor_hidden_layers,
-    use_ln=actor_use_ln)
+    use_ln=actor_use_ln,
+    continuous_projection_net_ctor=projection_net_ctor)
 
 critic_network_cls = partial(
     alf.networks.FuncCriticNetwork,

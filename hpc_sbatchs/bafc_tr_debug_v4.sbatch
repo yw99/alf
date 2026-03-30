@@ -2,7 +2,7 @@
 # Submit with:
 #   sbatch hpc_sbatchs/bafc_tr_dmc_gpu_32env.sbatch
 
-#SBATCH --job-name=alf-bafctr-dmc-32env
+#SBATCH --job-name=alf-bafctr-dmc-32env_debug_v4_beta
 #SBATCH --account=torch_pr_741_general
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -19,8 +19,8 @@ if [[ ! -d "${REPO_ROOT}/alf" && -d "${SUBMIT_DIR}/.." && -d "${SUBMIT_DIR}/../a
 fi
 
 PYTHON_BIN="/scratch/${USER}/conda-envs/alf-bafc/bin/python"
-CONF_FILE="${REPO_ROOT}/alf/examples/bafc_tr_dmc_conf.py"
-ROOT_DIR="/scratch/${USER}/alf_results/bafc_tr_debug_v2_2"
+CONF_FILE="${REPO_ROOT}/alf/examples/bafc_tr_projnet_dmc_conf.py"
+ROOT_DIR="/scratch/${USER}/alf_results/bafc_tr_debug_v4_beta"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python not found at ${PYTHON_BIN}"
@@ -59,6 +59,7 @@ echo "  num_parallel_environments: 32"
     --conf_param="TrainerConfig.summarize_grads_and_vars=True" \
     --conf_param="TrainerConfig.summarize_gradient_noise_scale=False" \
     --conf_param="TrainerConfig.summarize_action_distributions=True" \
+    --conf_param="TrainerConfig.projection_type=beta" \
     --alsologtostderr \
     --conf_param="TrainerConfig.unroll_length=128" \
     --conf_param="TrainerConfig.num_env_steps=200000000" \

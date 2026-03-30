@@ -667,7 +667,6 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
 
         dqda = nest_utils.grad(action, q_value.sum(), retain_graph=True)
         clipped_dqda = self._clip_gradient(dqda)
-        self._summarize_dqda_norms(dqda, clipped_dqda)
         if self._actor_eval_type == 'full':
             eval_action_in_graph = eval_action[1:]
         else:
@@ -677,6 +676,8 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             q_value.sum(),
             retain_graph=self._actor_eval_type != 'output')
         clipped_dqde = self._clip_gradient(dqde)
+        self._summarize_gradient_term_norms(dqda, clipped_dqda, dqde,
+                                            clipped_dqde)
 
         def action_loss_fn(grad, a_in):
             loss = 0.5 * losses.element_wise_squared_loss(
@@ -692,6 +693,7 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             action_loss_fn, clipped_dqde, eval_action_in_graph)
         eval_action_loss = math_ops.add_n(eval_action_loss).mean().repeat(
             action_loss.shape[0])
+        self._summarize_gradient_term_influence(action_loss, eval_action_loss)
 
         actor_info = LossInfo(
             loss=action_loss,
@@ -803,11 +805,94 @@ class BafcAlgorithmTR(OnPolicyAlgorithm):
             torch.float32).mean()
         self._record_debug_scalar(name, bound_fraction)
 
-    def _summarize_dqda_norms(self, dqda, clipped_dqda):
-        self._record_debug_scalar("dqda_global_norm",
+    def _summarize_gradient_component_magnitudes(self, grad, prefix: str):
+        if not (self._debug_summaries and alf.summary.should_record_summaries()):
+            return
+        for leaf_idx, leaf in enumerate(nest.flatten(grad)):
+            if leaf is None:
+                continue
+            abs_leaf = leaf.detach().abs()
+            if abs_leaf.ndim == 0:
+                comp_mags = abs_leaf.reshape(1)
+            elif abs_leaf.ndim == 1:
+                comp_mags = abs_leaf
+            else:
+                comp_mags = abs_leaf.mean(dim=tuple(range(abs_leaf.ndim - 1)))
+            comp_mags = comp_mags.reshape(-1)
+            self._record_debug_scalar(f"{prefix}/leaf_{leaf_idx}/abs_mean",
+                                      comp_mags.mean())
+            for comp_idx in range(comp_mags.shape[0]):
+                self._record_debug_scalar(
+                    f"{prefix}/leaf_{leaf_idx}/abs_mean_component_{comp_idx}",
+                    comp_mags[comp_idx])
+
+    def _summarize_gradient_term_norms(self, dqda, clipped_dqda, dqde,
+                                       clipped_dqde):
+        self._record_debug_scalar("actor_gradients/dqda_global_norm",
                                   self._nested_global_norm(dqda))
-        self._record_debug_scalar("clipped_dqda_global_norm",
+        self._record_debug_scalar("actor_gradients/clipped_dqda_global_norm",
                                   self._nested_global_norm(clipped_dqda))
+        self._record_debug_scalar("actor_gradients/dqde_global_norm",
+                                  self._nested_global_norm(dqde))
+        self._record_debug_scalar("actor_gradients/clipped_dqde_global_norm",
+                                  self._nested_global_norm(clipped_dqde))
+        self._summarize_gradient_component_magnitudes(
+            dqda, "actor_gradients/dqda")
+        self._summarize_gradient_component_magnitudes(
+            clipped_dqda, "actor_gradients/clipped_dqda")
+        self._summarize_gradient_component_magnitudes(
+            dqde, "actor_gradients/dqde")
+        self._summarize_gradient_component_magnitudes(
+            clipped_dqde, "actor_gradients/clipped_dqde")
+
+    def _summarize_gradient_term_influence(self, action_term_loss, eval_term_loss):
+        if not (self._debug_summaries and alf.summary.should_record_summaries()):
+            return
+
+        action_term_loss = action_term_loss.mean()
+        eval_term_loss = eval_term_loss.mean()
+        self._record_debug_scalar("actor_gradients/action_term_loss_mean",
+                                  action_term_loss)
+        self._record_debug_scalar("actor_gradients/eval_term_loss_mean",
+                                  eval_term_loss)
+
+        total_abs_loss = action_term_loss.detach().abs() + eval_term_loss.detach().abs()
+        self._record_debug_scalar(
+            "actor_gradients/action_term_abs_loss_fraction",
+            action_term_loss.detach().abs() / (total_abs_loss + 1e-12))
+        self._record_debug_scalar(
+            "actor_gradients/eval_term_abs_loss_fraction",
+            eval_term_loss.detach().abs() / (total_abs_loss + 1e-12))
+
+        actor_params = [
+            p for p in self._actor_networks.parameters() if p.requires_grad
+        ]
+        if not actor_params:
+            return
+
+        action_param_grads = torch.autograd.grad(
+            action_term_loss,
+            actor_params,
+            retain_graph=True,
+            allow_unused=True)
+        eval_param_grads = torch.autograd.grad(
+            eval_term_loss,
+            actor_params,
+            retain_graph=True,
+            allow_unused=True)
+
+        action_param_grad_norm = self._nested_global_norm(action_param_grads)
+        eval_param_grad_norm = self._nested_global_norm(eval_param_grads)
+        self._record_debug_scalar("actor_gradients/action_param_grad_norm",
+                                  action_param_grad_norm)
+        self._record_debug_scalar("actor_gradients/eval_param_grad_norm",
+                                  eval_param_grad_norm)
+
+        total_param_grad_norm = action_param_grad_norm + eval_param_grad_norm + 1e-12
+        self._record_debug_scalar("actor_gradients/action_param_grad_fraction",
+                                  action_param_grad_norm / total_param_grad_norm)
+        self._record_debug_scalar("actor_gradients/eval_param_grad_fraction",
+                                  eval_param_grad_norm / total_param_grad_norm)
 
     @torch.no_grad()
     def _summarize_policy_action_distances(self, observation, current_action):

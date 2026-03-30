@@ -28,7 +28,7 @@ import alf.nest as nest
 from alf.initializers import variance_scaling_init
 from alf.networks import Network
 from alf.tensor_specs import TensorSpec, BoundedTensorSpec
-from alf.utils import common, math_ops, spec_utils
+from alf.utils import common, dist_utils, math_ops, spec_utils
 import alf.utils.math_ops as math_ops
 
 
@@ -523,6 +523,232 @@ class ActorFCNetwork(Network):
         if full_neurons:
             # uncomment below if actor_eval_type in ['output2', 'last_three']
             # neurons.append(pre_activation)  
+            neurons.append(action)
+            return neurons, state
+        return action, state
+
+
+@alf.configurable
+class ActorProjectionFCNetwork(Network):
+    def __init__(self,
+                 input_tensor_spec: TensorSpec,
+                 action_spec: BoundedTensorSpec,
+                 fc_layer_params=None,
+                 n_groups=None,
+                 use_bias=True,
+                 use_bn=False,
+                 use_ln=False,
+                 first_layer_modulated=False,
+                 action_layer_modulated=False,
+                 action_layer_use_ln=False,
+                 demodulate=True,
+                 detach_demodulate=False,
+                 noise_dim=None,
+                 activation=torch.relu_,
+                 squashing_func=torch.tanh,
+                 kernel_initializer=None,
+                 last_kernel_initializer=None,
+                 continuous_projection_net_ctor=None,
+                 name="ActorProjectionFCNetwork"):
+        """ActorFCNetwork variant with a projection-based output head.
+
+        It keeps the BAFC-specific interface of ``ActorFCNetwork`` but replaces
+        the raw tanh action head with an existing ALF projection network.
+        """
+        super().__init__(input_tensor_spec, name=name)
+
+        del squashing_func, action_layer_use_ln
+
+        assert input_tensor_spec.ndim == 1, \
+            "The input shape {} should be like (N,)!".format(
+                input_tensor_spec.shape)
+        assert not action_layer_modulated, (
+            "ActorProjectionFCNetwork does not support "
+            "action_layer_modulated=True.")
+
+        input_size = input_tensor_spec.shape[0]
+
+        if kernel_initializer is None:
+            kernel_initializer = functools.partial(
+                variance_scaling_init,
+                gain=math.sqrt(1.0 / 3),
+                mode='fan_in',
+                distribution='uniform')
+
+        self._fc_layers = nn.ModuleList()
+        if fc_layer_params is None:
+            fc_layer_params = []
+        else:
+            assert isinstance(fc_layer_params, tuple)
+
+        if first_layer_modulated:
+            if noise_dim is None:
+                noise_dim = input_size
+            self._fc_layers.append(
+                layers.ParallelModulatedFC(
+                    input_size,
+                    fc_layer_params[0],
+                    n=n_groups,
+                    use_bias=use_bias,
+                    use_bn=use_bn,
+                    use_ln=use_ln,
+                    kernel_initializer=kernel_initializer,
+                    demodulate=demodulate,
+                    detach_demodulate=detach_demodulate,
+                    noise_dim=noise_dim))
+        else:
+            self._fc_layers.append(
+                layers.ParallelFC(
+                    input_size,
+                    fc_layer_params[0],
+                    n=n_groups,
+                    activation=activation,
+                    use_bias=use_bias,
+                    use_bn=use_bn,
+                    use_ln=use_ln,
+                    kernel_initializer=kernel_initializer))
+        input_size = fc_layer_params[0]
+
+        for size in fc_layer_params[1:]:
+            self._fc_layers.append(
+                layers.ParallelFC(
+                    input_size,
+                    size,
+                    n=n_groups,
+                    activation=activation,
+                    use_bias=use_bias,
+                    use_bn=use_bn,
+                    use_ln=use_ln,
+                    kernel_initializer=kernel_initializer))
+            input_size = size
+
+        if last_kernel_initializer is None:
+            last_kernel_initializer = functools.partial(
+                torch.nn.init.uniform_, a=-0.003, b=0.003)
+
+        # Resolve lazily to avoid touching ``alf.networks`` while this module
+        # is still being imported.
+        if continuous_projection_net_ctor is None:
+            from .projection_networks import NormalProjectionNetwork
+            continuous_projection_net_ctor = NormalProjectionNetwork
+
+        self._first_layer_modulated = first_layer_modulated
+        self._action_layer_modulated = action_layer_modulated
+        self._noise_dim = noise_dim
+        self._n_groups = n_groups
+        self._output_spec = action_spec
+        self._projection_net = continuous_projection_net_ctor(
+            input_size=input_size, action_spec=action_spec, parallelism=n_groups)
+
+        # BAFC only uses bias_params to infer token sizes for actor encoding.
+        self.register_buffer(
+            "_projection_weight_shape",
+            torch.zeros(n_groups, action_spec.shape[0], input_size))
+        self.register_buffer(
+            "_projection_bias_shape",
+            torch.zeros(n_groups, action_spec.shape[0]))
+        self._weight_params = [m.weight for m in self._fc_layers] + [
+            self._projection_weight_shape]
+        self._bias_params = [m.bias for m in self._fc_layers] + [
+            self._projection_bias_shape]
+        self._network_kwargs = {
+            "input_tensor_spec": input_tensor_spec,
+            "action_spec": action_spec,
+            "fc_layer_params": fc_layer_params,
+            "n_groups": n_groups,
+            "use_bias": use_bias,
+            "activation": activation,
+            "kernel_initializer": kernel_initializer,
+            "last_kernel_initializer": last_kernel_initializer,
+            "continuous_projection_net_ctor": continuous_projection_net_ctor}
+
+    @property
+    def weight_params(self):
+        """Get the list of weight tensors."""
+        return self._weight_params
+
+    @property
+    def bias_params(self):
+        """Get the list of bias tensors."""
+        return self._bias_params
+
+    @property
+    def network_kwargs(self):
+        return self._network_kwargs
+
+    @property
+    def noise_dim(self):
+        return self._noise_dim
+
+    def forward(self, inputs, full_neurons=False, id=None, noise=None, state=()):
+        """
+        Args:
+            inputs (Tensor):
+            state: not used, just keeps the interface same with other networks.
+        """
+        x = inputs
+
+        if not full_neurons:
+            if self._first_layer_modulated:
+                x = self._fc_layers[0](x, noise, id=id)
+            else:
+                x = self._fc_layers[0](x, id=id)
+            for fc_l in self._fc_layers[1:]:
+                x = fc_l(x, id=id)
+        else:
+            neurons = []
+            if len(self._fc_layers) > 0:
+                if self._first_layer_modulated:
+                    x = self._fc_layers[0](x, noise, store_inputs=True)
+                else:
+                    x = self._fc_layers[0](x, store_inputs=True)
+                neurons.append(self._fc_layers[0].inputs)
+                neurons.append(x)
+                if len(self._fc_layers) > 1:
+                    for fc_l in self._fc_layers[1:]:
+                        x = fc_l(x)
+                        neurons.append(x)
+            else:
+                neurons.append(x)
+
+        projection_inputs = x
+        if id is not None and projection_inputs.ndim == 2:
+            projection_inputs = projection_inputs.unsqueeze(1).expand(
+                -1, self._n_groups, -1)
+
+        action_dist, _ = self._projection_net(projection_inputs)
+        action = dist_utils.get_rmode(action_dist)
+        if id is not None and action.ndim == 3:
+            action = action[:, id, :]
+
+        if alf.summary.should_record_summaries():
+            mode = common.exe_mode_name()
+            prefix = 'summarize_output/' + self.name + '.action_layer.'
+            head_output = None
+            if hasattr(self._projection_net, '_means_projection_layer'):
+                head_output = self._projection_net._means_projection_layer(
+                    projection_inputs)
+            elif hasattr(self._projection_net, '_concentration_projection_layer'):
+                head_output = self._projection_net._concentration_projection_layer(
+                    projection_inputs)
+            if head_output is not None:
+                if id is not None and head_output.ndim == 3:
+                    head_output = head_output[:, id, :]
+                abs_head_output = head_output.detach().abs()
+                alf.summary.scalar(
+                    name=prefix + 'pre_activation_abs_mean.' + mode,
+                    data=abs_head_output.mean())
+                alf.summary.scalar(
+                    name=prefix + 'pre_activation_abs_max.' + mode,
+                    data=abs_head_output.max())
+                alf.summary.scalar(
+                    name=prefix + 'pre_activation_frac_gt_3.' + mode,
+                    data=abs_head_output.gt(3.).to(torch.float32).mean())
+                alf.summary.scalar(
+                    name=prefix + 'pre_activation_frac_gt_5.' + mode,
+                    data=abs_head_output.gt(5.).to(torch.float32).mean())
+
+        if full_neurons:
             neurons.append(action)
             return neurons, state
         return action, state
