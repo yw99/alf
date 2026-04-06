@@ -342,15 +342,18 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         ``_target_critic_networks`` to maintain their states.
         """
         assert not self._is_eval
-        if inputs.step_type == StepType.FIRST or self._bootstrap_mask_type == 'step':
-            if inputs.step_type == StepType.FIRST:
+        first_mask = (inputs.step_type == StepType.FIRST)
+        has_first = bool(torch.any(first_mask).item())
+        if has_first or self._bootstrap_mask_type == 'step':
+            if has_first:
                 # commitment: only resample rollout actor at the beginning of an episode
                 self._rollout_actor_id = torch.randint(self._num_actor_critic, ())
             if self._use_bootstrap_actors or self._use_bootstrap_critics:
                 # [n_env, n_actors] masks for bootstrap actors
                 prob_t = torch.full(
                     (inputs.step_type.shape[0], self._num_actor_critic),
-                    self._bootstrap_mask_prob)
+                    self._bootstrap_mask_prob,
+                    device=inputs.step_type.device)
                 self._bootstrap_mask = torch.bernoulli(prob_t)
 
         action, action_state = self._predict_action(

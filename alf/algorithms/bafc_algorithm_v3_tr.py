@@ -39,6 +39,7 @@ from alf.utils import losses, common, dist_utils, math_ops
 from alf.utils.normalizers import ScalarAdaptiveNormalizer
 from alf.utils.schedulers import Scheduler
 from alf.utils.summary_utils import safe_mean_hist_summary
+from alf.networks.network import Network
 from alf.networks.neural_graphs.actor_graph import ActorGraph
 from alf.networks.neural_graphs.graph_network import GraphNetwork
 
@@ -110,6 +111,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  obs_action_encoding_dim=64,
                  trust_cov_reg: float = 1e-4,
                  trust_metric_num_obs: int = 128,
+                 trust_metric_num_feature_coords: int = 64,
+                 trust_metric_update_interval: int = 1,
                  eval_trust_max: float = 2.0,
                  delta_trust_max: float = 2.0,
                  monitor_trust_metrics: bool = True,
@@ -154,6 +157,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             r"bootstrap mask type {bootstrap_mask_type} is not supported.")
         assert trust_cov_reg > 0, "trust_cov_reg must be > 0"
         assert trust_metric_num_obs >= 1, "trust_metric_num_obs must be >= 1"
+        assert trust_metric_num_feature_coords >= 1, (
+            "trust_metric_num_feature_coords must be >= 1")
+        assert trust_metric_update_interval >= 1, (
+            "trust_metric_update_interval must be >= 1")
         if actor_utd is None and critic_utd is None:
             self._train_mode = TrainMode.standard
         else:
@@ -183,6 +190,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._bootstrap_mask_type = bootstrap_mask_type
         self._trust_cov_reg = trust_cov_reg
         self._trust_metric_num_obs = trust_metric_num_obs
+        self._trust_metric_num_feature_coords = trust_metric_num_feature_coords
+        self._trust_metric_update_interval = trust_metric_update_interval
         self._eval_trust_max = eval_trust_max
         self._delta_trust_max = delta_trust_max
         self._monitor_trust_metrics = monitor_trust_metrics
@@ -277,6 +286,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._critic_networks = critic_networks
         self._target_critic_networks = critic_networks.copy(
             name='target_critic_networks')
+        self._snapshot_critic_networks = critic_networks.copy(
+            name='snapshot_critic_networks')
+        for p in self._snapshot_critic_networks.parameters():
+            p.requires_grad_(False)
         # self._target_critic_network.set_obs_action_batch_dominate(True)
 
         if critic_loss_ctor is None:
@@ -297,6 +310,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._do_critic_summary = False
         self._last_eval_trust = torch.tensor(1.0)
         self._last_grad_trust = torch.tensor(1.0)
+        # Trust metrics are observability-only. This counter only schedules
+        # when we refresh the cached logging values.
+        self._trust_metric_update_counter = 0
 
         def _filter(x):
             return list(filter(lambda x: x is not None, x))
@@ -315,6 +331,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             target_critic_tau, target_critic_period, target_critic_use_ema)
         self._sync_reference_from_current()
         self._sync_behavior_from_reference()
+        self._sync_snapshot_critic_from_current()
 
     def _sync_reference_from_current(self):
         self._reference_actor_networks.load_state_dict(
@@ -323,6 +340,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
     def _sync_behavior_from_reference(self):
         self._behavior_actor_networks.load_state_dict(
             self._reference_actor_networks.state_dict())
+
+    def _sync_snapshot_critic_from_current(self):
+        self._snapshot_critic_networks.load_state_dict(
+            self._critic_networks.state_dict())
 
     def _record_debug_scalar(self, name: str, value):
         if not (self._debug_summaries and alf.summary.should_record_summaries()):
@@ -351,6 +372,23 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             sq_norm = self._actor_eval_samples.new_zeros(())
         return sq_norm
 
+    def _scalar_grad_sq_norm(self,
+                             scalar,
+                             params,
+                             group_idx: int,
+                             retain_graph: bool):
+        if not isinstance(scalar, torch.Tensor) or not scalar.requires_grad:
+            if isinstance(scalar, torch.Tensor):
+                return scalar.new_zeros(())
+            return self._actor_eval_samples.new_zeros(())
+        grads = torch.autograd.grad(
+            scalar,
+            params,
+            retain_graph=retain_graph,
+            create_graph=False,
+            allow_unused=True)
+        return self._group_grad_sq_norm(grads, group_idx)
+
     def _sample_metric_observations(self, observation):
         if not isinstance(observation, torch.Tensor):
             return ()
@@ -371,6 +409,112 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             return action.unsqueeze(1)
         return action
 
+    def _extract_eval_action(self, actor_network):
+        eval_action = actor_network(
+            self._actor_eval_samples,
+            full_neurons=self._actor_eval_type != 'output')[0]
+        if self._actor_eval_type == 'exclude_input':
+            eval_action = eval_action[1:]
+        elif self._actor_eval_type == 'last_two':
+            eval_action = eval_action[-2:]
+        return eval_action
+
+    def _compute_actor_encoding(self, actor_network):
+        eval_action = self._extract_eval_action(actor_network)
+        actor_tokens = self._tokenize_actor_out(eval_action)
+        return self._actor_encoder(actor_tokens)[0]
+
+    def _sample_feature_coords(self, feature_dim, device):
+        if feature_dim <= self._trust_metric_num_feature_coords:
+            return torch.arange(feature_dim, device=device)
+        return torch.randperm(feature_dim, device=device)[
+            :self._trust_metric_num_feature_coords]
+
+    def _critic_feature_head_index(self, critic_network):
+        critic_core = getattr(critic_network, '_pnet', critic_network)
+        modules = getattr(critic_core, '_networks', None)
+        if modules is None:
+            raise RuntimeError(
+                "Snapshot critic does not expose the sequential modules needed "
+                "for trust-feature extraction.")
+
+        head_indices = []
+        for idx, module in enumerate(modules):
+            output_size = getattr(module, '_output_size', None)
+            if output_size is not None and int(output_size) == 1:
+                head_indices.append(idx)
+                continue
+            weight = getattr(module, 'weight', None)
+            if isinstance(weight, torch.Tensor) and weight.ndim >= 2:
+                if weight.shape[-2] == 1:
+                    head_indices.append(idx)
+        if not head_indices:
+            raise RuntimeError(
+                "Failed to locate the snapshot critic's final scalar head.")
+        return head_indices[-1]
+
+    def _compute_snapshot_feature_map(self,
+                                      observation,
+                                      actor_encoding,
+                                      action,
+                                      critic_network=None):
+        """Return the frozen snapshot critic feature map before the scalar head.
+
+        The feature map is the pre-activation input to the last scalar critic
+        head, not the raw action and not the final scalar Q value.
+        """
+        critic_network = (self._snapshot_critic_networks
+                          if critic_network is None else critic_network)
+        critic_core = getattr(critic_network, '_pnet', critic_network)
+        modules = critic_core._networks
+        head_idx = self._critic_feature_head_index(critic_network)
+
+        action = self._ensure_group_action(action)
+        if actor_encoding.ndim == 2:
+            actor_encoding = actor_encoding.unsqueeze(0).expand(
+                observation.shape[0], -1, -1)
+        critic_observation = observation.unsqueeze(1).expand(
+            -1, self._num_actor_critic, -1)
+        x = (actor_encoding, (critic_observation, action))
+
+        for idx, module in enumerate(modules):
+            if idx == head_idx:
+                if not isinstance(x, torch.Tensor) or x.ndim != 3:
+                    raise RuntimeError(
+                        "Unexpected snapshot critic feature-map shape %s" %
+                        (type(x), ))
+                return x
+            if isinstance(module, Network):
+                x = module(x)[0]
+            else:
+                x = module(x)
+
+        raise RuntimeError(
+            "Failed to extract snapshot critic feature map before the scalar "
+            "head.")
+
+    def _compute_feature_inv_cov(self, feature_map):
+        feature_by_group = feature_map.permute(1, 0, 2)  # [G, N, F]
+        cov = (feature_by_group.transpose(1, 2) @ feature_by_group /
+               feature_by_group.shape[1])
+        feature_dim = cov.shape[-1]
+        eye = torch.eye(
+            feature_dim, dtype=cov.dtype, device=cov.device).unsqueeze(0)
+        cov = cov + self._trust_cov_reg * eye
+        return torch.linalg.pinv(cov)
+
+    def _compute_weighted_feature_norm(self, feature_map, inv_cov):
+        feature_by_group = feature_map.permute(1, 0, 2)  # [G, N, F]
+        weighted = torch.matmul(feature_by_group, inv_cov)
+        squared_norm = torch.clamp(
+            (weighted * feature_by_group).sum(-1), min=0.)
+        return torch.sqrt(squared_norm + 1e-12).permute(1, 0)  # [N, G]
+
+    def _compute_eval_trust_from_features(self, phi_ref, phi_beh):
+        inv_cov = self._compute_feature_inv_cov(phi_beh)
+        weighted_norm = self._compute_weighted_feature_norm(phi_ref, inv_cov)
+        return torch.clamp(weighted_norm.pow(2).mean(), min=0.)
+
     @torch.no_grad()
     def _compute_eval_trust_metric(self, observation):
         obs = self._sample_metric_observations(observation)
@@ -378,95 +522,123 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             return torch.ones_like(self._last_eval_trust)
 
         ref_action = self._ensure_group_action(
-            self._reference_actor_networks(obs)[0])
+            self._reference_actor_networks(obs)[0]).detach()
         beh_action = self._ensure_group_action(
-            self._behavior_actor_networks(obs)[0])
+            self._behavior_actor_networks(obs)[0]).detach()
+        ref_encoding = self._compute_actor_encoding(
+            self._reference_actor_networks).detach()
 
-        ref_by_group = ref_action.permute(1, 0, 2)  # [G, N, A]
-        beh_by_group = beh_action.permute(1, 0, 2)  # [G, N, A]
-        cov = beh_by_group.transpose(1, 2) @ beh_by_group / beh_by_group.shape[1]
-        action_dim = cov.shape[-1]
-        eye = torch.eye(
-            action_dim, dtype=cov.dtype, device=cov.device).unsqueeze(0)
-        cov = cov + self._trust_cov_reg * eye
-        cov_inv = torch.linalg.pinv(cov)
-        weighted_ref = torch.matmul(ref_by_group, cov_inv)
-        squared_norm = (weighted_ref * ref_by_group).sum(-1)
-        trust = torch.clamp(squared_norm, min=0.).mean()
-        return trust
+        phi_ref = self._compute_snapshot_feature_map(
+            obs, ref_encoding, ref_action).detach()
+        # Use the same reference conditioning while swapping in the behavior
+        # actions, which mirrors the target-conditioned coverage view in Eq. (3.2).
+        phi_beh = self._compute_snapshot_feature_map(
+            obs, ref_encoding, beh_action).detach()
 
-    def _compute_grad_generalization_trust_metric(self, observation):
+        return self._compute_eval_trust_from_features(phi_ref, phi_beh)
+
+    def _compute_grad_generalization_trust_components(self, observation):
         obs = self._sample_metric_observations(observation)
         if not isinstance(obs, torch.Tensor):
-            return torch.ones_like(self._last_eval_trust)
+            one = torch.ones_like(self._last_eval_trust)
+            return one, one
 
         actor_params = list(self._actor_networks.parameters())
         if len(actor_params) == 0:
-            return torch.ones_like(self._last_eval_trust)
+            one = torch.ones_like(self._last_eval_trust)
+            return one, one
         param_requires_grad = [p.requires_grad for p in actor_params]
         for p in actor_params:
             if not p.requires_grad:
                 p.requires_grad_(True)
 
         try:
-            obs = obs.detach().clone().requires_grad_(True)
+            obs = obs.detach()
             cur_action = self._ensure_group_action(self._actor_networks(obs)[0])
             with torch.no_grad():
                 ref_action = self._ensure_group_action(
                     self._reference_actor_networks(obs.detach())[0])
+                ref_encoding = self._compute_actor_encoding(
+                    self._reference_actor_networks).detach()
+            cur_encoding = self._compute_actor_encoding(self._actor_networks)
 
-            ref_by_group = ref_action.permute(1, 0, 2)  # [G, N, A]
-            cov = ref_by_group.transpose(1, 2) @ ref_by_group / ref_by_group.shape[1]
-            action_dim = cov.shape[-1]
-            eye = torch.eye(
-                action_dim, dtype=cov.dtype, device=cov.device).unsqueeze(0)
-            cov = cov + self._trust_cov_reg * eye
-            a_inv = torch.linalg.pinv(cov)
+            # Keep the snapshot critic frozen and measure only how actor
+            # changes move the anchored feature map.
+            phi_ref = self._compute_snapshot_feature_map(
+                obs, ref_encoding, ref_action).detach()
+            phi_t = self._compute_snapshot_feature_map(
+                obs, cur_encoding, cur_action)
+            a_inv = self._compute_feature_inv_cov(phi_ref)
+            feature_norm = self._compute_weighted_feature_norm(phi_t, a_inv).mean(
+                dim=0)  # [G]
 
-            cur_by_group = cur_action.permute(1, 0, 2)  # [G, N, A]
-            weighted_cur = torch.matmul(cur_by_group, a_inv)
-            feature_norm = torch.sqrt(
-                torch.clamp((weighted_cur * cur_by_group).sum(-1), min=0.) +
-                1e-12).mean(dim=1)  # [G]
-
+            action_dim = cur_action.shape[-1]
             num_groups = cur_action.shape[1]
-            grad_sq = torch.zeros(
+            grad_sq_mu = torch.zeros(
                 (num_groups, action_dim),
                 dtype=cur_action.dtype,
                 device=cur_action.device)
-            num_terms = num_groups * action_dim
+            feature_dim = phi_t.shape[-1]
+            feature_coords = self._sample_feature_coords(feature_dim, phi_t.device)
+            grad_sq_phi = torch.zeros(
+                (num_groups, feature_coords.shape[0]),
+                dtype=phi_t.dtype,
+                device=phi_t.device)
+            num_terms = num_groups * (action_dim + feature_coords.shape[0])
             term_idx = 0
             for group_idx in range(num_groups):
                 for action_idx in range(action_dim):
                     term_idx += 1
                     retain_graph = term_idx < num_terms
                     scalar = cur_action[:, group_idx, action_idx].mean()
-                    grads = torch.autograd.grad(
-                        scalar,
-                        actor_params,
-                        retain_graph=retain_graph,
-                        create_graph=False,
-                        allow_unused=True)
-                    grad_sq[group_idx, action_idx] = self._group_grad_sq_norm(
-                        grads, group_idx)
+                    grad_sq_mu[group_idx, action_idx] = self._scalar_grad_sq_norm(
+                        scalar, actor_params, group_idx, retain_graph)
 
             jacobian_norm = torch.sqrt(
-                torch.clamp(grad_sq.sum(-1), min=0.) + 1e-12)
-            c1 = torch.max(jacobian_norm * feature_norm)
+                torch.clamp(grad_sq_mu.sum(-1), min=0.) + 1e-12)
+            c1 = torch.mean(jacobian_norm * feature_norm)
 
             a_inv_diag = torch.clamp(
                 torch.diagonal(a_inv, dim1=-2, dim2=-1), min=0.)
-            per_action_weighted_norm = torch.sqrt(
-                torch.clamp(grad_sq * a_inv_diag, min=0.) + 1e-12)
-            action_weight = cur_by_group.abs().mean(dim=1)
-            action_weight = action_weight / (
-                action_weight.sum(-1, keepdim=True) + 1e-12)
-            c2 = (action_weight * per_action_weighted_norm).sum(-1).mean()
+            sampled_inv_diag = a_inv_diag[:, feature_coords]
+            # C2 is the deterministic proxy for D_theta phi_t: the frozen
+            # feature map changes only through the current actor.
+            for group_idx in range(num_groups):
+                for local_idx, feature_idx in enumerate(feature_coords.tolist()):
+                    term_idx += 1
+                    retain_graph = term_idx < num_terms
+                    scalar = phi_t[:, group_idx, feature_idx].mean()
+                    grad_sq_phi[group_idx, local_idx] = self._scalar_grad_sq_norm(
+                        scalar, actor_params, group_idx, retain_graph)
 
-            return torch.clamp(torch.maximum(c1, c2), min=0.)
+            per_feature_weighted_norm = torch.sqrt(
+                torch.clamp(sampled_inv_diag * grad_sq_phi, min=0.) + 1e-12)
+            coord_scale = float(feature_dim) / float(feature_coords.shape[0])
+            c2 = torch.mean(per_feature_weighted_norm.sum(-1) * coord_scale)
+
+            return torch.clamp(c1, min=0.), torch.clamp(c2, min=0.)
         finally:
             for p, req in zip(actor_params, param_requires_grad):
                 p.requires_grad_(req)
+
+    def _compute_grad_generalization_trust_metric(self, observation):
+        c1, c2 = self._compute_grad_generalization_trust_components(observation)
+        return torch.maximum(c1, c2)
+
+    def _broadcast_trust_metric(self, metric, batch_shape, device, dtype):
+        metric = torch.as_tensor(metric, device=device, dtype=dtype)
+        batch_shape = tuple(batch_shape)
+        if not batch_shape:
+            return metric
+        if metric.shape == batch_shape:
+            return metric
+        if metric.numel() == 1:
+            return torch.full(
+                batch_shape,
+                float(metric.reshape(()).item()),
+                dtype=dtype,
+                device=device)
+        return torch.broadcast_to(metric, batch_shape).clone()
 
     def _predict_action(self,
                         actor_net,
@@ -542,8 +714,16 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             info=BafcInfo(
                 action=action,
                 bootstrap_mask=self._bootstrap_mask,
-                eval_trust_metric=self._last_eval_trust,
-                grad_trust_metric=self._last_grad_trust))
+                eval_trust_metric=self._broadcast_trust_metric(
+                    self._last_eval_trust,
+                    inputs.reward.shape,
+                    inputs.reward.device,
+                    inputs.reward.dtype),
+                grad_trust_metric=self._broadcast_trust_metric(
+                    self._last_grad_trust,
+                    inputs.reward.shape,
+                    inputs.reward.device,
+                    inputs.reward.dtype)))
 
     def _tokenize_actor_out(self, eval_out):
         # To make actor eval_out an input sequence to the transformer, we set
@@ -636,11 +816,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             loss=action_loss,
             extra=BafcActorInfo(
                 eval_action_loss=eval_action_loss,
-                grad_trust_metric=torch.full(
+                grad_trust_metric=self._broadcast_trust_metric(
+                    self._last_grad_trust,
                     action_loss.shape,
-                    float(self._last_grad_trust.item()),
-                    dtype=torch.float32,
-                    device=action_loss.device)))
+                    action_loss.device,
+                    action_loss.dtype)))
         return critic_state, actor_info
 
     def _critic_train_step(self, observation, state: BafcCriticState, 
@@ -697,7 +877,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         info = BafcCriticInfo(
             critic=critics,
             target_critic=target_critics,
-            eval_trust_metric=self._last_eval_trust)
+            eval_trust_metric=self._broadcast_trust_metric(
+                self._last_eval_trust,
+                critics.shape[:-2],
+                critics.device,
+                critics.dtype))
 
         return state, info
 
@@ -757,7 +941,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                     inputs.observation, state.critic, rollout_info, action)
                 actor_info = LossInfo(
                     extra=BafcActorInfo(
-                        grad_trust_metric=self._last_grad_trust))
+                        grad_trust_metric=self._broadcast_trust_metric(
+                            self._last_grad_trust,
+                            inputs.reward.shape,
+                            inputs.reward.device,
+                            inputs.reward.dtype)))
                 new_state = BafcState(action=action_state,
                                       actor=state.actor,
                                       critic=critic_state)
@@ -776,8 +964,16 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             critic=critic_info,
             discounted_return=rollout_info.discounted_return,
             bootstrap_mask=rollout_info.bootstrap_mask,
-            eval_trust_metric=self._last_eval_trust,
-            grad_trust_metric=self._last_grad_trust)
+            eval_trust_metric=self._broadcast_trust_metric(
+                self._last_eval_trust,
+                inputs.reward.shape,
+                inputs.reward.device,
+                inputs.reward.dtype),
+            grad_trust_metric=self._broadcast_trust_metric(
+                self._last_grad_trust,
+                inputs.reward.shape,
+                inputs.reward.device,
+                inputs.reward.dtype))
         return AlgStep(action, new_state, info)
 
     def calc_loss(self, info: BafcInfo):
@@ -828,12 +1024,16 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
     def _trainable_attributes_to_ignore(self):
         return [
             '_target_critic_networks', '_reference_actor_networks',
-            '_behavior_actor_networks'
+            '_behavior_actor_networks', '_snapshot_critic_networks'
         ]
 
     def after_update(self, root_inputs, info: BafcInfo):
         del info
-        if self._monitor_trust_metrics:
+        should_compute_trust_metrics = (
+            self._monitor_trust_metrics and
+            self._trust_metric_update_counter %
+            self._trust_metric_update_interval == 0)
+        if should_compute_trust_metrics:
             observation = ()
             if hasattr(root_inputs, "observation"):
                 observation = root_inputs.observation
@@ -845,11 +1045,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             else:
                 self._last_eval_trust = torch.ones_like(self._last_eval_trust)
                 self._last_grad_trust = torch.ones_like(self._last_grad_trust)
+        self._trust_metric_update_counter += 1
 
         self._sync_behavior_from_reference()
         self._sync_reference_from_current()
         self._update_train_mode()
         self._update_target_critic()
+        self._sync_snapshot_critic_from_current()
         self._record_debug_scalar('eval_trust_metric', self._last_eval_trust)
         self._record_debug_scalar('grad_trust_metric', self._last_grad_trust)
         self._record_debug_scalar('eval_trust_max', self._eval_trust_max)

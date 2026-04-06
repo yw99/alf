@@ -31,6 +31,7 @@ from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import LossInfo, StepType, TimeStep
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
+from alf.utils import dist_utils
 
 
 class _DummyProcess:
@@ -41,6 +42,23 @@ class _DummyProcess:
     def children(self, recursive=True):
         del recursive
         return []
+
+
+class _ScaleActor(torch.nn.Module):
+
+    def __init__(self, num_groups, action_dim):
+        super().__init__()
+        self._num_groups = num_groups
+        self._action_dim = action_dim
+        self.scale = torch.nn.Parameter(torch.zeros(num_groups, action_dim))
+
+    def forward(self, observation, state=(), id=None, full_neurons=False):
+        del full_neurons
+        action = torch.exp(self.scale).unsqueeze(0) * observation[
+            :, :self._action_dim].unsqueeze(1)
+        if id is not None:
+            action = action[:, id, :]
+        return action, state
 
 
 class BafcAlgorithmV3TRTest(alf.test.TestCase):
@@ -114,6 +132,17 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._num_actor_critic, 3)
         self.assertEqual(alg._train_mode, TrainMode.standard)
 
+    def test_trust_metric_update_interval_must_be_positive(self):
+        with self.assertRaises(AssertionError):
+            self._make_alg(trust_metric_update_interval=0)
+
+    def test_custom_feature_coord_config_is_applied(self):
+        alg = self._make_alg(trust_metric_num_feature_coords=5)
+
+        self.assertEqual(alg._trust_metric_num_feature_coords, 5)
+        coords = alg._sample_feature_coords(9, torch.device("cpu"))
+        self.assertEqual(tuple(coords.shape), (5, ))
+
     def test_predict_and_rollout_shapes_with_bootstrap_mask(self):
         alg = self._make_alg(
             use_bootstrap_actors=True,
@@ -130,6 +159,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(
             tuple(rollout_step.info.bootstrap_mask.shape),
             (1, alg._num_actor_critic))
+        self.assertEqual(tuple(rollout_step.info.eval_trust_metric.shape), (1, ))
+        self.assertEqual(tuple(rollout_step.info.grad_trust_metric.shape), (1, ))
         self.assertTrue(
             torch.all((rollout_step.info.bootstrap_mask == 0)
                       | (rollout_step.info.bootstrap_mask == 1)))
@@ -154,14 +185,41 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(
             tuple(step.info.critic.critic.shape),
             (batch_size, alg._num_actor_critic, alg._num_actor_critic))
-        self.assertTrue(isinstance(step.info.eval_trust_metric, torch.Tensor))
-        self.assertTrue(isinstance(step.info.grad_trust_metric, torch.Tensor))
+        self.assertEqual(tuple(step.info.critic.eval_trust_metric.shape),
+                         (batch_size, ))
+        self.assertEqual(tuple(step.info.eval_trust_metric.shape),
+                         (batch_size, ))
+        self.assertEqual(tuple(step.info.grad_trust_metric.shape),
+                         (batch_size, ))
         self.assertTrue(
-            torch.isfinite(step.info.eval_trust_metric).item())
+            torch.isfinite(step.info.eval_trust_metric).all().item())
         self.assertTrue(
-            torch.isfinite(step.info.grad_trust_metric).item())
+            torch.isfinite(step.info.grad_trust_metric).all().item())
         self.assertTrue(
-            torch.isfinite(step.info.critic.eval_trust_metric).item())
+            torch.isfinite(step.info.critic.eval_trust_metric).all().item())
+
+    def test_train_step_info_reshapes_like_distributed_collector(self):
+        alg = self._make_alg()
+        t, b = 2, 3
+        batch_size = t * b
+        train_state = alg.get_initial_train_state(batch_size=batch_size)
+        inputs = self._make_train_time_step(batch_size=batch_size)
+        rollout_info = self._make_rollout_info(
+            batch_size=batch_size, num_actor_critic=alg._num_actor_critic)
+
+        step = alg.train_step(inputs, train_state, rollout_info)
+        info_params = dist_utils.distributions_to_params(step.info)
+        reshaped = alf.nest.map_structure(
+            lambda x: x.reshape(t, b, *x.shape[1:]), info_params)
+
+        self.assertEqual(tuple(reshaped.eval_trust_metric.shape), (t, b))
+        self.assertEqual(tuple(reshaped.grad_trust_metric.shape), (t, b))
+        self.assertEqual(tuple(reshaped.actor.loss.shape), (t, b))
+        self.assertEqual(tuple(reshaped.actor.extra.eval_action_loss.shape),
+                         (t, b))
+        self.assertEqual(tuple(reshaped.actor.extra.grad_trust_metric.shape),
+                         (t, b))
+        self.assertEqual(tuple(reshaped.critic.eval_trust_metric.shape), (t, b))
 
     def test_calc_loss_with_synthetic_critic_info(self):
         alg = self._make_alg(use_bootstrap_critics=True, bootstrap_mask_prob=0.5)
@@ -179,11 +237,11 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             critic=BafcCriticInfo(
                 critic=torch.zeros(t, b, n, n),
                 target_critic=torch.zeros(t, b, n, n),
-                eval_trust_metric=torch.tensor(1.2)),
+                eval_trust_metric=torch.full((t, b), 1.2)),
             discounted_return=torch.zeros(t, b),
             bootstrap_mask=torch.ones(t, b, n),
-            eval_trust_metric=torch.tensor(1.2),
-            grad_trust_metric=torch.tensor(1.5))
+            eval_trust_metric=torch.full((t, b), 1.2),
+            grad_trust_metric=torch.full((t, b), 1.5))
 
         loss = alg.calc_loss(info)
 
@@ -208,11 +266,291 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._last_eval_trust.ndim, 0)
         self.assertEqual(alg._last_grad_trust.ndim, 0)
 
+    def test_after_update_respects_trust_metric_interval(self):
+        alg = self._make_alg(
+            trust_metric_update_interval=2, monitor_trust_metrics=True)
+        inputs = self._make_train_time_step(batch_size=4)
+
+        with mock.patch.object(
+                alg,
+                "_compute_eval_trust_metric",
+                side_effect=[torch.tensor(1.25),
+                             torch.tensor(2.5)]) as eval_mock, mock.patch.object(
+                                 alg,
+                                 "_compute_grad_generalization_trust_metric",
+                                 side_effect=[torch.tensor(1.75),
+                                              torch.tensor(3.5)]) as grad_mock:
+            alg.after_update(inputs, BafcInfo())
+            self.assertEqual(eval_mock.call_count, 1)
+            self.assertEqual(grad_mock.call_count, 1)
+            self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.25))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.75))
+
+            alg.after_update(inputs, BafcInfo())
+            self.assertEqual(eval_mock.call_count, 1)
+            self.assertEqual(grad_mock.call_count, 1)
+            self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.25))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.75))
+
+            alg.after_update(inputs, BafcInfo())
+            self.assertEqual(eval_mock.call_count, 2)
+            self.assertEqual(grad_mock.call_count, 2)
+            self.assertTensorClose(alg._last_eval_trust, torch.tensor(2.5))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(3.5))
+
+    def test_calc_loss_is_independent_of_trust_metrics(self):
+        alg = self._make_alg(use_bootstrap_critics=True, bootstrap_mask_prob=0.5)
+        t, b, n = 2, 3, alg._num_actor_critic
+        base_info = BafcInfo(
+            reward=torch.zeros(t, b),
+            step_type=torch.full((t, b), StepType.MID, dtype=torch.int64),
+            discount=torch.ones(t, b),
+            action=torch.zeros(t, b, 2),
+            actor=LossInfo(
+                loss=torch.ones(t, b),
+                extra=BafcActorInfo(
+                    eval_action_loss=torch.ones(t, b),
+                    grad_trust_metric=torch.full((t, b), 1.5))),
+            critic=BafcCriticInfo(
+                critic=torch.zeros(t, b, n, n),
+                target_critic=torch.zeros(t, b, n, n),
+                eval_trust_metric=torch.full((t, b), 1.2)),
+            discounted_return=torch.zeros(t, b),
+            bootstrap_mask=torch.ones(t, b, n),
+            eval_trust_metric=torch.full((t, b), 1.2),
+            grad_trust_metric=torch.full((t, b), 1.5))
+        changed_metrics = base_info._replace(
+            actor=base_info.actor._replace(
+                extra=base_info.actor.extra._replace(
+                    grad_trust_metric=torch.full((t, b), 9.0))),
+            critic=base_info.critic._replace(
+                eval_trust_metric=torch.full((t, b), 8.0)),
+            eval_trust_metric=torch.full((t, b), 7.0),
+            grad_trust_metric=torch.full((t, b), 6.0))
+
+        base_loss = alg.calc_loss(base_info)
+        changed_loss = alg.calc_loss(changed_metrics)
+
+        self.assertTensorClose(base_loss.loss, changed_loss.loss)
+        self.assertTensorClose(base_loss.scalar_loss, changed_loss.scalar_loss)
+
+    def test_eval_trust_metric_matches_feature_formula(self):
+        alg = self._make_alg(trust_cov_reg=0.25)
+        obs = torch.randn(3, 4)
+        ref_action = torch.full((3, alg._num_actor_critic, 2), 0.5)
+        beh_action = torch.full((3, alg._num_actor_critic, 2), -0.25)
+        phi_ref = torch.tensor(
+            [
+                [[1.0, 0.0, 2.0], [0.5, 1.0, 0.0], [1.5, 0.0, 1.0]],
+                [[0.0, 1.0, 1.0], [1.0, 0.5, 0.5], [0.5, 1.5, 0.0]],
+                [[1.0, 1.0, 0.0], [0.0, 0.5, 1.5], [1.0, 0.5, 1.0]],
+            ])
+        phi_beh = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0], [0.5, 1.0, 0.0], [1.0, 0.5, 0.0]],
+                [[0.0, 1.0, 0.0], [1.0, 0.5, 0.5], [0.0, 1.0, 0.5]],
+                [[1.0, 1.0, 0.0], [0.5, 0.0, 1.0], [0.5, 0.5, 1.0]],
+            ])
+
+        with mock.patch.object(
+                alg._reference_actor_networks,
+                "forward",
+                return_value=(ref_action, ())), mock.patch.object(
+                    alg._behavior_actor_networks,
+                    "forward",
+                    return_value=(beh_action, ())), mock.patch.object(
+                        alg,
+                        "_compute_actor_encoding",
+                        return_value=torch.zeros(
+                            alg._num_actor_critic, 1)):
+
+            def _feature_map(_obs, _actor_encoding, action, critic_network=None):
+                del _obs, _actor_encoding, critic_network
+                if torch.equal(action, ref_action):
+                    return phi_ref.clone()
+                if torch.equal(action, beh_action):
+                    return phi_beh.clone()
+                raise AssertionError("Unexpected action tensor passed to feature map")
+
+            with mock.patch.object(
+                    alg,
+                    "_compute_snapshot_feature_map",
+                    side_effect=_feature_map):
+                trust = alg._compute_eval_trust_metric(obs)
+
+        beh_by_group = phi_beh.permute(1, 0, 2)
+        cov = beh_by_group.transpose(1, 2) @ beh_by_group / beh_by_group.shape[1]
+        cov = cov + 0.25 * torch.eye(3).unsqueeze(0)
+        cov_inv = torch.linalg.pinv(cov)
+        ref_by_group = phi_ref.permute(1, 0, 2)
+        manual = ((ref_by_group @ cov_inv) * ref_by_group).sum(-1).mean()
+        self.assertTensorClose(trust, manual)
+
+    def test_grad_trust_c2_zero_for_constant_frozen_features(self):
+        alg = self._make_alg(
+            trust_metric_num_obs=3, trust_metric_num_feature_coords=3)
+        obs = torch.randn(5, 4)
+
+        def _constant_feature_map(observation,
+                                  actor_encoding,
+                                  action,
+                                  critic_network=None):
+            del actor_encoding, action, critic_network
+            return torch.ones(
+                observation.shape[0],
+                alg._num_actor_critic,
+                4,
+                dtype=observation.dtype,
+                device=observation.device)
+
+        with mock.patch.object(
+                alg,
+                "_compute_snapshot_feature_map",
+                side_effect=_constant_feature_map):
+            c1, c2 = alg._compute_grad_generalization_trust_components(obs)
+
+        self.assertTrue(torch.isfinite(c1).item())
+        self.assertTrue(torch.isfinite(c2).item())
+        self.assertLess(c2.item(), 1e-6)
+
+    def test_grad_trust_c1_tracks_policy_jacobian(self):
+        alg = self._make_alg(
+            trust_metric_num_obs=4, trust_metric_num_feature_coords=2)
+        obs = torch.randn(6, 4)
+        alg._actor_networks = _ScaleActor(alg._num_actor_critic, 2)
+        alg._reference_actor_networks = _ScaleActor(alg._num_actor_critic, 2)
+
+        def _constant_feature_map(observation,
+                                  actor_encoding,
+                                  action,
+                                  critic_network=None):
+            del actor_encoding, action, critic_network
+            return torch.ones(
+                observation.shape[0],
+                alg._num_actor_critic,
+                3,
+                dtype=observation.dtype,
+                device=observation.device)
+
+        with mock.patch.object(
+                alg,
+                "_compute_actor_encoding",
+                return_value=torch.zeros(alg._num_actor_critic, 1)), mock.patch.object(
+                    alg,
+                    "_compute_snapshot_feature_map",
+                    side_effect=_constant_feature_map):
+            c1_before, c2_before = alg._compute_grad_generalization_trust_components(
+                obs)
+            with torch.no_grad():
+                alg._actor_networks.scale.fill_(1.5)
+            c1_after, c2_after = alg._compute_grad_generalization_trust_components(
+                obs)
+
+        self.assertLess(c2_before.item(), 1e-6)
+        self.assertLess(c2_after.item(), 1e-6)
+        self.assertGreater(c1_after.item(), c1_before.item())
+
+    def test_grad_trust_c2_increases_when_features_depend_on_actor(self):
+        alg = self._make_alg(
+            trust_metric_num_obs=4, trust_metric_num_feature_coords=3)
+        obs = torch.randn(6, 4)
+
+        def _constant_feature_map(observation,
+                                  actor_encoding,
+                                  action,
+                                  critic_network=None):
+            del actor_encoding, action, critic_network
+            return torch.ones(
+                observation.shape[0],
+                alg._num_actor_critic,
+                3,
+                dtype=observation.dtype,
+                device=observation.device)
+
+        def _action_feature_map(observation,
+                                actor_encoding,
+                                action,
+                                critic_network=None):
+            del actor_encoding, critic_network
+            action = alg._ensure_group_action(action)
+            ones = torch.ones(
+                observation.shape[0], alg._num_actor_critic, 1,
+                dtype=action.dtype,
+                device=action.device)
+            return torch.cat([action, ones], dim=-1)
+
+        with mock.patch.object(
+                alg,
+                "_compute_snapshot_feature_map",
+                side_effect=_constant_feature_map):
+            _, c2_constant = alg._compute_grad_generalization_trust_components(
+                obs)
+        with mock.patch.object(
+                alg,
+                "_compute_snapshot_feature_map",
+                side_effect=_action_feature_map):
+            _, c2_action = alg._compute_grad_generalization_trust_components(obs)
+
+        self.assertLess(c2_constant.item(), 1e-6)
+        self.assertGreater(c2_action.item(), c2_constant.item() + 1e-6)
+
+    def test_grad_trust_does_not_touch_critic_parameter_grads(self):
+        alg = self._make_alg(trust_metric_num_obs=3)
+        obs = torch.randn(5, 4)
+
+        for param in alg._critic_networks.parameters():
+            param.grad = None
+        for param in alg._snapshot_critic_networks.parameters():
+            param.grad = None
+
+        c1, c2 = alg._compute_grad_generalization_trust_components(obs)
+
+        self.assertTrue(torch.isfinite(c1).item())
+        self.assertTrue(torch.isfinite(c2).item())
+        self.assertTrue(
+            all(not param.requires_grad
+                for param in alg._snapshot_critic_networks.parameters()))
+        self.assertTrue(
+            all(param.grad is None for param in alg._critic_networks.parameters()))
+        self.assertTrue(
+            all(param.grad is None
+                for param in alg._snapshot_critic_networks.parameters()))
+
+    def test_snapshot_feature_map_matches_penultimate_critic_layer(self):
+        alg = self._make_alg(trust_metric_num_obs=3)
+        obs = torch.randn(5, 4)
+        action = alg._ensure_group_action(
+            alg._reference_actor_networks(obs)[0]).detach()
+        actor_encoding = alg._compute_actor_encoding(
+            alg._reference_actor_networks).detach()
+
+        phi = alg._compute_snapshot_feature_map(obs, actor_encoding, action)
+        critic = alg._snapshot_critic_networks
+        critic_core = getattr(critic, "_pnet", critic)
+        head_idx = alg._critic_feature_head_index(critic)
+        head = critic_core._networks[head_idx]
+        q_from_phi = head(phi)
+        if isinstance(q_from_phi, tuple):
+            q_from_phi = q_from_phi[0]
+        critic_obs = obs.unsqueeze(1).expand(-1, alg._num_actor_critic, -1)
+        q_direct = critic(
+            (actor_encoding.unsqueeze(0).expand(obs.shape[0], -1, -1),
+             (critic_obs, action)))[0]
+        if q_from_phi.ndim == q_direct.ndim + 1 and q_from_phi.shape[-1] == 1:
+            q_from_phi = q_from_phi.squeeze(-1)
+
+        self.assertEqual(tuple(phi.shape[:2]), tuple(q_direct.shape[:2]))
+        self.assertGreater(phi.shape[-1], 1)
+        self.assertNotEqual(phi.shape[-1], action.shape[-1])
+        self.assertEqual(tuple(q_from_phi.shape), tuple(q_direct.shape))
+        self.assertTensorClose(q_from_phi, q_direct)
+
     def test_utd_mode_switch_via_after_update(self):
         alg = self._make_alg(
             actor_utd=1,
             critic_utd=2,
             num_updates_per_train_iter=3,
+            trust_metric_update_interval=2,
             eval_trust_max=1e-6,
             delta_trust_max=1e-6,
             monitor_trust_metrics=True)
