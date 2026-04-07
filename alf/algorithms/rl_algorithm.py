@@ -825,7 +825,6 @@ class RLAlgorithm(Algorithm):
                         experience = self.unroll(unroll_length)
                         if experience:
                             self.summarize_rollout(experience)
-                            self.summarize_metrics()
                             rollout_info = experience.rollout_info
                             if config.use_root_inputs_for_after_train_iter:
                                 root_inputs = experience.time_step
@@ -835,6 +834,10 @@ class RLAlgorithm(Algorithm):
     def _train_iter_off_policy(self):
         """User may override this for their own training procedure."""
         unrolled, root_inputs, rollout_info = self._unroll_iter_off_policy()
+
+        # Keep environment metrics on the training summary schedule even when
+        # rollout is skipped for some off-policy iterations.
+        self.summarize_metrics()
 
         # replay buffer may not have been created for two different reasons:
         # 1. in online RL training (``has_offline`` is False), unroll is not

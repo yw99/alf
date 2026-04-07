@@ -32,13 +32,25 @@ optimizer = Adam(lr=3e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
 actor_use_ln = False
+trust_cov_reg = 1e-4
+monitor_trust_metrics = True
+eval_trust_max = 2.0
+delta_trust_max = 2.0
+eval_gate_max_consecutive_rollout_actor_holds = 5
+grad_gate_max_consecutive_critic_extensions = 5
 
 if debug_mode:
+    trust_metric_num_obs = 64
+    trust_metric_num_feature_coords = 32
+
     actor_hidden_layers = (32, 32)
     joint_hidden_layers = (32, 32)
     num_actor_eval_samples = 64
     initial_collect_steps = 1000
 else:
+    trust_metric_num_obs = 128
+    trust_metric_num_feature_coords = 64
+
     actor_hidden_layers = (256, 256)
     joint_hidden_layers = (256, 256)
     num_actor_eval_samples = 512
@@ -83,6 +95,17 @@ alf.config(
     actor_eval_type='last_two',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,
+    trust_cov_reg=trust_cov_reg,
+    trust_metric_num_obs=trust_metric_num_obs,
+    trust_metric_num_feature_coords=trust_metric_num_feature_coords,
+    monitor_trust_metrics=monitor_trust_metrics,
+    eval_trust_max=eval_trust_max,
+    delta_trust_max=delta_trust_max,
+    trust_metric_update_interval=1,
+    enable_eval_rollout_skip_gate=True,
+    enable_grad_critic_extend_gate=True,
+    eval_gate_max_consecutive_rollout_actor_holds=eval_gate_max_consecutive_rollout_actor_holds,
+    grad_gate_max_consecutive_critic_extensions=grad_gate_max_consecutive_critic_extensions,
     actor_utd=1,
     critic_utd=3,
     # actor_encoder_optimizer=Adam(lr=4e-5),

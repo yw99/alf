@@ -126,6 +126,23 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             discounted_return=torch.zeros(batch_size),
             bootstrap_mask=torch.ones(batch_size, num_actor_critic))
 
+    def _clone_state_dict(self, module):
+        return {
+            name: value.detach().clone()
+            for name, value in module.state_dict().items()
+        }
+
+    def _assert_state_dict_equal(self, module, expected_state):
+        actual_state = module.state_dict()
+        self.assertEqual(set(actual_state.keys()), set(expected_state.keys()))
+        for name, value in actual_state.items():
+            self.assertTensorEqual(value, expected_state[name])
+
+    def _fill_module(self, module, fill_value):
+        with torch.no_grad():
+            for parameter in module.parameters():
+                parameter.fill_(fill_value)
+
     def test_initialization_smoke(self):
         alg = self._make_alg()
         self.assertIsInstance(alg, BafcAlgorithmV3)
@@ -574,6 +591,216 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(step3.info.critic, BafcCriticInfo())
         alg.after_update(inputs, step3.info)
         self.assertEqual(alg._train_mode, TrainMode.critic)
+
+
+    def test_eval_gate_low_trust_no_longer_skips_rollout(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            eval_gate_max_consecutive_rollout_actor_holds=2)
+        alg._last_eval_trust = torch.tensor(1.0)
+
+        self.assertFalse(alg.request_skip_rollout_iter())
+        self.assertFalse(alg._last_eval_gate_skip_decision)
+        self.assertFalse(alg._last_rollout_skip_due_eval_gate)
+        self.assertEqual(alg._eval_gate_skip_count, 0)
+        self.assertEqual(alg._rollout_skip_due_eval_gate_count, 0)
+
+    def test_critic_mode_skip_not_counted_as_eval_gate_skip(self):
+        alg = self._make_alg(enable_eval_rollout_skip_gate=True)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._last_eval_trust = torch.tensor(0.1)
+
+        self.assertTrue(alg.request_skip_rollout_iter())
+        self.assertFalse(alg._last_eval_gate_skip_decision)
+        self.assertFalse(alg._last_rollout_skip_due_eval_gate)
+        self.assertEqual(alg._eval_gate_skip_count, 0)
+        self.assertEqual(alg._rollout_skip_due_eval_gate_count, 0)
+
+    def test_low_eval_trust_holds_behavior_actor_and_advances_reference(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            monitor_trust_metrics=False)
+        inputs = self._make_train_time_step(batch_size=4)
+        behavior_before = self._clone_state_dict(alg._behavior_actor_networks)
+
+        self._fill_module(alg._actor_networks, 0.5)
+        actor_after = self._clone_state_dict(alg._actor_networks)
+        alg._last_eval_trust = torch.tensor(1.0)
+
+        alg.after_update(inputs, BafcInfo())
+
+        self._assert_state_dict_equal(alg._behavior_actor_networks,
+                                      behavior_before)
+        self._assert_state_dict_equal(alg._reference_actor_networks,
+                                      actor_after)
+        self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 1)
+        self.assertEqual(alg._rollout_actor_hold_due_eval_gate_count, 1)
+        self.assertTrue(alg._last_rollout_actor_held_due_eval_gate)
+        self.assertFalse(alg._last_rollout_actor_refreshed_from_reference)
+        self.assertFalse(
+            alg._last_rollout_actor_refresh_forced_by_eval_gate_cap)
+
+    def test_high_eval_trust_refreshes_behavior_actor_and_resets_hold_counter(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            monitor_trust_metrics=False)
+        inputs = self._make_train_time_step(batch_size=4)
+
+        self._fill_module(alg._behavior_actor_networks, -1.0)
+        self._fill_module(alg._reference_actor_networks, 1.0)
+        self._fill_module(alg._actor_networks, 2.0)
+        reference_before = self._clone_state_dict(alg._reference_actor_networks)
+        actor_after = self._clone_state_dict(alg._actor_networks)
+        alg._eval_gate_consecutive_rollout_actor_holds = 2
+        alg._last_eval_trust = torch.tensor(10.0)
+
+        alg.after_update(inputs, BafcInfo())
+
+        self._assert_state_dict_equal(alg._behavior_actor_networks,
+                                      reference_before)
+        self._assert_state_dict_equal(alg._reference_actor_networks,
+                                      actor_after)
+        self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 0)
+        self.assertFalse(alg._last_rollout_actor_held_due_eval_gate)
+        self.assertTrue(alg._last_rollout_actor_refreshed_from_reference)
+        self.assertFalse(
+            alg._last_rollout_actor_refresh_forced_by_eval_gate_cap)
+
+    def test_eval_gate_hold_cap_forces_rollout_actor_refresh(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            monitor_trust_metrics=False,
+            eval_gate_max_consecutive_rollout_actor_holds=2)
+        inputs = self._make_train_time_step(batch_size=4)
+
+        self._fill_module(alg._behavior_actor_networks, -1.0)
+        self._fill_module(alg._reference_actor_networks, 1.0)
+        self._fill_module(alg._actor_networks, 2.0)
+        reference_before = self._clone_state_dict(alg._reference_actor_networks)
+        actor_after = self._clone_state_dict(alg._actor_networks)
+        alg._eval_gate_consecutive_rollout_actor_holds = 2
+        alg._last_eval_trust = torch.tensor(1.0)
+
+        alg.after_update(inputs, BafcInfo())
+
+        self._assert_state_dict_equal(alg._behavior_actor_networks,
+                                      reference_before)
+        self._assert_state_dict_equal(alg._reference_actor_networks,
+                                      actor_after)
+        self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 0)
+        self.assertEqual(alg._rollout_actor_hold_due_eval_gate_count, 0)
+        self.assertFalse(alg._last_rollout_actor_held_due_eval_gate)
+        self.assertTrue(alg._last_rollout_actor_refreshed_from_reference)
+        self.assertTrue(
+            alg._last_rollout_actor_refresh_forced_by_eval_gate_cap)
+
+    def test_rollout_hold_cap_alias_old_name_only_works(self):
+        alg = self._make_alg(eval_gate_max_consecutive_rollout_skips=7)
+
+        self.assertEqual(alg._eval_gate_max_consecutive_rollout_actor_holds, 7)
+
+    def test_rollout_hold_cap_new_name_only_works(self):
+        alg = self._make_alg(
+            eval_gate_max_consecutive_rollout_actor_holds=6)
+
+        self.assertEqual(alg._eval_gate_max_consecutive_rollout_actor_holds, 6)
+
+    def test_rollout_hold_cap_conflicting_aliases_fail(self):
+        with self.assertRaisesRegex(
+                ValueError,
+                "must match when both are provided"):
+            self._make_alg(
+                eval_gate_max_consecutive_rollout_actor_holds=6,
+                eval_gate_max_consecutive_rollout_skips=5)
+
+    def test_grad_gate_extends_critic_block_and_bumps_counter(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=2,
+            num_updates_per_train_iter=3,
+            enable_grad_critic_extend_gate=True,
+            monitor_trust_metrics=False)
+        alg._train_mode = TrainMode.critic
+        alg._critic_update_counter = 2
+
+        alg._last_grad_trust = torch.tensor(1.0)
+        before = alg._trust_metric_update_counter
+        alg._update_train_mode()
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertTrue(alg._last_grad_gate_extended)
+        self.assertEqual(alg._grad_gate_extension_count, 1)
+        self.assertEqual(alg._trust_metric_update_counter, before + 1)
+
+        alg._last_grad_trust = torch.tensor(3.0)
+        before = alg._trust_metric_update_counter
+        alg._update_train_mode()
+        self.assertEqual(alg._train_mode, TrainMode.actor)
+        self.assertFalse(alg._last_grad_gate_extended)
+        self.assertEqual(alg._trust_metric_update_counter, before)
+
+    def test_grad_gate_extension_cap_forces_actor_switch(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=2,
+            num_updates_per_train_iter=3,
+            enable_grad_critic_extend_gate=True,
+            grad_gate_max_consecutive_critic_extensions=1,
+            monitor_trust_metrics=False)
+        alg._train_mode = TrainMode.critic
+        alg._critic_update_counter = 2
+        alg._last_grad_trust = torch.tensor(0.0)
+
+        before = alg._trust_metric_update_counter
+        alg._update_train_mode()
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertTrue(alg._last_grad_gate_extended)
+        self.assertEqual(alg._grad_gate_consecutive_extensions, 1)
+        self.assertEqual(alg._grad_gate_extension_count, 1)
+        self.assertEqual(alg._trust_metric_update_counter, before + 1)
+
+        before = alg._trust_metric_update_counter
+        alg._update_train_mode()
+        self.assertEqual(alg._train_mode, TrainMode.actor)
+        self.assertFalse(alg._last_grad_gate_extended)
+        self.assertEqual(alg._grad_gate_consecutive_extensions, 0)
+        self.assertEqual(alg._grad_gate_extension_count, 1)
+        self.assertEqual(alg._trust_metric_update_counter, before)
+
+    def test_grad_gate_disabled_keeps_default_mode_switch(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=2,
+            num_updates_per_train_iter=3,
+            enable_grad_critic_extend_gate=False,
+            monitor_trust_metrics=False,
+            delta_trust_max=1e6)
+        alg._train_mode = TrainMode.critic
+        alg._critic_update_counter = 2
+        alg._last_grad_trust = torch.tensor(0.0)
+
+        before = alg._trust_metric_update_counter
+        alg._update_train_mode()
+
+        self.assertEqual(alg._train_mode, TrainMode.actor)
+        self.assertFalse(alg._last_grad_gate_extended)
+        self.assertEqual(alg._trust_metric_update_counter, before)
+
+    def test_rollout_uses_behavior_actor_when_gates_enabled(self):
+        alg = self._make_alg(enable_eval_rollout_skip_gate=True)
+        rollout_state = alg.get_initial_rollout_state(batch_size=1)
+        time_step = self._make_rollout_time_step(batch_size=1)
+        called = {}
+
+        def _fake_predict(actor_net, observation, state, train=False):
+            del observation, train
+            called['actor_net'] = actor_net
+            return torch.zeros(1, 2), state
+
+        with mock.patch.object(alg, "_predict_action", side_effect=_fake_predict):
+            alg.rollout_step(time_step, rollout_state)
+
+        self.assertIs(called['actor_net'], alg._behavior_actor_networks)
 
 
 if __name__ == "__main__":
