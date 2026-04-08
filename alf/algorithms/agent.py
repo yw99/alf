@@ -16,8 +16,6 @@
 import copy
 from typing import Callable
 
-import torch
-
 import alf
 from alf.algorithms.actor_critic_algorithm import ActorCriticAlgorithm
 from alf.algorithms.agent_helpers import AgentHelper
@@ -32,8 +30,6 @@ from alf.algorithms.rl_algorithm import RLAlgorithm
 from alf.data_structures import AlgStep, Experience
 from alf.data_structures import TimeStep, namedtuple
 from alf.tensor_specs import TensorSpec
-from alf.utils.summary_utils import record_time
-
 AgentState = namedtuple("AgentState",
                         ["rl", "irm", "goal_generator", "repr", "rw"],
                         default_value=())
@@ -319,66 +315,6 @@ class Agent(RLAlgorithm):
             info = info._replace(rw=rw_step.info)
 
         return AlgStep(output=rl_step.output, state=new_state, info=info)
-
-    def _unroll_iter_off_policy(self):
-        """Optionally skip rollout for one off-policy train iteration.
-
-        The skip decision is delegated to the child RL algorithm when it
-        provides ``request_skip_rollout_iter()``.
-        """
-        config: TrainerConfig = self._config
-
-        if not config.update_counter_every_mini_batch:
-            alf.summary.increment_global_counter()
-
-        unroll_length = self._remaining_unroll_length_fraction + config.unroll_length
-        self._remaining_unroll_length_fraction = unroll_length - int(
-            unroll_length)
-        unroll_length = int(unroll_length)
-
-        self._ensure_rollout_summary.tick()
-
-        unrolled = False
-        root_inputs = None
-        rollout_info = None
-        if (alf.summary.get_global_counter()
-                >= self._rl_train_after_update_steps
-                and (unroll_length > 0 or config.unroll_length == 0) and
-            (config.num_env_steps == 0
-             or self.get_step_metrics()[1].result() < config.num_env_steps)):
-            should_skip_rollout = False
-            gate_fn = getattr(self._rl_algorithm, 'request_skip_rollout_iter',
-                              None)
-            replay_ready = False
-            if self._replay_buffer is not None:
-                total_size = self._replay_buffer.total_size
-                if isinstance(total_size, torch.Tensor):
-                    replay_ready = bool(
-                        (total_size >= config.initial_collect_steps).item())
-                else:
-                    replay_ready = total_size >= config.initial_collect_steps
-
-            if callable(gate_fn) and replay_ready and unroll_length > 0:
-                should_skip_rollout = bool(gate_fn())
-
-            if not should_skip_rollout:
-                unrolled = True
-                with torch.set_grad_enabled(
-                        config.unroll_with_grad), torch.cuda.amp.autocast(
-                            config.enable_amp, dtype=self._config.amp_dtype):
-                    with record_time("time/unroll"):
-                        self.eval()
-                        # Keep rollout summary cadence consistent even if
-                        # some train iterations are skip-only.
-                        with self._ensure_rollout_summary:
-                            experience = self.unroll(unroll_length)
-                            if experience:
-                                self.summarize_rollout(experience)
-                                rollout_info = experience.rollout_info
-                                if config.use_root_inputs_for_after_train_iter:
-                                    root_inputs = experience.time_step
-                                del experience
-        return unrolled, root_inputs, rollout_info
 
     def train_step(self, time_step: TimeStep, state, rollout_info):
         new_state = AgentState()

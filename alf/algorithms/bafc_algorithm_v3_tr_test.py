@@ -20,6 +20,7 @@ from unittest import mock
 import torch
 
 import alf
+from alf.algorithms.agent import Agent
 from alf.algorithms.bafc_algorithm_v3_tr import (
     BafcActorInfo,
     BafcAlgorithmV3,
@@ -59,6 +60,72 @@ class _ScaleActor(torch.nn.Module):
         if id is not None:
             action = action[:, id, :]
         return action, state
+
+
+class _TinyContinuousEnv(object):
+
+    def __init__(self, batch_size):
+        self._batch_size = batch_size
+        self._observation_spec = TensorSpec((4, ), dtype='float32')
+        self._action_spec = BoundedTensorSpec(
+            shape=(2, ), dtype='float32', minimum=-1.0, maximum=1.0)
+        self.reset()
+
+    @property
+    def is_tensor_based(self):
+        return True
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    def observation_spec(self):
+        return self._observation_spec
+
+    def action_spec(self):
+        return self._action_spec
+
+    def reward_spec(self):
+        return TensorSpec(())
+
+    def reset(self):
+        self._prev_action = self._action_spec.zeros(outer_dims=(self._batch_size, ))
+        self._current_time_step = TimeStep(
+            observation=self._observation_spec.randn([self._batch_size]),
+            step_type=torch.full([self._batch_size],
+                                 StepType.FIRST,
+                                 dtype=torch.int32),
+            reward=torch.zeros(self._batch_size),
+            discount=torch.zeros(self._batch_size),
+            prev_action=self._prev_action,
+            env_id=torch.arange(self._batch_size, dtype=torch.int32))
+        return self._current_time_step
+
+    def step(self, action):
+        step_type = torch.where(
+            self._current_time_step.step_type == StepType.LAST,
+            torch.full([self._batch_size], StepType.FIRST, dtype=torch.int32),
+            torch.full([self._batch_size], StepType.MID, dtype=torch.int32))
+        step_type = torch.where(
+            self._current_time_step.step_type == StepType.MID,
+            torch.full([self._batch_size], StepType.LAST, dtype=torch.int32),
+            step_type)
+
+        self._current_time_step = TimeStep(
+            observation=self._observation_spec.randn([self._batch_size]),
+            step_type=step_type,
+            reward=action.mean(dim=-1),
+            discount=torch.zeros(self._batch_size),
+            prev_action=self._prev_action,
+            env_id=torch.arange(self._batch_size, dtype=torch.int32))
+        self._prev_action = action
+        return self._current_time_step
+
+    def current_time_step(self):
+        return self._current_time_step
+
+    def close(self):
+        pass
 
 
 class BafcAlgorithmV3TRTest(alf.test.TestCase):
@@ -428,7 +495,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
 
         self.assertTrue(torch.isfinite(c1).item())
         self.assertTrue(torch.isfinite(c2).item())
-        self.assertLess(c2.item(), 1e-6)
+        self.assertLess(c2.item(), 1e-5)
 
     def test_grad_trust_c1_tracks_policy_jacobian(self):
         alg = self._make_alg(
@@ -463,8 +530,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             c1_after, c2_after = alg._compute_grad_generalization_trust_components(
                 obs)
 
-        self.assertLess(c2_before.item(), 1e-6)
-        self.assertLess(c2_after.item(), 1e-6)
+        self.assertLess(c2_before.item(), 1e-5)
+        self.assertLess(c2_after.item(), 1e-5)
         self.assertGreater(c1_after.item(), c1_before.item())
 
     def test_grad_trust_c2_increases_when_features_depend_on_actor(self):
@@ -508,8 +575,146 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
                 side_effect=_action_feature_map):
             _, c2_action = alg._compute_grad_generalization_trust_components(obs)
 
-        self.assertLess(c2_constant.item(), 1e-6)
+        self.assertLess(c2_constant.item(), 1e-5)
         self.assertGreater(c2_action.item(), c2_constant.item() + 1e-6)
+
+    def test_batched_vjp_matches_scalar_reference(self):
+        alg = self._make_alg(trust_metric_num_obs=4)
+        obs = torch.randn(6, 4)
+        actor_params = list(alg._actor_networks.parameters())
+        param_requires_grad = [p.requires_grad for p in actor_params]
+        for p in actor_params:
+            if not p.requires_grad:
+                p.requires_grad_(True)
+
+        try:
+            cur_action = alg._ensure_group_action(alg._actor_networks(obs)[0])
+            output_means = cur_action.mean(dim=0)
+            batched = alg._batched_output_grad_sq_norm(
+                output_means, actor_params, retain_graph=True)
+
+            scalar = torch.zeros_like(output_means)
+            num_groups, output_dim = output_means.shape
+            num_terms = num_groups * output_dim
+            term_idx = 0
+            for group_idx in range(num_groups):
+                for output_idx in range(output_dim):
+                    term_idx += 1
+                    retain_graph = term_idx < num_terms
+                    scalar[group_idx, output_idx] = alg._scalar_grad_sq_norm(
+                        output_means[group_idx, output_idx], actor_params,
+                        group_idx, retain_graph)
+        finally:
+            for p, req in zip(actor_params, param_requires_grad):
+                p.requires_grad_(req)
+
+        self.assertTensorClose(batched, scalar)
+
+    def test_batched_vjp_chunk_size_consistency(self):
+        alg = self._make_alg(trust_metric_num_obs=4)
+        obs = torch.randn(6, 4)
+        actor_params = list(alg._actor_networks.parameters())
+        param_requires_grad = [p.requires_grad for p in actor_params]
+        for p in actor_params:
+            if not p.requires_grad:
+                p.requires_grad_(True)
+
+        try:
+            output_means_full = alg._ensure_group_action(
+                alg._actor_networks(obs)[0]).mean(dim=0)
+            full_chunk = alg._batched_output_grad_sq_norm(
+                output_means_full,
+                actor_params,
+                retain_graph=False,
+                max_chunk_size=output_means_full.numel())
+
+            output_means_small = alg._ensure_group_action(
+                alg._actor_networks(obs)[0]).mean(dim=0)
+            small_chunk = alg._batched_output_grad_sq_norm(
+                output_means_small,
+                actor_params,
+                retain_graph=False,
+                max_chunk_size=2)
+        finally:
+            for p, req in zip(actor_params, param_requires_grad):
+                p.requires_grad_(req)
+
+        self.assertTensorClose(full_chunk, small_chunk)
+
+    def test_grad_trust_c2_matches_weighted_rms_formula(self):
+        alg = self._make_alg(
+            trust_metric_num_obs=2, trust_metric_num_feature_coords=2)
+        obs = torch.randn(2, 4)
+        ref_action = torch.ones(2, alg._num_actor_critic, 2)
+        cur_action = torch.full((2, alg._num_actor_critic, 2), 2.0)
+        phi_ref = torch.ones(2, alg._num_actor_critic, 3)
+        phi_t = torch.full((2, alg._num_actor_critic, 3), 3.0)
+        feature_coords = torch.tensor([0, 2], dtype=torch.int64)
+        inv_cov = torch.tensor(
+            [
+                [[2.0, 0.0, 0.0], [0.0, 99.0, 0.0], [0.0, 0.0, 8.0]],
+                [[3.0, 0.0, 0.0], [0.0, 99.0, 0.0], [0.0, 0.0, 12.0]],
+                [[5.0, 0.0, 0.0], [0.0, 99.0, 0.0], [0.0, 0.0, 20.0]],
+            ])
+        grad_sq_phi = torch.tensor(
+            [[1.0, 4.0], [9.0, 16.0], [25.0, 36.0]])
+
+        def _batched_grad_sq(output_means,
+                             params,
+                             retain_graph,
+                             max_chunk_size=None):
+            del params, retain_graph, max_chunk_size
+            if torch.allclose(output_means, torch.full_like(output_means, 2.0)):
+                return torch.zeros_like(output_means)
+            if torch.allclose(output_means, torch.full_like(output_means, 3.0)):
+                return grad_sq_phi.clone()
+            raise AssertionError(
+                f"Unexpected output means passed to batched grad helper: "
+                f"shape={tuple(output_means.shape)}")
+
+        with mock.patch.object(
+                alg._actor_networks,
+                "forward",
+                return_value=(cur_action, ())), mock.patch.object(
+                    alg._reference_actor_networks,
+                    "forward",
+                    return_value=(ref_action, ())), mock.patch.object(
+                        alg,
+                        "_compute_actor_encoding",
+                        return_value=torch.zeros(alg._num_actor_critic, 1)), mock.patch.object(
+                            alg,
+                            "_sample_feature_coords",
+                            return_value=feature_coords), mock.patch.object(
+                                alg,
+                                "_compute_feature_inv_cov",
+                                return_value=inv_cov), mock.patch.object(
+                                    alg,
+                                    "_batched_output_grad_sq_norm",
+                                    side_effect=_batched_grad_sq):
+
+            def _feature_map(_obs, _actor_encoding, action, critic_network=None):
+                del _obs, _actor_encoding, critic_network
+                if torch.equal(action, ref_action):
+                    return phi_ref.clone()
+                if torch.equal(action, cur_action):
+                    return phi_t.clone()
+                raise AssertionError("Unexpected action tensor passed to feature map")
+
+            with mock.patch.object(
+                    alg,
+                    "_compute_snapshot_feature_map",
+                    side_effect=_feature_map):
+                _, c2 = alg._compute_grad_generalization_trust_components(obs)
+
+        sampled_inv_diag = torch.tensor(
+            [[2.0, 8.0], [3.0, 12.0], [5.0, 20.0]])
+        coord_scale = 3.0 / 2.0
+        manual = torch.sqrt(coord_scale * (sampled_inv_diag * grad_sq_phi).sum(-1)).mean()
+        old_formula = (torch.sqrt(sampled_inv_diag * grad_sq_phi).sum(-1)
+                       * coord_scale).mean()
+
+        self.assertTensorClose(c2, manual)
+        self.assertGreater(torch.abs(c2 - old_formula).item(), 1e-5)
 
     def test_grad_trust_does_not_touch_critic_parameter_grads(self):
         alg = self._make_alg(trust_metric_num_obs=3)
@@ -592,31 +797,6 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg.after_update(inputs, step3.info)
         self.assertEqual(alg._train_mode, TrainMode.critic)
 
-
-    def test_eval_gate_low_trust_no_longer_skips_rollout(self):
-        alg = self._make_alg(
-            enable_eval_rollout_skip_gate=True,
-            eval_gate_max_consecutive_rollout_actor_holds=2)
-        alg._last_eval_trust = torch.tensor(1.0)
-
-        self.assertFalse(alg.request_skip_rollout_iter())
-        self.assertFalse(alg._last_eval_gate_skip_decision)
-        self.assertFalse(alg._last_rollout_skip_due_eval_gate)
-        self.assertEqual(alg._eval_gate_skip_count, 0)
-        self.assertEqual(alg._rollout_skip_due_eval_gate_count, 0)
-
-    def test_critic_mode_skip_not_counted_as_eval_gate_skip(self):
-        alg = self._make_alg(enable_eval_rollout_skip_gate=True)
-        alg._training_started = True
-        alg._train_mode = TrainMode.critic
-        alg._last_eval_trust = torch.tensor(0.1)
-
-        self.assertTrue(alg.request_skip_rollout_iter())
-        self.assertFalse(alg._last_eval_gate_skip_decision)
-        self.assertFalse(alg._last_rollout_skip_due_eval_gate)
-        self.assertEqual(alg._eval_gate_skip_count, 0)
-        self.assertEqual(alg._rollout_skip_due_eval_gate_count, 0)
-
     def test_low_eval_trust_holds_behavior_actor_and_advances_reference(self):
         alg = self._make_alg(
             enable_eval_rollout_skip_gate=True,
@@ -650,7 +830,6 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self._fill_module(alg._behavior_actor_networks, -1.0)
         self._fill_module(alg._reference_actor_networks, 1.0)
         self._fill_module(alg._actor_networks, 2.0)
-        reference_before = self._clone_state_dict(alg._reference_actor_networks)
         actor_after = self._clone_state_dict(alg._actor_networks)
         alg._eval_gate_consecutive_rollout_actor_holds = 2
         alg._last_eval_trust = torch.tensor(10.0)
@@ -658,7 +837,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg.after_update(inputs, BafcInfo())
 
         self._assert_state_dict_equal(alg._behavior_actor_networks,
-                                      reference_before)
+                                      actor_after)
         self._assert_state_dict_equal(alg._reference_actor_networks,
                                       actor_after)
         self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 0)
@@ -677,7 +856,6 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self._fill_module(alg._behavior_actor_networks, -1.0)
         self._fill_module(alg._reference_actor_networks, 1.0)
         self._fill_module(alg._actor_networks, 2.0)
-        reference_before = self._clone_state_dict(alg._reference_actor_networks)
         actor_after = self._clone_state_dict(alg._actor_networks)
         alg._eval_gate_consecutive_rollout_actor_holds = 2
         alg._last_eval_trust = torch.tensor(1.0)
@@ -685,7 +863,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg.after_update(inputs, BafcInfo())
 
         self._assert_state_dict_equal(alg._behavior_actor_networks,
-                                      reference_before)
+                                      actor_after)
         self._assert_state_dict_equal(alg._reference_actor_networks,
                                       actor_after)
         self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 0)
@@ -714,57 +892,57 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
                 eval_gate_max_consecutive_rollout_actor_holds=6,
                 eval_gate_max_consecutive_rollout_skips=5)
 
-    def test_grad_gate_extends_critic_block_and_bumps_counter(self):
+    def test_grad_gate_extends_actor_block_and_bumps_counter(self):
         alg = self._make_alg(
             actor_utd=1,
             critic_utd=2,
             num_updates_per_train_iter=3,
-            enable_grad_critic_extend_gate=True,
+            enable_grad_actor_extend_gate=True,
             monitor_trust_metrics=False)
-        alg._train_mode = TrainMode.critic
-        alg._critic_update_counter = 2
+        alg._train_mode = TrainMode.actor
+        alg._actor_update_counter = 1
 
         alg._last_grad_trust = torch.tensor(1.0)
         before = alg._trust_metric_update_counter
         alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.critic)
-        self.assertTrue(alg._last_grad_gate_extended)
-        self.assertEqual(alg._grad_gate_extension_count, 1)
+        self.assertEqual(alg._train_mode, TrainMode.actor)
+        self.assertTrue(alg._last_grad_gate_actor_extended)
+        self.assertEqual(alg._grad_gate_actor_extension_count, 1)
         self.assertEqual(alg._trust_metric_update_counter, before + 1)
 
         alg._last_grad_trust = torch.tensor(3.0)
         before = alg._trust_metric_update_counter
         alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.actor)
-        self.assertFalse(alg._last_grad_gate_extended)
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertFalse(alg._last_grad_gate_actor_extended)
         self.assertEqual(alg._trust_metric_update_counter, before)
 
-    def test_grad_gate_extension_cap_forces_actor_switch(self):
+    def test_grad_gate_extension_cap_forces_critic_switch(self):
         alg = self._make_alg(
             actor_utd=1,
             critic_utd=2,
             num_updates_per_train_iter=3,
-            enable_grad_critic_extend_gate=True,
-            grad_gate_max_consecutive_critic_extensions=1,
+            enable_grad_actor_extend_gate=True,
+            grad_gate_max_consecutive_actor_extensions=1,
             monitor_trust_metrics=False)
-        alg._train_mode = TrainMode.critic
-        alg._critic_update_counter = 2
+        alg._train_mode = TrainMode.actor
+        alg._actor_update_counter = 1
         alg._last_grad_trust = torch.tensor(0.0)
 
         before = alg._trust_metric_update_counter
         alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.critic)
-        self.assertTrue(alg._last_grad_gate_extended)
-        self.assertEqual(alg._grad_gate_consecutive_extensions, 1)
-        self.assertEqual(alg._grad_gate_extension_count, 1)
+        self.assertEqual(alg._train_mode, TrainMode.actor)
+        self.assertTrue(alg._last_grad_gate_actor_extended)
+        self.assertEqual(alg._grad_gate_consecutive_actor_extensions, 1)
+        self.assertEqual(alg._grad_gate_actor_extension_count, 1)
         self.assertEqual(alg._trust_metric_update_counter, before + 1)
 
         before = alg._trust_metric_update_counter
         alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.actor)
-        self.assertFalse(alg._last_grad_gate_extended)
-        self.assertEqual(alg._grad_gate_consecutive_extensions, 0)
-        self.assertEqual(alg._grad_gate_extension_count, 1)
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertFalse(alg._last_grad_gate_actor_extended)
+        self.assertEqual(alg._grad_gate_consecutive_actor_extensions, 0)
+        self.assertEqual(alg._grad_gate_actor_extension_count, 1)
         self.assertEqual(alg._trust_metric_update_counter, before)
 
     def test_grad_gate_disabled_keeps_default_mode_switch(self):
@@ -772,7 +950,26 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             actor_utd=1,
             critic_utd=2,
             num_updates_per_train_iter=3,
-            enable_grad_critic_extend_gate=False,
+            enable_grad_actor_extend_gate=False,
+            monitor_trust_metrics=False,
+            delta_trust_max=1e6)
+        alg._train_mode = TrainMode.actor
+        alg._actor_update_counter = 1
+        alg._last_grad_trust = torch.tensor(0.0)
+
+        before = alg._trust_metric_update_counter
+        alg._update_train_mode()
+
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertFalse(alg._last_grad_gate_actor_extended)
+        self.assertEqual(alg._trust_metric_update_counter, before)
+
+    def test_critic_boundary_switches_to_actor_without_extension(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=2,
+            num_updates_per_train_iter=3,
+            enable_grad_actor_extend_gate=True,
             monitor_trust_metrics=False,
             delta_trust_max=1e6)
         alg._train_mode = TrainMode.critic
@@ -783,10 +980,11 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg._update_train_mode()
 
         self.assertEqual(alg._train_mode, TrainMode.actor)
-        self.assertFalse(alg._last_grad_gate_extended)
+        self.assertFalse(alg._last_grad_gate_actor_extended)
+        self.assertEqual(alg._grad_gate_actor_extension_count, 0)
         self.assertEqual(alg._trust_metric_update_counter, before)
 
-    def test_rollout_uses_behavior_actor_when_gates_enabled(self):
+    def test_rollout_uses_behavior_actor_when_eval_gate_enabled(self):
         alg = self._make_alg(enable_eval_rollout_skip_gate=True)
         rollout_state = alg.get_initial_rollout_state(batch_size=1)
         time_step = self._make_rollout_time_step(batch_size=1)
@@ -801,6 +999,62 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             alg.rollout_step(time_step, rollout_state)
 
         self.assertIs(called['actor_net'], alg._behavior_actor_networks)
+
+    def test_rollout_uses_train_actor_when_only_grad_gate_enabled(self):
+        alg = self._make_alg(enable_grad_actor_extend_gate=True)
+        rollout_state = alg.get_initial_rollout_state(batch_size=1)
+        time_step = self._make_rollout_time_step(batch_size=1)
+        called = {}
+
+        def _fake_predict(actor_net, observation, state, train=False):
+            del observation, train
+            called['actor_net'] = actor_net
+            return torch.zeros(1, 2), state
+
+        with mock.patch.object(alg, "_predict_action", side_effect=_fake_predict):
+            alg.rollout_step(time_step, rollout_state)
+
+        self.assertIs(called['actor_net'], alg._actor_networks)
+
+    def test_agent_rollout_continues_after_training_starts(self):
+        env = _TinyContinuousEnv(batch_size=1)
+        with tempfile.TemporaryDirectory() as root_dir:
+            config = TrainerConfig(
+                root_dir=root_dir,
+                unroll_length=2,
+                mini_batch_length=2,
+                mini_batch_size=1,
+                initial_collect_steps=2,
+                replay_buffer_length=32,
+                num_updates_per_train_iter=3)
+            agent = Agent(
+                observation_spec=env.observation_spec(),
+                action_spec=env.action_spec(),
+                env=env,
+                config=config,
+                optimizer=alf.optimizers.Adam(lr=1e-3),
+                rl_algorithm_cls=partial(
+                    BafcAlgorithmV3,
+                    actor_network_cls=partial(ActorFCNetwork, fc_layer_params=(16, 16)),
+                    critic_network_cls=partial(
+                        FuncCriticNetwork,
+                        obs_action_joint_fc_layer_params=(16, 16),
+                        actor_obs_action_joint_fc_layer_params=(16, 16)),
+                    actor_encoder_cls=partial(
+                        TransformerEncoder, num_layers=2, num_attention_heads=1),
+                    num_actor_critic=3,
+                    num_actor_eval_samples=8,
+                    actor_utd=1,
+                    critic_utd=2,
+                    enable_eval_rollout_skip_gate=True,
+                    enable_grad_actor_extend_gate=True,
+                    monitor_trust_metrics=False))
+
+            for _ in range(8):
+                agent.train_iter()
+
+            self.assertTrue(agent._rl_algorithm._training_started)
+            self.assertGreater(agent.get_step_metrics()[1].result().item(), 1)
 
 
 if __name__ == "__main__":

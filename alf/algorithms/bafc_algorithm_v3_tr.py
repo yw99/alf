@@ -117,12 +117,12 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  delta_trust_max: float = 2.0,
                  monitor_trust_metrics: bool = True,
                  enable_eval_rollout_skip_gate: bool = False,
-                 enable_grad_critic_extend_gate: bool = False,
+                 enable_grad_actor_extend_gate: bool = False,
                  eval_gate_max_consecutive_rollout_actor_holds:
                  Optional[int] = None,
                  eval_gate_max_consecutive_rollout_skips:
                  Optional[int] = None,
-                 grad_gate_max_consecutive_critic_extensions: Optional[int] = None,
+                 grad_gate_max_consecutive_actor_extensions: Optional[int] = None,
                  actor_utd: Optional[int] = None,
                  critic_utd: Optional[int] = None,
                  env=None,
@@ -191,9 +191,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 "Use `eval_gate_max_consecutive_rollout_actor_holds` instead.")
         assert eval_gate_max_consecutive_rollout_actor_holds >= 1, (
             "eval_gate_max_consecutive_rollout_actor_holds must be >= 1")
-        if grad_gate_max_consecutive_critic_extensions is not None:
-            assert grad_gate_max_consecutive_critic_extensions >= 1, (
-                "grad_gate_max_consecutive_critic_extensions must be >= 1 when set")
+        if grad_gate_max_consecutive_actor_extensions is not None:
+            assert grad_gate_max_consecutive_actor_extensions >= 1, (
+                "grad_gate_max_consecutive_actor_extensions must be >= 1 when set")
         if actor_utd is None and critic_utd is None:
             self._train_mode = TrainMode.standard
         else:
@@ -229,13 +229,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._delta_trust_max = delta_trust_max
         self._monitor_trust_metrics = monitor_trust_metrics
         self._enable_eval_rollout_skip_gate = enable_eval_rollout_skip_gate
-        self._enable_grad_critic_extend_gate = enable_grad_critic_extend_gate
+        self._enable_grad_actor_extend_gate = enable_grad_actor_extend_gate
         self._eval_gate_max_consecutive_rollout_actor_holds = (
             eval_gate_max_consecutive_rollout_actor_holds)
         self._eval_gate_max_consecutive_rollout_skips = (
             eval_gate_max_consecutive_rollout_actor_holds)
-        self._grad_gate_max_consecutive_critic_extensions = (
-            grad_gate_max_consecutive_critic_extensions)
+        self._grad_gate_max_consecutive_actor_extensions = (
+            grad_gate_max_consecutive_actor_extensions)
         self._bootstrap_mask = ()
         actor_networks = actor_network_cls(
             input_tensor_spec=observation_spec,
@@ -356,17 +356,12 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._trust_metric_update_counter = 0
         self._eval_gate_consecutive_rollout_actor_holds = 0
         self._rollout_actor_hold_due_eval_gate_count = 0
-        self._eval_gate_consecutive_rollout_skips = 0
-        self._eval_gate_skip_count = 0
-        self._grad_gate_extension_count = 0
-        self._grad_gate_consecutive_extensions = 0
+        self._grad_gate_actor_extension_count = 0
+        self._grad_gate_consecutive_actor_extensions = 0
         self._last_rollout_actor_held_due_eval_gate = False
         self._last_rollout_actor_refreshed_from_reference = False
         self._last_rollout_actor_refresh_forced_by_eval_gate_cap = False
-        self._last_eval_gate_skip_decision = False
-        self._last_rollout_skip_due_eval_gate = False
-        self._rollout_skip_due_eval_gate_count = 0
-        self._last_grad_gate_extended = False
+        self._last_grad_gate_actor_extended = False
 
         def _filter(x):
             return list(filter(lambda x: x is not None, x))
@@ -473,6 +468,95 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             create_graph=False,
             allow_unused=True)
         return self._group_grad_sq_norm(grads, group_idx)
+
+    def _batched_output_grad_sq_norm(self,
+                                     output_means: torch.Tensor,
+                                     params,
+                                     retain_graph: bool,
+                                     max_chunk_size: Optional[int] = None):
+        """Compute per-output grad squared norms with chunked batched VJPs.
+
+        Args:
+            output_means: Tensor shaped [G, D], where each scalar output is
+                differentiated w.r.t. ``params``.
+            params: Iterable of actor parameters.
+            retain_graph: Forwarded retain policy for the final successful
+                chunk so callers can chain further gradient queries.
+            max_chunk_size: Optional internal override used by tests.
+
+        Returns:
+            Tensor shaped [G, D] with per-output gradient squared norms,
+            matching the semantics of looping over scalars and calling
+            ``_scalar_grad_sq_norm``.
+        """
+        if not isinstance(output_means, torch.Tensor):
+            return self._actor_eval_samples.new_zeros((0, 0))
+        if output_means.ndim != 2:
+            raise ValueError(
+                f"Expected output_means with shape [G, D], got "
+                f"{tuple(output_means.shape)}")
+        if not output_means.requires_grad:
+            return output_means.new_zeros(output_means.shape)
+
+        num_groups, output_dim = output_means.shape
+        flat_outputs = output_means.reshape(-1)
+        num_outputs = flat_outputs.shape[0]
+        if num_outputs == 0:
+            return output_means.new_zeros(output_means.shape)
+
+        start_chunk = min(128, num_outputs)
+        if max_chunk_size is not None:
+            start_chunk = min(max(1, int(max_chunk_size)), num_outputs)
+
+        flat_group_idx = torch.arange(
+            num_groups, device=output_means.device).repeat_interleave(output_dim)
+        grad_sq = output_means.new_zeros(num_outputs)
+
+        chunk_size = start_chunk
+        while True:
+            try:
+                start = 0
+                while start < num_outputs:
+                    end = min(start + chunk_size, num_outputs)
+                    chunk_len = end - start
+                    row_idx = torch.arange(chunk_len, device=output_means.device)
+                    col_idx = torch.arange(start, end, device=output_means.device)
+                    basis = flat_outputs.new_zeros((chunk_len, num_outputs))
+                    basis[row_idx, col_idx] = 1.0
+
+                    keep_graph = retain_graph or (end < num_outputs)
+                    batched_grads = torch.autograd.grad(
+                        flat_outputs,
+                        params,
+                        grad_outputs=basis,
+                        retain_graph=keep_graph,
+                        create_graph=False,
+                        allow_unused=True,
+                        is_grads_batched=True)
+
+                    chunk_grad_sq = flat_outputs.new_zeros(chunk_len)
+                    chunk_group_idx = flat_group_idx[start:end]
+                    for grad, param in zip(batched_grads, params):
+                        if grad is None:
+                            continue
+                        if param.ndim > 0 and param.shape[0] == num_groups:
+                            selected = grad[row_idx, chunk_group_idx]
+                        else:
+                            selected = grad
+                        chunk_grad_sq = chunk_grad_sq + selected.reshape(
+                            chunk_len, -1).pow(2).sum(dim=1)
+
+                    grad_sq[start:end] = chunk_grad_sq
+                    start = end
+                return grad_sq.view(num_groups, output_dim)
+            except RuntimeError:
+                if chunk_size == 1:
+                    raise
+                next_chunk = max(1, chunk_size // 2)
+                logging.warning(
+                    "Batched VJP for grad-trust failed at chunk_size=%d; "
+                    "retrying with chunk_size=%d.", chunk_size, next_chunk)
+                chunk_size = next_chunk
 
     def _sample_metric_observations(self, observation):
         if not isinstance(observation, torch.Tensor):
@@ -659,25 +743,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
             action_dim = cur_action.shape[-1]
             num_groups = cur_action.shape[1]
-            grad_sq_mu = torch.zeros(
-                (num_groups, action_dim),
-                dtype=cur_action.dtype,
-                device=cur_action.device)
+            action_mean = cur_action.mean(dim=0)  # [G, A]
+            grad_sq_mu = self._batched_output_grad_sq_norm(
+                action_mean, actor_params, retain_graph=True)
             feature_dim = phi_t.shape[-1]
             feature_coords = self._sample_feature_coords(feature_dim, phi_t.device)
-            grad_sq_phi = torch.zeros(
-                (num_groups, feature_coords.shape[0]),
-                dtype=phi_t.dtype,
-                device=phi_t.device)
-            num_terms = num_groups * (action_dim + feature_coords.shape[0])
-            term_idx = 0
-            for group_idx in range(num_groups):
-                for action_idx in range(action_dim):
-                    term_idx += 1
-                    retain_graph = term_idx < num_terms
-                    scalar = cur_action[:, group_idx, action_idx].mean()
-                    grad_sq_mu[group_idx, action_idx] = self._scalar_grad_sq_norm(
-                        scalar, actor_params, group_idx, retain_graph)
 
             jacobian_norm = torch.sqrt(
                 torch.clamp(grad_sq_mu.sum(-1), min=0.) + 1e-12)
@@ -688,18 +758,17 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             sampled_inv_diag = a_inv_diag[:, feature_coords]
             # C2 is the deterministic proxy for D_theta phi_t: the frozen
             # feature map changes only through the current actor.
-            for group_idx in range(num_groups):
-                for local_idx, feature_idx in enumerate(feature_coords.tolist()):
-                    term_idx += 1
-                    retain_graph = term_idx < num_terms
-                    scalar = phi_t[:, group_idx, feature_idx].mean()
-                    grad_sq_phi[group_idx, local_idx] = self._scalar_grad_sq_norm(
-                        scalar, actor_params, group_idx, retain_graph)
+            phi_coord_mean = phi_t[:, :, feature_coords].mean(dim=0)  # [G, F']
+            grad_sq_phi = self._batched_output_grad_sq_norm(
+                phi_coord_mean, actor_params, retain_graph=False)
 
-            per_feature_weighted_norm = torch.sqrt(
-                torch.clamp(sampled_inv_diag * grad_sq_phi, min=0.) + 1e-12)
+            weighted_grad_sq = torch.clamp(sampled_inv_diag * grad_sq_phi,
+                                           min=0.)
             coord_scale = float(feature_dim) / float(feature_coords.shape[0])
-            c2 = torch.mean(per_feature_weighted_norm.sum(-1) * coord_scale)
+            c2 = torch.mean(
+                torch.sqrt(
+                    torch.clamp(coord_scale * weighted_grad_sq.sum(-1),
+                                min=0.) + 1e-12))
 
             return torch.clamp(c1, min=0.), torch.clamp(c2, min=0.)
         finally:
@@ -761,19 +830,6 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
         return action, new_state
 
-    def request_skip_rollout_iter(self):
-        """Decide whether to skip rollout for the current train iteration.
-
-        Returns ``True`` only when we should continue replay-only optimization
-        for the current update block (e.g. critic mode).
-        """
-        self._last_eval_gate_skip_decision = False
-        self._last_rollout_skip_due_eval_gate = False
-        # Avoid interleaving fresh rollout between consecutive critic updates.
-        if self._training_started and self._train_mode == TrainMode.critic:
-            return True
-        return False
-
     def predict_step(self, inputs: TimeStep, state: BafcActionState):
         action, action_state = self._predict_action(
             self._actor_networks,
@@ -803,8 +859,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 self._bootstrap_mask = torch.bernoulli(prob_t)
 
         rollout_actor_networks = self._actor_networks
-        if (self._enable_eval_rollout_skip_gate
-                or self._enable_grad_critic_extend_gate):
+        if self._enable_eval_rollout_skip_gate:
             rollout_actor_networks = self._behavior_actor_networks
         action, action_state = self._predict_action(
             rollout_actor_networks,
@@ -988,42 +1043,45 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         return state, info
 
     def _update_train_mode(self):
-        self._last_grad_gate_extended = False
+        self._last_grad_gate_actor_extended = False
         if self._train_mode == TrainMode.actor:
             if self._actor_update_counter % self._actor_utd == 0:
-                self._train_mode = TrainMode.critic
-                # self._critic_network.set_obs_action_batch_dominate(False)
-                for p in self._actor_networks.parameters():
-                    p.requires_grad_(False)
-                self._actor_eval_samples.requires_grad_(True)
-        elif self._train_mode == TrainMode.critic:
-            if self._critic_update_counter % self._critic_utd == 0:
-                should_extend_critic = False
-                if self._enable_grad_critic_extend_gate:
+                should_extend_actor = False
+                if self._enable_grad_actor_extend_gate:
                     grad_trust = float(
                         torch.as_tensor(self._last_grad_trust).reshape(
                             ()).item())
-                    should_extend_critic = grad_trust <= self._delta_trust_max
-                    if (should_extend_critic and
-                            self._grad_gate_max_consecutive_critic_extensions
+                    # Algorithm 3: continue actor-improvement steps while the
+                    # anchored critic remains trustworthy, and refresh critic
+                    # when grad trust violates the threshold.
+                    should_extend_actor = grad_trust <= self._delta_trust_max
+                    if (should_extend_actor and
+                            self._grad_gate_max_consecutive_actor_extensions
                             is not None and
-                            self._grad_gate_consecutive_extensions >=
-                            self._grad_gate_max_consecutive_critic_extensions):
-                        should_extend_critic = False
-                if should_extend_critic:
-                    self._last_grad_gate_extended = True
-                    self._grad_gate_extension_count += 1
-                    self._grad_gate_consecutive_extensions += 1
+                            self._grad_gate_consecutive_actor_extensions >=
+                            self._grad_gate_max_consecutive_actor_extensions):
+                        should_extend_actor = False
+                if should_extend_actor:
+                    self._last_grad_gate_actor_extended = True
+                    self._grad_gate_actor_extension_count += 1
+                    self._grad_gate_consecutive_actor_extensions += 1
                     # Advance the trust-metric scheduler by one extra count for
-                    # each gate-triggered critic block extension.
+                    # each gate-triggered actor block extension.
                     self._trust_metric_update_counter += 1
                 else:
-                    self._grad_gate_consecutive_extensions = 0
-                    self._train_mode = TrainMode.actor
-                    # self._critic_network.set_obs_action_batch_dominate(True)
+                    self._grad_gate_consecutive_actor_extensions = 0
+                    self._train_mode = TrainMode.critic
+                    # self._critic_network.set_obs_action_batch_dominate(False)
                     for p in self._actor_networks.parameters():
-                        p.requires_grad_(True)
-                    self._actor_eval_samples.requires_grad_(False)
+                        p.requires_grad_(False)
+                    self._actor_eval_samples.requires_grad_(True)
+        elif self._train_mode == TrainMode.critic:
+            if self._critic_update_counter % self._critic_utd == 0:
+                self._train_mode = TrainMode.actor
+                # self._critic_network.set_obs_action_batch_dominate(True)
+                for p in self._actor_networks.parameters():
+                    p.requires_grad_(True)
+                self._actor_eval_samples.requires_grad_(False)
 
     def train_step(self, inputs: TimeStep, state: BafcState,
                    rollout_info: BafcInfo):
@@ -1171,8 +1229,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 self._last_grad_trust = torch.ones_like(self._last_grad_trust)
         self._trust_metric_update_counter += 1
 
-        self._update_rollout_actor_from_eval_gate()
         self._sync_reference_from_current()
+        self._update_rollout_actor_from_eval_gate()
         self._update_train_mode()
         self._update_target_critic()
         self._sync_snapshot_critic_from_current()
@@ -1189,14 +1247,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._record_debug_scalar('eval_gate_enabled',
                                   float(self._enable_eval_rollout_skip_gate))
         self._record_debug_scalar('grad_gate_enabled',
-                                  float(self._enable_grad_critic_extend_gate))
-        self._record_debug_scalar(
-            'eval_gate_consecutive_rollout_skips',
-            float(self._eval_gate_consecutive_rollout_skips))
-        self._record_debug_scalar('rollout_skipped_due_eval_gate',
-                                  float(self._last_rollout_skip_due_eval_gate))
-        self._record_debug_scalar('rollout_skip_due_eval_gate_count',
-                                  float(self._rollout_skip_due_eval_gate_count))
+                                  float(self._enable_grad_actor_extend_gate))
         self._record_debug_scalar(
             'eval_gate_consecutive_rollout_actor_holds',
             float(self._eval_gate_consecutive_rollout_actor_holds))
@@ -1212,14 +1263,15 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._record_debug_scalar(
             'rollout_actor_refresh_forced_by_eval_gate_cap',
             float(self._last_rollout_actor_refresh_forced_by_eval_gate_cap))
-        self._record_debug_scalar('critic_extended_due_grad_gate',
-                                  float(self._last_grad_gate_extended))
-        self._record_debug_scalar('critic_extension_due_grad_gate_count',
-                                  float(self._grad_gate_extension_count))
-        self._record_debug_scalar('critic_extension_consecutive_count',
-                                  float(self._grad_gate_consecutive_extensions))
-        cap = self._grad_gate_max_consecutive_critic_extensions
+        self._record_debug_scalar('actor_extended_due_grad_gate',
+                                  float(self._last_grad_gate_actor_extended))
+        self._record_debug_scalar('actor_extension_due_grad_gate_count',
+                                  float(self._grad_gate_actor_extension_count))
+        self._record_debug_scalar(
+            'actor_extension_consecutive_count',
+            float(self._grad_gate_consecutive_actor_extensions))
+        cap = self._grad_gate_max_consecutive_actor_extensions
         if cap is None:
             cap = -1
-        self._record_debug_scalar('critic_extension_consecutive_cap',
+        self._record_debug_scalar('actor_extension_consecutive_cap',
                                   float(cap))

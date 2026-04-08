@@ -37,7 +37,7 @@ monitor_trust_metrics = True
 eval_trust_max = 2.0
 delta_trust_max = 2.0
 eval_gate_max_consecutive_rollout_actor_holds = 5
-grad_gate_max_consecutive_critic_extensions = 5
+grad_gate_max_consecutive_actor_extensions = 5
 
 if debug_mode:
     trust_metric_num_obs = 64
@@ -103,9 +103,9 @@ alf.config(
     delta_trust_max=delta_trust_max,
     trust_metric_update_interval=1,
     enable_eval_rollout_skip_gate=True,
-    enable_grad_critic_extend_gate=True,
+    enable_grad_actor_extend_gate=True,
     eval_gate_max_consecutive_rollout_actor_holds=eval_gate_max_consecutive_rollout_actor_holds,
-    grad_gate_max_consecutive_critic_extensions=grad_gate_max_consecutive_critic_extensions,
+    grad_gate_max_consecutive_actor_extensions=grad_gate_max_consecutive_actor_extensions,
     actor_utd=1,
     critic_utd=3,
     # actor_encoder_optimizer=Adam(lr=4e-5),
