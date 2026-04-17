@@ -47,6 +47,27 @@ class ReluMLPTest(parameterized.TestCase, alf.test.TestCase):
         self.assertEqual(x.shape, y.shape)
         self.assertLessEqual(float(torch.max(abs(x - y))), eps)
 
+    def _extract_same_sample_jacobian(self, jac):
+        batch_size = jac.shape[0]
+        blocks = []
+        for i in range(batch_size):
+            blocks.append(jac[i, :, i, :])
+        return torch.stack(blocks, dim=0)
+
+    def _expected_penultimate_dhdx_l2_mean(self, mlp, x):
+        if len(mlp._hidden_layers) == 0:
+            return torch.ones(
+                mlp._input_size, dtype=x.dtype, device=x.device)
+
+        x_ref = x.detach().clone().requires_grad_(True)
+        h = x_ref
+        for fc in mlp._fc_layers[:-1]:
+            h = fc(h)
+
+        jac_ad = jacobian(h, x_ref)
+        jac_same_sample = self._extract_same_sample_jacobian(jac_ad)
+        return jac_same_sample.norm(p=2, dim=-1).mean(dim=0)
+
     @parameterized.parameters(
         dict(hidden_layers=()),
         dict(hidden_layers=(2, )),
@@ -238,6 +259,85 @@ class ReluMLPTest(parameterized.TestCase, alf.test.TestCase):
         self.assertArrayEqual(jvp, jvp2, 1e-6)
         self.assertArrayEqual(jvp_partial1, jvp2_partial1, 1e-6)
         self.assertArrayEqual(jvp_partial2, jvp2_partial2, 1e-6)
+
+    @parameterized.parameters(
+        dict(hidden_layers=(2, )),
+        dict(hidden_layers=(2, 3), batch_size=1),
+        dict(hidden_layers=(3, 4)),
+    )
+    def test_cached_penultimate_dhdx_l2_mean_matches_autograd(
+            self,
+            hidden_layers=(2, ),
+            batch_size=2,
+            input_size=5):
+        spec = TensorSpec((input_size, ))
+        mlp = ReluMLP(spec, output_size=4, hidden_layers=hidden_layers)
+
+        x = torch.randn(batch_size, input_size, requires_grad=True)
+        mlp.compute_jac(x.detach().clone())
+
+        cached = mlp.get_cached_penultimate_dhdx_l2_mean()
+        expected = self._expected_penultimate_dhdx_l2_mean(mlp, x)
+
+        self.assertIsNotNone(cached)
+        self.assertArrayEqual(cached, expected, 1e-6)
+
+    def test_cached_penultimate_dhdx_l2_mean_latest_only(self):
+        input_size = 5
+        spec = TensorSpec((input_size, ))
+        mlp = ReluMLP(spec, output_size=4, hidden_layers=(3, 4))
+
+        x1 = torch.randn(2, input_size, requires_grad=True)
+        mlp.compute_jac(x1.detach().clone())
+
+        cached1 = mlp.get_cached_penultimate_dhdx_l2_mean()
+        expected1 = self._expected_penultimate_dhdx_l2_mean(mlp, x1)
+        self.assertIsNotNone(cached1)
+        self.assertArrayEqual(cached1, expected1, 1e-6)
+
+        x2 = torch.randn(2, input_size, requires_grad=True)
+        mlp.compute_jac(x2.detach().clone())
+
+        cached2 = mlp.get_cached_penultimate_dhdx_l2_mean()
+        expected2 = self._expected_penultimate_dhdx_l2_mean(mlp, x2)
+        self.assertIsNotNone(cached2)
+        self.assertArrayEqual(cached2, expected2, 1e-6)
+
+    def test_cached_penultimate_dhdx_l2_mean_no_hidden_layers_is_ones(self):
+        input_size = 5
+        spec = TensorSpec((input_size, ))
+        mlp = ReluMLP(spec, output_size=3, hidden_layers=())
+
+        x = torch.randn(4, input_size)
+        mlp.compute_jac(x)
+
+        cached = mlp.get_cached_penultimate_dhdx_l2_mean()
+        self.assertIsNotNone(cached)
+        expected = torch.ones_like(cached)
+        self.assertArrayEqual(cached, expected, 1e-6)
+
+    def test_cached_penultimate_dhdx_l2_mean_accessor_clear(self):
+        spec = TensorSpec((5, ))
+        mlp = ReluMLP(spec, output_size=4, hidden_layers=(2, ))
+
+        self.assertIsNone(mlp.get_cached_penultimate_dhdx_l2_mean())
+
+        x = torch.randn(2, 5)
+        mlp.compute_jac(x)
+
+        cached = mlp.get_cached_penultimate_dhdx_l2_mean(clear=True)
+        self.assertIsNotNone(cached)
+        self.assertIsNone(mlp.get_cached_penultimate_dhdx_l2_mean())
+
+    def test_cached_penultimate_dhdx_l2_mean_not_populated_by_backward_only(self):
+        spec = TensorSpec((5, ))
+        mlp = ReluMLP(spec, output_size=4, hidden_layers=(2, ))
+
+        x = torch.randn(3, 5, requires_grad=True)
+        y, _ = mlp(x)
+        y.square().sum().backward()
+
+        self.assertIsNone(mlp.get_cached_penultimate_dhdx_l2_mean())
 
 
 if __name__ == "__main__":

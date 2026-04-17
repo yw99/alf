@@ -35,11 +35,11 @@ use_obs_normalizer = True
 
 if debug_mode:
     hidden_layers = (64, 64)
-    unroll_length = 64
+    unroll_length = 1
     mini_batch_size = 128
 else:
     hidden_layers = dmc_conf.hidden_layers
-    unroll_length = 256
+    unroll_length = 1
     mini_batch_size = 256
 
 # PPO in ALF trains by repeatedly replaying one collected rollout batch.

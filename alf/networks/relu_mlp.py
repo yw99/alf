@@ -97,9 +97,33 @@ class ReluMLP(Network):
         last_fc = SimpleFC(input_size, self._output_size, activation=identity)
         self._fc_layers.append(last_fc)
 
+        # Cache the latest batch-mean vector of ||d h_j / d x||_2, where h is
+        # the penultimate post-ReLU hidden activation.
+        self._cached_penultimate_dhdx_l2_mean = None
+
     def __getitem__(self, i):
         """Get i-th (zero-based) FC layer"""
         return self._fc_layers[i]
+
+    def get_cached_penultimate_dhdx_l2_mean(self, clear=False):
+        """Return cached batch-mean ||d h_j / d x||_2 values.
+
+        Args:
+            clear (bool): if True, clear the cache after reading.
+
+        Returns:
+            Tensor or None: shape [hidden_layers[-1]] if hidden layers exist,
+                else shape [input_size]. ``None`` if no Jacobian computation has
+                populated the cache.
+        """
+        cached = self._cached_penultimate_dhdx_l2_mean
+        if clear:
+            self._cached_penultimate_dhdx_l2_mean = None
+        return cached
+
+    def _compute_penultimate_dhdx_l2_mean(self, penultimate_jac):
+        """Compute batch-mean ||d h_j / d x||_2 from penultimate Jacobian."""
+        return penultimate_jac.norm(p=2, dim=-1).mean(dim=0)
 
     def forward(self,
                 inputs,
@@ -124,6 +148,7 @@ class ReluMLP(Network):
             z = fc(z)
         if ndim == 1:
             z = z.squeeze(0)
+
         if requires_jac:
             z = (z, self._compute_jac())
         elif requires_jac_diag:
@@ -158,26 +183,61 @@ class ReluMLP(Network):
 
     def _compute_jac(self, output_partial_idx=None):
         """Compute the input-output Jacobian. """
+        # OLD _compute_jac (commented out):
+        # if output_partial_idx is None:
+        #     output_partial_idx = torch.arange(self._output_size)
+        #
+        # if len(self._fc_layers) > 1:
+        #     mask = (self._fc_layers[-2].hidden_neurons > 0).float()
+        #     J = torch.einsum('ia,ba,aj->bij',
+        #                      self._fc_layers[-1].weight[output_partial_idx, :],
+        #                      mask, self._fc_layers[-2].weight)
+        #     for fc in reversed(self._fc_layers[0:-2]):
+        #         mask = (fc.hidden_neurons > 0).float()
+        #         J = torch.einsum('bia,ba,aj->bij', J, mask, fc.weight)
+        # else:
+        #     mask = torch.ones_like(self._fc_layers[-1].hidden_neurons)
+        #     mask = mask[:, output_partial_idx]
+        #     J = torch.einsum('ji, bj->bji',
+        #                      self._fc_layers[-1].weight[output_partial_idx, :],
+        #                      mask)
+        #
+        # return J
 
         if output_partial_idx is None:
             output_partial_idx = torch.arange(self._output_size)
 
-        if len(self._fc_layers) > 1:
-            mask = (self._fc_layers[-2].hidden_neurons > 0).float()
-            J = torch.einsum('ia,ba,aj->bij',
-                             self._fc_layers[-1].weight[output_partial_idx, :],
-                             mask, self._fc_layers[-2].weight)
-            for fc in reversed(self._fc_layers[0:-2]):
-                mask = (fc.hidden_neurons > 0).float()
-                J = torch.einsum('bia,ba,aj->bij', J, mask, fc.weight)
-        else:
-            mask = torch.ones_like(self._fc_layers[-1].hidden_neurons)
-            mask = mask[:, output_partial_idx]
-            J = torch.einsum('ji, bj->bji',
-                             self._fc_layers[-1].weight[output_partial_idx, :],
-                             mask)
+        last_fc = self._fc_layers[-1]
+        hidden_layers = self._fc_layers[:-1]
+        output_weight = last_fc.weight[output_partial_idx, :]
 
-        return J  # [B, n_out, n_in]
+        if len(hidden_layers) == 0:
+            with torch.no_grad():
+                self._cached_penultimate_dhdx_l2_mean = torch.ones(
+                    self._input_size,
+                    dtype=last_fc.weight.dtype,
+                    device=last_fc.weight.device)
+            batch_size = last_fc.hidden_neurons.shape[0]
+            return output_weight.unsqueeze(0).expand(batch_size, -1, -1)
+
+        first_mask = (hidden_layers[0].hidden_neurons > 0).to(
+            dtype=hidden_layers[0].weight.dtype)
+        penultimate_jac = hidden_layers[0].weight.unsqueeze(0).expand(
+            first_mask.shape[0], -1, -1)
+        penultimate_jac = penultimate_jac * first_mask.unsqueeze(-1)
+
+        for fc in hidden_layers[1:]:
+            mask = (fc.hidden_neurons > 0).to(dtype=fc.weight.dtype)
+            penultimate_jac = torch.einsum('op,bpi->boi', fc.weight,
+                                           penultimate_jac)
+            penultimate_jac = penultimate_jac * mask.unsqueeze(-1)
+
+        with torch.no_grad():
+            self._cached_penultimate_dhdx_l2_mean = (
+                self._compute_penultimate_dhdx_l2_mean(
+                    penultimate_jac).detach())
+
+        return torch.einsum('op,bpi->boi', output_weight, penultimate_jac)
 
     def compute_jac_diag(self, inputs):
         """Compute diagonals of the input-output Jacobian. """

@@ -2,7 +2,7 @@
 # Launcher for a single BAFCv3-TR run.
 # Runs either a single trust-gated run or a single trust-disabled BAFCv3-TR run.
 #
-# Usage: bash run_bafcv3_tr_cheetah_run_1gpu.sh [options]
+# Usage: bash run_bafcv3_tr_cheetah_nondebug_1gpu.sh [options]
 #   -e, --env ENV_NAME                 DMC environment (default: cheetah:run)
 #   -d, --dir BASE_DIR                 Base results directory (default: /root/alf_results_v2)
 #   -n, --steps NUM_STEPS              Total env steps (default: 1000000)
@@ -43,9 +43,9 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v3"
+BASE_DIR="/root/alf_results_v3_nondebug"
 NUM_ENV_STEPS=1000000
-SEED=0
+SEED=1
 GPU=1
 EVAL_TRUST_MAX=40.0
 DELTA_TRUST_MAX=40.0
@@ -184,11 +184,9 @@ if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
-        --conf_param "debug_mode=True" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
-        --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         --conf_param "BafcAlgorithmV3.monitor_trust_metrics=False" \
         --conf_param "BafcAlgorithmV3.enable_eval_rollout_skip_gate=False" \
@@ -199,11 +197,9 @@ else
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
-        --conf_param "debug_mode=True" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
-        --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         --conf_param "BafcAlgorithmV3.monitor_trust_metrics=True" \
         --conf_param "BafcAlgorithmV3.eval_trust_max=${EVAL_TRUST_MAX}" \
