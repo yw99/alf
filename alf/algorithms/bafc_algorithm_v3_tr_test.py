@@ -352,7 +352,9 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
 
     def test_after_update_respects_trust_metric_interval(self):
         alg = self._make_alg(
-            trust_metric_update_interval=2, monitor_trust_metrics=True)
+            trust_metric_update_interval=2,
+            monitor_trust_metrics=True,
+            enable_eval_rollout_skip_gate=True)
         inputs = self._make_train_time_step(batch_size=4)
 
         with mock.patch.object(
@@ -381,6 +383,73 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             self.assertEqual(grad_mock.call_count, 2)
             self.assertTensorClose(alg._last_eval_trust, torch.tensor(2.5))
             self.assertTensorClose(alg._last_grad_trust, torch.tensor(3.5))
+
+    def test_after_update_skips_eval_metric_when_eval_gate_disabled(self):
+        alg = self._make_alg(
+            trust_metric_update_interval=2,
+            monitor_trust_metrics=True,
+            enable_eval_rollout_skip_gate=False)
+        inputs = self._make_train_time_step(batch_size=4)
+
+        with mock.patch.object(
+                alg,
+                "_compute_eval_trust_metric",
+                side_effect=AssertionError(
+                    "eval trust should not be computed when eval gate is disabled"
+                )) as eval_mock, mock.patch.object(
+                    alg,
+                    "_compute_grad_generalization_trust_metric",
+                    side_effect=[torch.tensor(1.75),
+                                 torch.tensor(3.5)]) as grad_mock:
+            alg.after_update(inputs, BafcInfo())
+            self.assertEqual(eval_mock.call_count, 0)
+            self.assertEqual(grad_mock.call_count, 1)
+            self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.0))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.75))
+
+            alg.after_update(inputs, BafcInfo())
+            self.assertEqual(eval_mock.call_count, 0)
+            self.assertEqual(grad_mock.call_count, 1)
+            self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.0))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.75))
+
+            alg.after_update(inputs, BafcInfo())
+            self.assertEqual(eval_mock.call_count, 0)
+            self.assertEqual(grad_mock.call_count, 2)
+            self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.0))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(3.5))
+
+    def test_eval_metric_info_stays_finite_when_eval_compute_is_skipped(self):
+        alg = self._make_alg(
+            monitor_trust_metrics=True, enable_eval_rollout_skip_gate=False)
+        batch_size = 4
+        inputs = self._make_train_time_step(batch_size=batch_size)
+        rollout_info = self._make_rollout_info(
+            batch_size=batch_size, num_actor_critic=alg._num_actor_critic)
+        state = alg.get_initial_train_state(batch_size=batch_size)
+
+        step1 = alg.train_step(inputs, state, rollout_info)
+        alg.after_update(inputs, step1.info)
+        step2 = alg.train_step(inputs, step1.state, rollout_info)
+
+        self.assertEqual(tuple(step2.info.eval_trust_metric.shape), (batch_size, ))
+        self.assertEqual(tuple(step2.info.critic.eval_trust_metric.shape),
+                         (batch_size, ))
+        self.assertTrue(torch.isfinite(step2.info.eval_trust_metric).all().item())
+        self.assertTrue(
+            torch.isfinite(step2.info.critic.eval_trust_metric).all().item())
+        self.assertTensorClose(step2.info.eval_trust_metric,
+                               torch.ones_like(step2.info.eval_trust_metric))
+        self.assertTensorClose(
+            step2.info.critic.eval_trust_metric,
+            torch.ones_like(step2.info.critic.eval_trust_metric))
+
+        rollout_state = alg.get_initial_rollout_state(batch_size=1)
+        rollout_step = alg.rollout_step(
+            self._make_rollout_time_step(batch_size=1), rollout_state)
+        self.assertEqual(tuple(rollout_step.info.eval_trust_metric.shape), (1, ))
+        self.assertTrue(
+            torch.isfinite(rollout_step.info.eval_trust_metric).all().item())
 
     def test_calc_loss_is_independent_of_trust_metrics(self):
         alg = self._make_alg(use_bootstrap_critics=True, bootstrap_mask_prob=0.5)

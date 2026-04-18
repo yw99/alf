@@ -31,7 +31,7 @@ alf.config('make_ddp_performer', find_unused_parameters=True)
 optimizer = Adam(lr=3e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
-actor_use_ln = False
+actor_use_ln = True
 trust_cov_reg = 1e-4
 monitor_trust_metrics = True
 eval_trust_max = 2.0
@@ -102,7 +102,7 @@ alf.config(
     eval_trust_max=eval_trust_max,
     delta_trust_max=delta_trust_max,
     trust_metric_update_interval=1,
-    enable_eval_rollout_skip_gate=True,
+    enable_eval_rollout_skip_gate=False,
     enable_grad_actor_extend_gate=True,
     eval_gate_max_consecutive_rollout_actor_holds=eval_gate_max_consecutive_rollout_actor_holds,
     grad_gate_max_consecutive_actor_extensions=grad_gate_max_consecutive_actor_extensions,

@@ -38,7 +38,7 @@ from alf.tensor_specs import TensorSpec, BoundedTensorSpec
 from alf.utils import losses, common, dist_utils, math_ops
 from alf.utils.normalizers import ScalarAdaptiveNormalizer
 from alf.utils.schedulers import Scheduler
-from alf.utils.summary_utils import safe_mean_hist_summary
+from alf.utils.summary_utils import safe_mean_hist_summary, record_time
 from alf.networks.network import Network
 from alf.networks.neural_graphs.actor_graph import ActorGraph
 from alf.networks.neural_graphs.graph_network import GraphNetwork
@@ -125,6 +125,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  grad_gate_max_consecutive_actor_extensions: Optional[int] = None,
                  actor_utd: Optional[int] = None,
                  critic_utd: Optional[int] = None,
+                 rollout_cycles_per_collect: int = 3,
                  env=None,
                  config: TrainerConfig = None,
                  critic_loss_ctor=None,
@@ -155,6 +156,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
                 every step of an episode. ``step`` means resampled bootstrap_mask for
                 every step of an episode.
+            enable_eval_rollout_skip_gate (bool): whether to gate rollout actor
+                refreshes using the eval trust metric. When False, eval trust is
+                not computed (to save compute), and rollout always refreshes from
+                the latest reference actor.
+            rollout_cycles_per_collect (int): number of completed
+                critic-actor cycles to train on replay data after each unroll.
+                A cycle is counted when train mode switches from ``actor`` back
+                to ``critic``.
         """
         assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'output'], (
             r"{actor_eval_type} in not supported.")
@@ -194,6 +203,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if grad_gate_max_consecutive_actor_extensions is not None:
             assert grad_gate_max_consecutive_actor_extensions >= 1, (
                 "grad_gate_max_consecutive_actor_extensions must be >= 1 when set")
+        assert rollout_cycles_per_collect >= 1, (
+            "rollout_cycles_per_collect must be >= 1")
+        if config is None or config.num_updates_per_train_iter != 1:
+            raise ValueError(
+                "BafcAlgorithmV3 requires "
+                "TrainerConfig.num_updates_per_train_iter == 1 when using "
+                "cycle-based replay scheduling. Control update cadence via "
+                "`rollout_cycles_per_collect` and actor/critic UTD settings.")
         if actor_utd is None and critic_utd is None:
             self._train_mode = TrainMode.standard
         else:
@@ -236,6 +253,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             eval_gate_max_consecutive_rollout_actor_holds)
         self._grad_gate_max_consecutive_actor_extensions = (
             grad_gate_max_consecutive_actor_extensions)
+        self._rollout_cycles_per_collect = rollout_cycles_per_collect
         self._bootstrap_mask = ()
         actor_networks = actor_network_cls(
             input_tensor_spec=observation_spec,
@@ -346,6 +364,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._rollout_actor_id = 0
         self._actor_update_counter = 0
         self._critic_update_counter = 0
+        self._completed_cycles_since_rollout = 0
+        self._updates_since_rollout = 0
         self._dqda_clipping = dqda_clipping
         self._training_started = False
         self._do_critic_summary = False
@@ -1071,6 +1091,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 else:
                     self._grad_gate_consecutive_actor_extensions = 0
                     self._train_mode = TrainMode.critic
+                    self._completed_cycles_since_rollout += 1
                     # self._critic_network.set_obs_action_batch_dominate(False)
                     for p in self._actor_networks.parameters():
                         p.requires_grad_(False)
@@ -1209,6 +1230,53 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             '_behavior_actor_networks', '_snapshot_critic_networks'
         ]
 
+    def _train_iter_off_policy(self):
+        """Perform one off-policy iteration with cycle-based replay cadence.
+
+        One unroll is performed first. When unroll succeeds and the algorithm
+        uses alternating critic/actor modes, replay updates continue until
+        ``rollout_cycles_per_collect`` completed actor->critic cycles are
+        observed.
+        """
+        unrolled, root_inputs, rollout_info = self._unroll_iter_off_policy()
+
+        # replay buffer may not have been created for two different reasons:
+        # 1. in online RL training (``has_offline`` is False), unroll is not
+        # performed yet. In this case, we simply return from here.
+        # 2. in offline RL training case (``has_offline`` is True), there is no
+        # online replay buffer. In this case, we move on and continue with the
+        # offline training.
+        if self._replay_buffer is None and not self.has_offline:
+            return 0
+
+        self.train()
+
+        # Standard mode has no actor->critic transition events, so keep the
+        # original single replay pass behavior.
+        if not unrolled or self._train_mode == TrainMode.standard:
+            steps = self.train_from_replay_buffer(update_global_counter=True)
+        else:
+            steps = 0
+            self._completed_cycles_since_rollout = 0
+            self._updates_since_rollout = 0
+
+            while (self._completed_cycles_since_rollout <
+                   self._rollout_cycles_per_collect):
+                train_steps = self.train_from_replay_buffer(
+                    update_global_counter=True)
+                steps += train_steps
+                self._updates_since_rollout += 1
+                # During warmup (initial_collect_steps), replay returns 0.
+                if train_steps == 0:
+                    break
+
+        if unrolled:
+            with record_time("time/after_train_iter"):
+                self.after_train_iter(root_inputs, rollout_info)
+
+        # For now, we only return the steps of the primary algorithm's training
+        return steps
+
     def after_update(self, root_inputs, info: BafcInfo):
         del info
         should_compute_trust_metrics = (
@@ -1220,8 +1288,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             if hasattr(root_inputs, "observation"):
                 observation = root_inputs.observation
             if isinstance(observation, torch.Tensor):
-                self._last_eval_trust = self._compute_eval_trust_metric(
-                    observation).detach()
+                if self._enable_eval_rollout_skip_gate:
+                    self._last_eval_trust = self._compute_eval_trust_metric(
+                        observation).detach()
+                else:
+                    # Keep eval-trust outputs interface-stable while skipping
+                    # expensive eval-trust computation when eval gating is off.
+                    self._last_eval_trust = torch.ones_like(
+                        self._last_eval_trust)
                 self._last_grad_trust = self._compute_grad_generalization_trust_metric(
                     observation).detach()
             else:

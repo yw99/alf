@@ -43,9 +43,9 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v3_nondebug"
+BASE_DIR="/root/alf_results_v4_full_gradonly"
 NUM_ENV_STEPS=1000000
-SEED=1
+SEED=0
 GPU=1
 EVAL_TRUST_MAX=40.0
 DELTA_TRUST_MAX=40.0
