@@ -17,7 +17,7 @@ import torch
 
 import alf
 from alf.algorithms.agent import Agent
-from alf.algorithms.bafc_algorithm_v3_tr import BafcAlgorithmV3
+from alf.algorithms.bafc_algorithm_v36_tr import BafcAlgorithmV36
 from alf.algorithms.data_transformer import ObservationNormalizer
 from alf.examples.benchmarks.dm_control import dmc_conf
 from alf.optimizers import Adam
@@ -77,12 +77,10 @@ critic_network_cls = partial(
     actor_obs_action_joint_fc_layer_params=joint_hidden_layers,
     use_fc_ln=True)  # turning on critic layernorm is crucial for high utd
 
-alf.config('Agent',
-           optimizer=optimizer,
-           rl_algorithm_cls=BafcAlgorithmV3)
+alf.config('Agent', optimizer=optimizer, rl_algorithm_cls=BafcAlgorithmV36)
 
 alf.config(
-    'BafcAlgorithmV3',
+    'BafcAlgorithmV36',
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
     num_actor_critic=10,
@@ -107,8 +105,10 @@ alf.config(
     trust_metric_update_interval=1,
     enable_eval_rollout_skip_gate=False,
     enable_grad_actor_extend_gate=True,
-    eval_gate_max_consecutive_rollout_actor_holds=eval_gate_max_consecutive_rollout_actor_holds,
-    grad_gate_max_consecutive_actor_extensions=grad_gate_max_consecutive_actor_extensions,
+    eval_gate_max_consecutive_rollout_actor_holds=
+    eval_gate_max_consecutive_rollout_actor_holds,
+    grad_gate_max_consecutive_actor_extensions=
+    grad_gate_max_consecutive_actor_extensions,
     rollout_cycles_per_collect=rollout_cycles_per_collect,
     actor_utd=1,
     critic_utd=3,
@@ -118,11 +118,7 @@ alf.config(
     target_critic_period=1,
     target_critic_use_ema=False)
 
-alf.config(
-    'TransformerEncoder',
-    num_layers=4,
-    num_attention_heads=1,
-    dropout=0.0)
+alf.config('TransformerEncoder', num_layers=4, num_attention_heads=1, dropout=0.0)
 
 alf.config(
     'TrainerConfig',

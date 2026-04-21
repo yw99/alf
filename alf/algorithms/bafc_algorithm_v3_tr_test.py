@@ -28,6 +28,7 @@ from alf.algorithms.bafc_algorithm_v3_tr import (
     BafcInfo,
 )
 from alf.algorithms.config import TrainerConfig
+from alf.algorithms.rl_algorithm import RLAlgorithm
 from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import LossInfo, StepType, TimeStep
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
@@ -356,6 +357,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             monitor_trust_metrics=True,
             enable_eval_rollout_skip_gate=True)
         inputs = self._make_train_time_step(batch_size=4)
+        alg._last_update_had_actor_step = True
 
         with mock.patch.object(
                 alg,
@@ -390,6 +392,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             monitor_trust_metrics=True,
             enable_eval_rollout_skip_gate=False)
         inputs = self._make_train_time_step(batch_size=4)
+        alg._last_update_had_actor_step = True
 
         with mock.patch.object(
                 alg,
@@ -866,6 +869,109 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg.after_update(inputs, step3.info)
         self.assertEqual(alg._train_mode, TrainMode.critic)
 
+    def test_constructor_allows_non_one_updates_per_train_iter(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=3)
+
+        self.assertIsInstance(alg, BafcAlgorithmV3)
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertEqual(alg._actor_utd, 1)
+        self.assertEqual(alg._critic_utd, 3)
+
+    def test_unroll_iter_off_policy_gates_on_completed_cycles(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._completed_cycles_since_rollout = 2
+
+        with mock.patch.object(
+                RLAlgorithm,
+                "_unroll_iter_off_policy",
+                return_value=(True, "root", "info")) as parent_unroll:
+            unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
+
+        self.assertFalse(unrolled)
+        self.assertIsNone(root_inputs)
+        self.assertIsNone(rollout_info)
+        parent_unroll.assert_not_called()
+
+        alg._completed_cycles_since_rollout = 3
+        with mock.patch.object(
+                RLAlgorithm,
+                "_unroll_iter_off_policy",
+                return_value=(True, "root", "info")) as parent_unroll:
+            unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
+
+        self.assertTrue(unrolled)
+        self.assertEqual(root_inputs, "root")
+        self.assertEqual(rollout_info, "info")
+        self.assertEqual(alg._completed_cycles_since_rollout, 0)
+        parent_unroll.assert_called_once()
+
+    def test_unroll_iter_off_policy_delegates_during_warmup_or_standard_mode(
+            self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3)
+        alg._completed_cycles_since_rollout = 0
+
+        with mock.patch.object(
+                RLAlgorithm,
+                "_unroll_iter_off_policy",
+                return_value=(False, "warmup", "none")) as parent_unroll:
+            alg._training_started = False
+            alg._train_mode = TrainMode.critic
+            unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
+        self.assertFalse(unrolled)
+        self.assertEqual(root_inputs, "warmup")
+        self.assertEqual(rollout_info, "none")
+        parent_unroll.assert_called_once()
+
+        with mock.patch.object(
+                RLAlgorithm,
+                "_unroll_iter_off_policy",
+                return_value=(True, "std", "info")) as parent_unroll:
+            alg._training_started = True
+            alg._train_mode = TrainMode.standard
+            unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
+        self.assertTrue(unrolled)
+        self.assertEqual(root_inputs, "std")
+        self.assertEqual(rollout_info, "info")
+        parent_unroll.assert_called_once()
+
+    def test_train_iter_off_policy_keeps_single_replay_pass_per_outer_iter(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3)
+        alg._replay_buffer = object()
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+
+        with mock.patch.object(
+                alg,
+                "_unroll_iter_off_policy",
+                return_value=(False, None, None)) as unroll_mock, mock.patch.object(
+                    alg,
+                    "train_from_replay_buffer",
+                    return_value=6144) as replay_mock, mock.patch.object(
+                        alg, "after_train_iter") as after_iter_mock:
+            steps = alg._train_iter_off_policy()
+
+        self.assertEqual(steps, 6144)
+        unroll_mock.assert_called_once()
+        replay_mock.assert_called_once_with(update_global_counter=True)
+        after_iter_mock.assert_not_called()
+
     def test_low_eval_trust_holds_behavior_actor_and_advances_reference(self):
         alg = self._make_alg(
             enable_eval_rollout_skip_gate=True,
@@ -961,7 +1067,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
                 eval_gate_max_consecutive_rollout_actor_holds=6,
                 eval_gate_max_consecutive_rollout_skips=5)
 
-    def test_grad_gate_extends_actor_block_and_bumps_counter(self):
+    def test_grad_gate_extends_actor_block_without_counter_bump(self):
         alg = self._make_alg(
             actor_utd=1,
             critic_utd=2,
@@ -977,7 +1083,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._train_mode, TrainMode.actor)
         self.assertTrue(alg._last_grad_gate_actor_extended)
         self.assertEqual(alg._grad_gate_actor_extension_count, 1)
-        self.assertEqual(alg._trust_metric_update_counter, before + 1)
+        self.assertEqual(alg._trust_metric_update_counter, before)
 
         alg._last_grad_trust = torch.tensor(3.0)
         before = alg._trust_metric_update_counter
@@ -986,7 +1092,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertFalse(alg._last_grad_gate_actor_extended)
         self.assertEqual(alg._trust_metric_update_counter, before)
 
-    def test_grad_gate_extension_cap_forces_critic_switch(self):
+    def test_grad_gate_extension_cap_forces_critic_switch_without_counter_bump(
+            self):
         alg = self._make_alg(
             actor_utd=1,
             critic_utd=2,
@@ -1004,7 +1111,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertTrue(alg._last_grad_gate_actor_extended)
         self.assertEqual(alg._grad_gate_consecutive_actor_extensions, 1)
         self.assertEqual(alg._grad_gate_actor_extension_count, 1)
-        self.assertEqual(alg._trust_metric_update_counter, before + 1)
+        self.assertEqual(alg._trust_metric_update_counter, before)
 
         before = alg._trust_metric_update_counter
         alg._update_train_mode()

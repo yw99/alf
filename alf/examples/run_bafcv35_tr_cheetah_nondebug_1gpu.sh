@@ -1,10 +1,10 @@
 #!/bin/bash
-# Launcher for a single BAFCv3-TR run.
-# Runs either a single trust-gated run or a single trust-disabled BAFCv3-TR run.
+# Launcher for a single BAFCv35-TR run.
+# Runs either a single trust-gated run or a single trust-disabled BAFCv35-TR run.
 #
-# Usage: bash run_bafcv3_tr_cheetah_nondebug_1gpu.sh [options]
+# Usage: bash run_bafcv35_tr_cheetah_nondebug_1gpu.sh [options]
 #   -e, --env ENV_NAME                 DMC environment (default: cheetah:run)
-#   -d, --dir BASE_DIR                 Base results directory (default: /root/alf_results_v2)
+#   -d, --dir BASE_DIR                 Base results directory (default: /root/alf_results_v4_full_gradonly_rolloutbycycle)
 #   -n, --steps NUM_STEPS              Total env steps (default: 1000000)
 #   -s, --seed SEED                    Seed for the run (default: 0)
 #   -g, --gpu ID                       GPU id for the run (default: 0)
@@ -22,18 +22,18 @@
 #       --rollout-hold-cap VALUE       Max consecutive eval-gated rollout-actor holds (default: 20)
 #       --rollout-skip-cap VALUE       Deprecated alias for --rollout-hold-cap
 #       --actor-extend-cap VALUE       Max consecutive grad-gated actor extensions (default: 5)
-#       --original-algo                Disable trust metrics and both trust gates for BAFCv3-TR
+#       --original-algo                Disable trust metrics and both trust gates for BAFCv35-TR
 #   -h, --help                         Show this help message
 #
 # Example:
-#   bash run_bafcv3_tr_cheetah_run_1gpu.sh --gpu 0 --eval 2 --delta 2 --rollout-hold-cap 20 --actor-extend-cap 5
-#   bash run_bafcv3_tr_cheetah_run_1gpu.sh --gpu 0 --seed 0 --original-algo
+#   bash run_bafcv35_tr_cheetah_nondebug_1gpu.sh --gpu 0 --eval 2 --delta 2 --rollout-hold-cap 20 --actor-extend-cap 5
+#   bash run_bafcv35_tr_cheetah_nondebug_1gpu.sh --gpu 0 --seed 0 --original-algo
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-CONF_FILE="${SCRIPT_DIR}/bafcv3_tr_dmc_conf.py"
+CONF_FILE="${SCRIPT_DIR}/bafcv35_tr_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -43,13 +43,13 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v4_full_gradonly_rolloutbycycle"
+BASE_DIR="/root/alf_results_v5_debug_gradwithcache_coord64"
 NUM_ENV_STEPS=1000000
 SEED=0
 GPU=0
 EVAL_TRUST_MAX=40.0
 DELTA_TRUST_MAX=40.0
-NUM_FEATURE_COORDS=4
+NUM_FEATURE_COORDS=64
 METRIC_INTERVAL=8
 ROLLOUT_HOLD_CAP=20
 ACTOR_EXTEND_CAP=5
@@ -144,18 +144,18 @@ done
 
 ENV_DIR="$(echo "${ENV_NAME}" | cut -d':' -f1)"
 if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
-    ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_tr_dmc_original_algo"
+    ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv35_tr_dmc_original_algo"
     RUN_DIR="${ROOT_BASE}/seed${SEED}"
 else
-    ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_tr_dmc_single_run"
+    ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv35_tr_dmc_single_run"
     RUN_DIR="${ROOT_BASE}/eval${EVAL_TRUST_MAX}_delta${DELTA_TRUST_MAX}_cap${ROLLOUT_HOLD_CAP}_acap${ACTOR_EXTEND_CAP}_seed${SEED}"
 fi
 mkdir -p "${RUN_DIR}"
 
 if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
-    echo "Launching BAFCv3-TR trust-disabled mode (single run)"
+    echo "Launching BAFCv35-TR trust-disabled mode (single run)"
 else
-    echo "Launching BAFCv3-TR trust-gated run (single run)"
+    echo "Launching BAFCv35-TR trust-gated run (single run)"
 fi
 echo "  Config: ${CONF_FILE}"
 echo "  Environment: ${ENV_NAME}"
@@ -184,30 +184,32 @@ if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
+        --conf_param "debug_mode=True" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
-        --conf_param "BafcAlgorithmV3.monitor_trust_metrics=False" \
-        --conf_param "BafcAlgorithmV3.enable_eval_rollout_skip_gate=False" \
-        --conf_param "BafcAlgorithmV3.enable_grad_actor_extend_gate=False" \
+        --conf_param "BafcAlgorithmV35.monitor_trust_metrics=False" \
+        --conf_param "BafcAlgorithmV35.enable_eval_rollout_skip_gate=False" \
+        --conf_param "BafcAlgorithmV35.enable_grad_actor_extend_gate=False" \
         > "${RUN_DIR}/out.log" 2>&1 &
 else
     cd "${REPO_ROOT}"
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
+        --conf_param "debug_mode=True" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
-        --conf_param "BafcAlgorithmV3.monitor_trust_metrics=True" \
-        --conf_param "BafcAlgorithmV3.eval_trust_max=${EVAL_TRUST_MAX}" \
-        --conf_param "BafcAlgorithmV3.delta_trust_max=${DELTA_TRUST_MAX}" \
-        --conf_param "BafcAlgorithmV3.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
-        --conf_param "BafcAlgorithmV3.trust_metric_update_interval=${METRIC_INTERVAL}" \
-        --conf_param "BafcAlgorithmV3.eval_gate_max_consecutive_rollout_actor_holds=${ROLLOUT_HOLD_CAP}" \
-        --conf_param "BafcAlgorithmV3.grad_gate_max_consecutive_actor_extensions=${ACTOR_EXTEND_CAP}" \
+        --conf_param "BafcAlgorithmV35.monitor_trust_metrics=True" \
+        --conf_param "BafcAlgorithmV35.eval_trust_max=${EVAL_TRUST_MAX}" \
+        --conf_param "BafcAlgorithmV35.delta_trust_max=${DELTA_TRUST_MAX}" \
+        --conf_param "BafcAlgorithmV35.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
+        --conf_param "BafcAlgorithmV35.trust_metric_update_interval=${METRIC_INTERVAL}" \
+        --conf_param "BafcAlgorithmV35.eval_gate_max_consecutive_rollout_actor_holds=${ROLLOUT_HOLD_CAP}" \
+        --conf_param "BafcAlgorithmV35.grad_gate_max_consecutive_actor_extensions=${ACTOR_EXTEND_CAP}" \
         > "${RUN_DIR}/out.log" 2>&1 &
 fi
 PID=$!
