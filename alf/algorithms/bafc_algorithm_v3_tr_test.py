@@ -355,7 +355,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg = self._make_alg(
             trust_metric_update_interval=2,
             monitor_trust_metrics=True,
-            enable_eval_rollout_skip_gate=True)
+            enable_eval_rollout_skip_gate=True,
+            enable_grad_actor_extend_gate=True)
         inputs = self._make_train_time_step(batch_size=4)
         alg._last_update_had_actor_step = True
 
@@ -386,6 +387,30 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             self.assertTensorClose(alg._last_eval_trust, torch.tensor(2.5))
             self.assertTensorClose(alg._last_grad_trust, torch.tensor(3.5))
 
+    def test_after_update_eval_only_mode_skips_grad_metric_compute(self):
+        alg = self._make_alg(
+            trust_metric_update_interval=1,
+            monitor_trust_metrics=True,
+            enable_eval_rollout_skip_gate=True,
+            enable_grad_actor_extend_gate=False)
+        inputs = self._make_train_time_step(batch_size=4)
+        alg._last_update_had_actor_step = True
+
+        with mock.patch.object(
+                alg,
+                "_compute_eval_trust_metric",
+                return_value=torch.tensor(1.25)) as eval_mock, mock.patch.object(
+                    alg,
+                    "_compute_grad_generalization_trust_metric",
+                    side_effect=AssertionError(
+                        "grad trust should not be computed when grad gate is disabled"
+                    )) as grad_mock:
+            alg.after_update(inputs, BafcInfo())
+            self.assertEqual(eval_mock.call_count, 1)
+            self.assertEqual(grad_mock.call_count, 0)
+            self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.25))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.0))
+
     def test_after_update_skips_eval_metric_when_eval_gate_disabled(self):
         alg = self._make_alg(
             trust_metric_update_interval=2,
@@ -402,25 +427,26 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
                 )) as eval_mock, mock.patch.object(
                     alg,
                     "_compute_grad_generalization_trust_metric",
-                    side_effect=[torch.tensor(1.75),
-                                 torch.tensor(3.5)]) as grad_mock:
+                    side_effect=AssertionError(
+                        "grad trust should not be computed when grad gate is disabled"
+                    )) as grad_mock:
             alg.after_update(inputs, BafcInfo())
             self.assertEqual(eval_mock.call_count, 0)
-            self.assertEqual(grad_mock.call_count, 1)
+            self.assertEqual(grad_mock.call_count, 0)
             self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.0))
-            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.75))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.0))
 
             alg.after_update(inputs, BafcInfo())
             self.assertEqual(eval_mock.call_count, 0)
-            self.assertEqual(grad_mock.call_count, 1)
+            self.assertEqual(grad_mock.call_count, 0)
             self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.0))
-            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.75))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.0))
 
             alg.after_update(inputs, BafcInfo())
             self.assertEqual(eval_mock.call_count, 0)
-            self.assertEqual(grad_mock.call_count, 2)
+            self.assertEqual(grad_mock.call_count, 0)
             self.assertTensorClose(alg._last_eval_trust, torch.tensor(1.0))
-            self.assertTensorClose(alg._last_grad_trust, torch.tensor(3.5))
+            self.assertTensorClose(alg._last_grad_trust, torch.tensor(1.0))
 
     def test_eval_metric_info_stays_finite_when_eval_compute_is_skipped(self):
         alg = self._make_alg(
@@ -494,7 +520,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg = self._make_alg(trust_cov_reg=0.25)
         obs = torch.randn(3, 4)
         ref_action = torch.full((3, alg._num_actor_critic, 2), 0.5)
-        beh_action = torch.full((3, alg._num_actor_critic, 2), -0.25)
+        cur_action = torch.full((3, alg._num_actor_critic, 2), -0.25)
         phi_ref = torch.tensor(
             [
                 [[1.0, 0.0, 2.0], [0.5, 1.0, 0.0], [1.5, 0.0, 1.0]],
@@ -512,9 +538,9 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
                 alg._reference_actor_networks,
                 "forward",
                 return_value=(ref_action, ())), mock.patch.object(
-                    alg._behavior_actor_networks,
+                    alg._actor_networks,
                     "forward",
-                    return_value=(beh_action, ())), mock.patch.object(
+                    return_value=(cur_action, ())), mock.patch.object(
                         alg,
                         "_compute_actor_encoding",
                         return_value=torch.zeros(
@@ -524,7 +550,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
                 del _obs, _actor_encoding, critic_network
                 if torch.equal(action, ref_action):
                     return phi_ref.clone()
-                if torch.equal(action, beh_action):
+                if torch.equal(action, cur_action):
                     return phi_beh.clone()
                 raise AssertionError("Unexpected action tensor passed to feature map")
 
@@ -893,19 +919,22 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         with mock.patch.object(
                 RLAlgorithm,
                 "_unroll_iter_off_policy",
-                return_value=(True, "root", "info")) as parent_unroll:
+                return_value=(True, "root", "info")) as parent_unroll, mock.patch.object(
+                    alg, "_sync_reference_from_current") as sync_mock:
             unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
 
         self.assertFalse(unrolled)
         self.assertIsNone(root_inputs)
         self.assertIsNone(rollout_info)
         parent_unroll.assert_not_called()
+        sync_mock.assert_not_called()
 
         alg._completed_cycles_since_rollout = 3
         with mock.patch.object(
                 RLAlgorithm,
                 "_unroll_iter_off_policy",
-                return_value=(True, "root", "info")) as parent_unroll:
+                return_value=(True, "root", "info")) as parent_unroll, mock.patch.object(
+                    alg, "_sync_reference_from_current") as sync_mock:
             unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
 
         self.assertTrue(unrolled)
@@ -913,6 +942,68 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(rollout_info, "info")
         self.assertEqual(alg._completed_cycles_since_rollout, 0)
         parent_unroll.assert_called_once()
+        sync_mock.assert_called_once()
+
+    def test_unroll_iter_off_policy_skips_rollout_when_eval_gate_blocks(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3,
+            enable_eval_rollout_skip_gate=True,
+            monitor_trust_metrics=False)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._completed_cycles_since_rollout = 3
+        alg._last_eval_trust = torch.tensor(1.0)
+
+        with mock.patch.object(
+                RLAlgorithm,
+                "_unroll_iter_off_policy",
+                return_value=(True, "root", "info")) as parent_unroll, mock.patch.object(
+                    alg, "_sync_reference_from_current") as sync_mock:
+            unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
+
+        self.assertFalse(unrolled)
+        self.assertIsNone(root_inputs)
+        self.assertIsNone(rollout_info)
+        self.assertEqual(alg._completed_cycles_since_rollout, 3)
+        self.assertEqual(alg._eval_gate_consecutive_rollout_skips, 1)
+        self.assertEqual(alg._rollout_skip_due_eval_gate_count, 1)
+        self.assertTrue(alg._last_rollout_skipped_due_eval_gate)
+        parent_unroll.assert_not_called()
+        sync_mock.assert_not_called()
+
+    def test_unroll_iter_off_policy_eval_skip_cap_allows_rollout(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3,
+            enable_eval_rollout_skip_gate=True,
+            monitor_trust_metrics=False,
+            eval_gate_max_consecutive_rollout_skips=2)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._completed_cycles_since_rollout = 3
+        alg._last_eval_trust = torch.tensor(1.0)
+        alg._eval_gate_consecutive_rollout_skips = 2
+
+        with mock.patch.object(
+                RLAlgorithm,
+                "_unroll_iter_off_policy",
+                return_value=(True, "root", "info")) as parent_unroll, mock.patch.object(
+                    alg, "_sync_reference_from_current") as sync_mock:
+            unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
+
+        self.assertTrue(unrolled)
+        self.assertEqual(root_inputs, "root")
+        self.assertEqual(rollout_info, "info")
+        self.assertEqual(alg._completed_cycles_since_rollout, 0)
+        self.assertEqual(alg._eval_gate_consecutive_rollout_skips, 0)
+        self.assertFalse(alg._last_rollout_skipped_due_eval_gate)
+        parent_unroll.assert_called_once()
+        sync_mock.assert_called_once()
 
     def test_unroll_iter_off_policy_delegates_during_warmup_or_standard_mode(
             self):
@@ -926,7 +1017,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         with mock.patch.object(
                 RLAlgorithm,
                 "_unroll_iter_off_policy",
-                return_value=(False, "warmup", "none")) as parent_unroll:
+                return_value=(False, "warmup", "none")) as parent_unroll, mock.patch.object(
+                    alg, "_sync_reference_from_current") as sync_mock:
             alg._training_started = False
             alg._train_mode = TrainMode.critic
             unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
@@ -934,11 +1026,13 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(root_inputs, "warmup")
         self.assertEqual(rollout_info, "none")
         parent_unroll.assert_called_once()
+        sync_mock.assert_not_called()
 
         with mock.patch.object(
                 RLAlgorithm,
                 "_unroll_iter_off_policy",
-                return_value=(True, "std", "info")) as parent_unroll:
+                return_value=(True, "std", "info")) as parent_unroll, mock.patch.object(
+                    alg, "_sync_reference_from_current") as sync_mock:
             alg._training_started = True
             alg._train_mode = TrainMode.standard
             unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
@@ -946,6 +1040,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(root_inputs, "std")
         self.assertEqual(rollout_info, "info")
         parent_unroll.assert_called_once()
+        sync_mock.assert_called_once()
 
     def test_train_iter_off_policy_keeps_single_replay_pass_per_outer_iter(self):
         alg = self._make_alg(
@@ -972,100 +1067,25 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         replay_mock.assert_called_once_with(update_global_counter=True)
         after_iter_mock.assert_not_called()
 
-    def test_low_eval_trust_holds_behavior_actor_and_advances_reference(self):
-        alg = self._make_alg(
-            enable_eval_rollout_skip_gate=True,
-            monitor_trust_metrics=False)
-        inputs = self._make_train_time_step(batch_size=4)
-        behavior_before = self._clone_state_dict(alg._behavior_actor_networks)
-
-        self._fill_module(alg._actor_networks, 0.5)
-        actor_after = self._clone_state_dict(alg._actor_networks)
-        alg._last_eval_trust = torch.tensor(1.0)
-
-        alg.after_update(inputs, BafcInfo())
-
-        self._assert_state_dict_equal(alg._behavior_actor_networks,
-                                      behavior_before)
-        self._assert_state_dict_equal(alg._reference_actor_networks,
-                                      actor_after)
-        self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 1)
-        self.assertEqual(alg._rollout_actor_hold_due_eval_gate_count, 1)
-        self.assertTrue(alg._last_rollout_actor_held_due_eval_gate)
-        self.assertFalse(alg._last_rollout_actor_refreshed_from_reference)
-        self.assertFalse(
-            alg._last_rollout_actor_refresh_forced_by_eval_gate_cap)
-
-    def test_high_eval_trust_refreshes_behavior_actor_and_resets_hold_counter(self):
+    def test_after_update_does_not_sync_reference_from_current(self):
         alg = self._make_alg(
             enable_eval_rollout_skip_gate=True,
             monitor_trust_metrics=False)
         inputs = self._make_train_time_step(batch_size=4)
 
-        self._fill_module(alg._behavior_actor_networks, -1.0)
-        self._fill_module(alg._reference_actor_networks, 1.0)
-        self._fill_module(alg._actor_networks, 2.0)
-        actor_after = self._clone_state_dict(alg._actor_networks)
-        alg._eval_gate_consecutive_rollout_actor_holds = 2
-        alg._last_eval_trust = torch.tensor(10.0)
+        with mock.patch.object(alg, "_sync_reference_from_current") as sync_mock:
+            alg.after_update(inputs, BafcInfo())
 
-        alg.after_update(inputs, BafcInfo())
+        sync_mock.assert_not_called()
 
-        self._assert_state_dict_equal(alg._behavior_actor_networks,
-                                      actor_after)
-        self._assert_state_dict_equal(alg._reference_actor_networks,
-                                      actor_after)
-        self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 0)
-        self.assertFalse(alg._last_rollout_actor_held_due_eval_gate)
-        self.assertTrue(alg._last_rollout_actor_refreshed_from_reference)
-        self.assertFalse(
-            alg._last_rollout_actor_refresh_forced_by_eval_gate_cap)
-
-    def test_eval_gate_hold_cap_forces_rollout_actor_refresh(self):
-        alg = self._make_alg(
-            enable_eval_rollout_skip_gate=True,
-            monitor_trust_metrics=False,
-            eval_gate_max_consecutive_rollout_actor_holds=2)
-        inputs = self._make_train_time_step(batch_size=4)
-
-        self._fill_module(alg._behavior_actor_networks, -1.0)
-        self._fill_module(alg._reference_actor_networks, 1.0)
-        self._fill_module(alg._actor_networks, 2.0)
-        actor_after = self._clone_state_dict(alg._actor_networks)
-        alg._eval_gate_consecutive_rollout_actor_holds = 2
-        alg._last_eval_trust = torch.tensor(1.0)
-
-        alg.after_update(inputs, BafcInfo())
-
-        self._assert_state_dict_equal(alg._behavior_actor_networks,
-                                      actor_after)
-        self._assert_state_dict_equal(alg._reference_actor_networks,
-                                      actor_after)
-        self.assertEqual(alg._eval_gate_consecutive_rollout_actor_holds, 0)
-        self.assertEqual(alg._rollout_actor_hold_due_eval_gate_count, 0)
-        self.assertFalse(alg._last_rollout_actor_held_due_eval_gate)
-        self.assertTrue(alg._last_rollout_actor_refreshed_from_reference)
-        self.assertTrue(
-            alg._last_rollout_actor_refresh_forced_by_eval_gate_cap)
-
-    def test_rollout_hold_cap_alias_old_name_only_works(self):
+    def test_rollout_skip_cap_config_works(self):
         alg = self._make_alg(eval_gate_max_consecutive_rollout_skips=7)
+        self.assertEqual(alg._eval_gate_max_consecutive_rollout_skips, 7)
 
-        self.assertEqual(alg._eval_gate_max_consecutive_rollout_actor_holds, 7)
-
-    def test_rollout_hold_cap_new_name_only_works(self):
-        alg = self._make_alg(
-            eval_gate_max_consecutive_rollout_actor_holds=6)
-
-        self.assertEqual(alg._eval_gate_max_consecutive_rollout_actor_holds, 6)
-
-    def test_rollout_hold_cap_conflicting_aliases_fail(self):
+    def test_constructor_rejects_removed_rollout_hold_cap_arg(self):
         with self.assertRaisesRegex(
-                ValueError,
-                "must match when both are provided"):
-            self._make_alg(
-                eval_gate_max_consecutive_rollout_actor_holds=6,
-                eval_gate_max_consecutive_rollout_skips=5)
+                TypeError, "eval_gate_max_consecutive_rollout_actor_holds"):
+            self._make_alg(eval_gate_max_consecutive_rollout_actor_holds=6)
 
     def test_grad_gate_extends_actor_block_without_counter_bump(self):
         alg = self._make_alg(
@@ -1160,7 +1180,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._grad_gate_actor_extension_count, 0)
         self.assertEqual(alg._trust_metric_update_counter, before)
 
-    def test_rollout_uses_behavior_actor_when_eval_gate_enabled(self):
+    def test_rollout_uses_latest_actor_when_eval_gate_enabled(self):
         alg = self._make_alg(enable_eval_rollout_skip_gate=True)
         rollout_state = alg.get_initial_rollout_state(batch_size=1)
         time_step = self._make_rollout_time_step(batch_size=1)
@@ -1174,7 +1194,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         with mock.patch.object(alg, "_predict_action", side_effect=_fake_predict):
             alg.rollout_step(time_step, rollout_state)
 
-        self.assertIs(called['actor_net'], alg._behavior_actor_networks)
+        self.assertIs(called['actor_net'], alg._actor_networks)
 
     def test_rollout_uses_train_actor_when_only_grad_gate_enabled(self):
         alg = self._make_alg(enable_grad_actor_extend_gate=True)

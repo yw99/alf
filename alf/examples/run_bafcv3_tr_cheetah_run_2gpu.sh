@@ -17,14 +17,13 @@
 #       --delta-b VALUE                Grad threshold for run B (default: 10.0)
 #       --num-feature-coords VALUE     Trust metric feature coords (default: 4)
 #       --metric-interval VALUE        Trust metric update interval (default: 8)
-#       --rollout-hold-cap VALUE       Max consecutive eval-gated rollout-actor holds (default: 20)
-#       --rollout-skip-cap VALUE       Deprecated alias for --rollout-hold-cap
+#       --rollout-skip-cap VALUE       Max consecutive eval-gated rollout skips (default: 20)
 #       --actor-extend-cap VALUE       Max consecutive grad-gated actor extensions (default: 5)
 #       --original-algo                Disable trust metrics and both trust gates for BAFCv3-TR; launch one job on GPU A
 #   -h, --help                         Show this help message
 #
 # Example:
-#   bash run_bafcv3_tr_cheetah_run_2gpu.sh --gpus 0,1 --eval-a 2 --delta-a 4 --eval-b 5 --delta-b 10 --rollout-hold-cap 20 --actor-extend-cap 5
+#   bash run_bafcv3_tr_cheetah_run_2gpu.sh --gpus 0,1 --eval-a 2 --delta-a 4 --eval-b 5 --delta-b 10 --rollout-skip-cap 20 --actor-extend-cap 5
 #   bash run_bafcv3_tr_cheetah_run_2gpu.sh --gpu-a 0 --seed 0 --original-algo
 
 set -euo pipefail
@@ -53,7 +52,7 @@ EVAL_TRUST_MAX_B=5.0
 DELTA_TRUST_MAX_B=5.0
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
-ROLLOUT_HOLD_CAP=20
+ROLLOUT_SKIP_CAP=20
 ACTOR_EXTEND_CAP=5
 ORIGINAL_ALGO=false
 
@@ -116,8 +115,8 @@ while [[ $# -gt 0 ]]; do
             METRIC_INTERVAL="$2"
             shift 2
             ;;
-        --rollout-hold-cap|--rollout-skip-cap)
-            ROLLOUT_HOLD_CAP="$2"
+        --rollout-skip-cap)
+            ROLLOUT_SKIP_CAP="$2"
             shift 2
             ;;
         --actor-extend-cap)
@@ -150,8 +149,8 @@ if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
     RUN_DIR="${ROOT_BASE}/seed${SEED_A}"
 else
     ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_tr_dmc_threshold_sweep"
-    RUN_A_DIR="${ROOT_BASE}/A_eval${EVAL_TRUST_MAX_A}_delta${DELTA_TRUST_MAX_A}_cap${ROLLOUT_HOLD_CAP}_acap${ACTOR_EXTEND_CAP}_seed${SEED_A}"
-    RUN_B_DIR="${ROOT_BASE}/B_eval${EVAL_TRUST_MAX_B}_delta${DELTA_TRUST_MAX_B}_cap${ROLLOUT_HOLD_CAP}_acap${ACTOR_EXTEND_CAP}_seed${SEED_B}"
+    RUN_A_DIR="${ROOT_BASE}/A_eval${EVAL_TRUST_MAX_A}_delta${DELTA_TRUST_MAX_A}_cap${ROLLOUT_SKIP_CAP}_acap${ACTOR_EXTEND_CAP}_seed${SEED_A}"
+    RUN_B_DIR="${ROOT_BASE}/B_eval${EVAL_TRUST_MAX_B}_delta${DELTA_TRUST_MAX_B}_cap${ROLLOUT_SKIP_CAP}_acap${ACTOR_EXTEND_CAP}_seed${SEED_B}"
 fi
 if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
     mkdir -p "${RUN_DIR}"
@@ -176,7 +175,7 @@ if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
 else
     echo "  num_feature_coords: ${NUM_FEATURE_COORDS}"
     echo "  metric_interval: ${METRIC_INTERVAL}"
-    echo "  rollout_hold_cap: ${ROLLOUT_HOLD_CAP}"
+    echo "  rollout_skip_cap: ${ROLLOUT_SKIP_CAP}"
     echo "  actor_extend_cap: ${ACTOR_EXTEND_CAP}"
 fi
 echo ""
@@ -226,7 +225,7 @@ else
         --conf_param "BafcAlgorithmV3.delta_trust_max=${DELTA_TRUST_MAX_A}" \
         --conf_param "BafcAlgorithmV3.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
         --conf_param "BafcAlgorithmV3.trust_metric_update_interval=${METRIC_INTERVAL}" \
-        --conf_param "BafcAlgorithmV3.eval_gate_max_consecutive_rollout_actor_holds=${ROLLOUT_HOLD_CAP}" \
+        --conf_param "BafcAlgorithmV3.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}" \
         --conf_param "BafcAlgorithmV3.grad_gate_max_consecutive_actor_extensions=${ACTOR_EXTEND_CAP}" \
         > "${RUN_A_DIR}/out.log" 2>&1 &
     PID_A=$!
@@ -245,7 +244,7 @@ else
         --conf_param "BafcAlgorithmV3.delta_trust_max=${DELTA_TRUST_MAX_B}" \
         --conf_param "BafcAlgorithmV3.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
         --conf_param "BafcAlgorithmV3.trust_metric_update_interval=${METRIC_INTERVAL}" \
-        --conf_param "BafcAlgorithmV3.eval_gate_max_consecutive_rollout_actor_holds=${ROLLOUT_HOLD_CAP}" \
+        --conf_param "BafcAlgorithmV3.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}" \
         --conf_param "BafcAlgorithmV3.grad_gate_max_consecutive_actor_extensions=${ACTOR_EXTEND_CAP}" \
         > "${RUN_B_DIR}/out.log" 2>&1 &
     PID_B=$!

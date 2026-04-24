@@ -36,7 +36,7 @@ trust_cov_reg = 1e-4
 monitor_trust_metrics = True
 eval_trust_max = 2.0
 delta_trust_max = 2.0
-eval_gate_max_consecutive_rollout_actor_holds = 5
+eval_gate_max_consecutive_rollout_skips = 5
 grad_gate_max_consecutive_actor_extensions = 5
 rollout_cycles_per_collect = 3
 # Rollout cadence (cycle-based) should not change replay update budget.
@@ -107,7 +107,7 @@ alf.config(
     trust_metric_update_interval=1,
     enable_eval_rollout_skip_gate=False,
     enable_grad_actor_extend_gate=True,
-    eval_gate_max_consecutive_rollout_actor_holds=eval_gate_max_consecutive_rollout_actor_holds,
+    eval_gate_max_consecutive_rollout_skips=eval_gate_max_consecutive_rollout_skips,
     grad_gate_max_consecutive_actor_extensions=grad_gate_max_consecutive_actor_extensions,
     rollout_cycles_per_collect=rollout_cycles_per_collect,
     actor_utd=1,

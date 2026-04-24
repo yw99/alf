@@ -43,13 +43,13 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v5_debug_gradwithcache_coord64"
+BASE_DIR="/root/alf_results_v5_full_gradwithcache_coord64"
 NUM_ENV_STEPS=1000000
 SEED=0
 GPU=0
-EVAL_TRUST_MAX=40.0
-DELTA_TRUST_MAX=40.0
-NUM_FEATURE_COORDS=64
+EVAL_TRUST_MAX=100.0 #40.0
+DELTA_TRUST_MAX=100.0 #40.0
+NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
 ROLLOUT_HOLD_CAP=20
 ACTOR_EXTEND_CAP=5
@@ -184,7 +184,6 @@ if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
-        --conf_param "debug_mode=True" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
@@ -198,7 +197,6 @@ else
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
-        --conf_param "debug_mode=True" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
