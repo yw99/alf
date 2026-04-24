@@ -131,7 +131,7 @@ done
 
 ENV_DIR="$(echo "${ENV_NAME}" | cut -d':' -f1)"
 ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_tr_dmc_evalonly_single_run"
-RUN_DIR="${ROOT_BASE}/eval${EVAL_TRUST_MAX}_cap${ROLLOUT_SKIP_CAP}_seed${SEED}"
+RUN_DIR="${ROOT_BASE}/eval${EVAL_TRUST_MAX}_nf${NUM_FEATURE_COORDS}_mi${METRIC_INTERVAL}_cap${ROLLOUT_SKIP_CAP}_seed${SEED}"
 mkdir -p "${RUN_DIR}"
 
 echo "Launching BAFCv3-TR eval-only run (single run)"
