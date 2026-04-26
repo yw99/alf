@@ -1154,28 +1154,23 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             '_snapshot_critic_networks'
         ]
 
-    def _unroll_iter_off_policy(self):
-        """Gate rollout cadence by completed actor->critic cycles.
-
-        Keep replay update budget unchanged by using the base
-        ``_train_iter_off_policy()`` and only controlling whether unroll is
-        performed for a given outer iteration.
-        """
+    def _should_skip_unroll_iter_off_policy(self):
+        """Return whether the next off-policy unroll should be skipped."""
         self._last_rollout_skipped_due_eval_gate = False
 
         # Preserve the default behavior during warmup/initial collection and
         # for standard (non-alternating) training mode.
         if not self._training_started or self._train_mode == TrainMode.standard:
-            unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()
-            if unrolled:
-                self._sync_reference_from_current()
-                self._eval_gate_consecutive_rollout_skips = 0
-            return unrolled, root_inputs, rollout_info
+            return False
 
-        # Skip rollout until enough completed actor->critic cycles have
-        # accumulated since the previous actual rollout.
-        if self._completed_cycles_since_rollout < self._rollout_cycles_per_collect:
-            return False, None, None
+        # Skip rollout until the next rollout boundary. This checks the eval
+        # gate once every ``rollout_cycles_per_collect`` completed cycles, so an
+        # eval-gated skip extends training by another full rollout interval.
+        if (self._completed_cycles_since_rollout <
+                self._rollout_cycles_per_collect
+                or self._completed_cycles_since_rollout %
+                self._rollout_cycles_per_collect != 0):
+            return True
 
         # Real rollout skip: when eval trust remains below threshold, skip this
         # rollout and keep training from replay only.
@@ -1188,14 +1183,32 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 self._eval_gate_consecutive_rollout_skips += 1
                 self._rollout_skip_due_eval_gate_count += 1
                 self._last_rollout_skipped_due_eval_gate = True
-                return False, None, None
+                return True
 
-        unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()
-        if unrolled:
-            self._sync_reference_from_current()
+        return False
+
+    def _after_unroll_iter_off_policy(self, unrolled):
+        """Update BAFC rollout-gate state after a real parent unroll."""
+        if not unrolled:
+            return
+        self._sync_reference_from_current()
+        if self._training_started and self._train_mode != TrainMode.standard:
             self._completed_cycles_since_rollout = 0
-            self._eval_gate_consecutive_rollout_skips = 0
-        return unrolled, root_inputs, rollout_info
+        self._eval_gate_consecutive_rollout_skips = 0
+
+    # def _unroll_iter_off_policy(self):
+    #     """Gate rollout cadence by completed actor->critic cycles.
+
+    #     Keep replay update budget unchanged by using the base
+    #     ``_train_iter_off_policy()`` and only controlling whether unroll is
+    #     performed for a given outer iteration.
+    #     """
+    #     if self._should_skip_unroll_iter_off_policy():
+    #         return False, None, None
+
+    #     unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()
+    #     self._after_unroll_iter_off_policy(unrolled)
+    #     return unrolled, root_inputs, rollout_info
 
     def after_update(self, root_inputs, info: BafcInfo):
         del info

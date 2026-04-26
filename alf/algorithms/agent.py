@@ -361,6 +361,21 @@ class Agent(RLAlgorithm):
 
         return AlgStep(output=rl_step.output, state=new_state, info=info)
 
+    def _unroll_iter_off_policy(self):
+        should_skip_unroll = getattr(
+            self._rl_algorithm, "_should_skip_unroll_iter_off_policy", None)
+        if should_skip_unroll is not None and should_skip_unroll():
+            return False, None, None
+
+        unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()
+
+        after_unroll = getattr(self._rl_algorithm,
+                               "_after_unroll_iter_off_policy", None)
+        if after_unroll is not None:
+            after_unroll(unrolled)
+
+        return unrolled, root_inputs, rollout_info
+
     def train_step_offline(self, time_step: TimeStep, state, rollout_info,
                            pre_train):
         new_state = AgentState()
