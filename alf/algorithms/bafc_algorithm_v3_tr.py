@@ -123,6 +123,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  actor_utd: Optional[int] = None,
                  critic_utd: Optional[int] = None,
                  rollout_cycles_per_collect: int = 3,
+                 reference_actor_sync_interval: Optional[int] = None,
                  env=None,
                  config: TrainerConfig = None,
                  critic_loss_ctor=None,
@@ -160,6 +161,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 critic-actor cycles to train on replay data after each unroll.
                 A cycle is counted when train mode switches from ``actor`` back
                 to ``critic``.
+            reference_actor_sync_interval (None|int): sync the reference actor
+                from the current actor once every this many real rollout
+                collections. If None, defaults to half the replay buffer length
+                in rollout collections, based on ``TrainerConfig``.
         """
         assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'output'], (
             r"{actor_eval_type} in not supported.")
@@ -180,6 +185,19 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 "grad_gate_max_consecutive_actor_extensions must be >= 1 when set")
         assert rollout_cycles_per_collect >= 1, (
             "rollout_cycles_per_collect must be >= 1")
+        if reference_actor_sync_interval is None:
+            reference_actor_sync_interval = 1
+            if config is not None:
+                unroll_length = config.unroll_length
+                if unroll_length == 0:
+                    unroll_length = config.max_unroll_length
+                unroll_length = max(1, unroll_length)
+                reference_actor_sync_interval = max(
+                    1,
+                    int(np.ceil(config.replay_buffer_length /
+                                (2 * unroll_length))))
+        assert reference_actor_sync_interval >= 1, (
+            "reference_actor_sync_interval must be >= 1")
         if actor_utd is None and critic_utd is None:
             self._train_mode = TrainMode.standard
         else:
@@ -221,6 +239,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._grad_gate_max_consecutive_actor_extensions = (
             grad_gate_max_consecutive_actor_extensions)
         self._rollout_cycles_per_collect = rollout_cycles_per_collect
+        self._reference_actor_sync_interval = reference_actor_sync_interval
+        self._real_rollouts_since_reference_sync = 0
         self._bootstrap_mask = ()
         actor_networks = actor_network_cls(
             input_tensor_spec=observation_spec,
@@ -1191,7 +1211,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         """Update BAFC rollout-gate state after a real parent unroll."""
         if not unrolled:
             return
-        self._sync_reference_from_current()
+        self._real_rollouts_since_reference_sync += 1
+        if (self._real_rollouts_since_reference_sync >=
+                self._reference_actor_sync_interval):
+            self._sync_reference_from_current()
+            self._real_rollouts_since_reference_sync = 0
         if self._training_started and self._train_mode != TrainMode.standard:
             self._completed_cycles_since_rollout = 0
         self._eval_gate_consecutive_rollout_skips = 0

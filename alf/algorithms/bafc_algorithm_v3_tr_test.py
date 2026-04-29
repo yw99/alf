@@ -221,6 +221,15 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         with self.assertRaises(AssertionError):
             self._make_alg(trust_metric_update_interval=0)
 
+    def test_reference_actor_sync_interval_must_be_positive(self):
+        with self.assertRaises(AssertionError):
+            self._make_alg(reference_actor_sync_interval=0)
+
+    def test_reference_actor_sync_interval_defaults_to_half_buffer(self):
+        alg = self._make_alg()
+
+        self.assertEqual(alg._reference_actor_sync_interval, 256)
+
     def test_custom_feature_coord_config_is_applied(self):
         alg = self._make_alg(trust_metric_num_feature_coords=5)
 
@@ -943,6 +952,26 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._completed_cycles_since_rollout, 0)
         parent_unroll.assert_called_once()
         sync_mock.assert_called_once()
+
+    def test_reference_actor_sync_interval_delays_sync(self):
+        alg = self._make_alg(reference_actor_sync_interval=3)
+
+        with mock.patch.object(alg, "_sync_reference_from_current") as sync_mock:
+            alg._after_unroll_iter_off_policy(False)
+            self.assertEqual(alg._real_rollouts_since_reference_sync, 0)
+            sync_mock.assert_not_called()
+
+            alg._after_unroll_iter_off_policy(True)
+            self.assertEqual(alg._real_rollouts_since_reference_sync, 1)
+            sync_mock.assert_not_called()
+
+            alg._after_unroll_iter_off_policy(True)
+            self.assertEqual(alg._real_rollouts_since_reference_sync, 2)
+            sync_mock.assert_not_called()
+
+            alg._after_unroll_iter_off_policy(True)
+            self.assertEqual(alg._real_rollouts_since_reference_sync, 0)
+            sync_mock.assert_called_once()
 
     def test_unroll_iter_off_policy_skips_rollout_when_eval_gate_blocks(self):
         alg = self._make_alg(
