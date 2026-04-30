@@ -49,6 +49,8 @@ class TrainerConfig(object):
                  evaluate=False,
                  rollout_skip_eval=False,
                  grad_gate_eval=False,
+                 rollout_skip_eval_interval=100,
+                 grad_gate_eval_interval=100,
                  num_evals=None,
                  eval_interval=10,
                  epsilon_greedy=0.,
@@ -226,6 +228,10 @@ class TrainerConfig(object):
             grad_gate_eval (bool): If True, run policy evaluations around BAFC
                 grad-gated actor extension streaks. This is independent from
                 ``evaluate`` and does not enable periodic evaluation.
+            rollout_skip_eval_interval (int): Minimum rollout-opportunity
+                interval between sampled rollout-skip evaluation windows.
+            grad_gate_eval_interval (int): Minimum training-step interval
+                between sampled grad-gate evaluation windows.
             num_evals (int): how many evaluations are needed throughout the training.
                 If not None, an automatically calculated ``eval_interval`` will
                 replace ``config.eval_interval``.
@@ -410,6 +416,10 @@ class TrainerConfig(object):
         self.evaluate = evaluate
         self.rollout_skip_eval = rollout_skip_eval
         self.grad_gate_eval = grad_gate_eval
+        assert rollout_skip_eval_interval >= 1
+        assert grad_gate_eval_interval >= 1
+        self.rollout_skip_eval_interval = rollout_skip_eval_interval
+        self.grad_gate_eval_interval = grad_gate_eval_interval
         self.num_evals = num_evals
         self.eval_interval = eval_interval
         self.epsilon_greedy = epsilon_greedy

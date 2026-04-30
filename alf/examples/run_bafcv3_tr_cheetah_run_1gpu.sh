@@ -52,6 +52,7 @@ NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
 ROLLOUT_SKIP_CAP=20
 ACTOR_EXTEND_CAP=5
+GRAD_GATE_EVAL_INTERVAL=100
 ORIGINAL_ALGO=false
 
 while [[ $# -gt 0 ]]; do
@@ -174,6 +175,7 @@ else
     echo "  metric_interval: ${METRIC_INTERVAL}"
     echo "  rollout_skip_cap: ${ROLLOUT_SKIP_CAP}"
     echo "  actor_extend_cap: ${ACTOR_EXTEND_CAP}"
+    echo "  grad_gate_eval_interval: ${GRAD_GATE_EVAL_INTERVAL}"
 fi
 echo "  Root dir: ${RUN_DIR}"
 echo ""
@@ -204,6 +206,7 @@ else
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.grad_gate_eval=True" \
+        --conf_param "TrainerConfig.grad_gate_eval_interval=${GRAD_GATE_EVAL_INTERVAL}" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         --conf_param "BafcAlgorithmV3.monitor_trust_metrics=True" \
         --conf_param "BafcAlgorithmV3.eval_trust_max=${EVAL_TRUST_MAX}" \

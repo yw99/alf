@@ -35,6 +35,26 @@ env_load.batched = True
 
 class TrainerTest(alf.test.TestCase):
 
+    def _make_policy_boundary_eval_trainer(self,
+                                           rollout_interval=100,
+                                           grad_interval=100):
+        trainer = object.__new__(RLTrainer)
+        trainer._rollout_skip_evaluator = mock.Mock()
+        trainer._rollout_skip_eval = True
+        trainer._grad_gate_eval = True
+        trainer._rollout_skip_eval_interval = rollout_interval
+        trainer._grad_gate_eval_interval = grad_interval
+        trainer._next_rollout_skip_eval_start = rollout_interval
+        trainer._next_grad_gate_eval_start = grad_interval
+        trainer._sampled_rollout_skip_eval_starts = set()
+        trainer._sampled_grad_gate_eval_starts = set()
+        metric = mock.Mock()
+        metric.name = "EnvironmentSteps"
+        metric.result.return_value = 123
+        trainer._algorithm = mock.Mock()
+        trainer._algorithm.get_step_metrics.return_value = [metric]
+        return trainer
+
     def test_rl_trainer(self):
         with tempfile.TemporaryDirectory() as root_dir:
             alf.config("create_environment", env_load_fn=env_load)
@@ -174,6 +194,118 @@ class TrainerTest(alf.test.TestCase):
             step=15)
         scalar.assert_any_call("grad_gate_eval/extension_length", 4, step=15)
         self.assertEqual(scalar.call_count, 6)
+
+    def test_rollout_skip_eval_interval_samples_complete_windows(self):
+        trainer = self._make_policy_boundary_eval_trainer(
+            rollout_interval=100)
+        state_dict = {"weights": 1}
+
+        with mock.patch.object(alf.summary, "get_global_counter", return_value=7):
+            trainer._handle_rollout_skip_eval_event(
+                dict(
+                    type="skip_start",
+                    start_rollout_opportunity=50,
+                    end_rollout_opportunity=50,
+                    skip_length=1), state_dict)
+            trainer._handle_rollout_skip_eval_event(
+                dict(
+                    type="skip_end",
+                    start_rollout_opportunity=50,
+                    end_rollout_opportunity=60,
+                    skip_length=10), state_dict)
+            self.assertEqual(trainer._rollout_skip_evaluator.eval.call_count, 0)
+            trainer._algorithm.get_step_metrics.assert_not_called()
+
+            start_100 = dict(
+                type="skip_start",
+                start_rollout_opportunity=100,
+                end_rollout_opportunity=100,
+                skip_length=1)
+            end_100 = dict(
+                type="skip_end",
+                start_rollout_opportunity=100,
+                end_rollout_opportunity=101,
+                skip_length=1)
+            trainer._handle_rollout_skip_eval_event(start_100, state_dict)
+            trainer._handle_rollout_skip_eval_event(end_100, state_dict)
+            self.assertEqual(trainer._rollout_skip_evaluator.eval.call_count, 2)
+            trainer._rollout_skip_evaluator.eval.assert_any_call(
+                event=start_100,
+                state_dict=state_dict,
+                global_counter=7,
+                step_metric_values={"EnvironmentSteps": 123})
+            trainer._rollout_skip_evaluator.eval.assert_any_call(
+                event=end_100,
+                state_dict=state_dict,
+                global_counter=7,
+                step_metric_values={"EnvironmentSteps": 123})
+            self.assertEqual(trainer._next_rollout_skip_eval_start, 200)
+            self.assertEqual(trainer._sampled_rollout_skip_eval_starts, set())
+
+            trainer._handle_rollout_skip_eval_event(
+                dict(
+                    type="skip_start",
+                    start_rollout_opportunity=150,
+                    end_rollout_opportunity=150,
+                    skip_length=1), state_dict)
+            self.assertEqual(trainer._rollout_skip_evaluator.eval.call_count, 2)
+
+    def test_grad_gate_eval_interval_samples_complete_windows_independently(
+            self):
+        trainer = self._make_policy_boundary_eval_trainer(
+            rollout_interval=100, grad_interval=100)
+        state_dict = {"weights": 1}
+
+        with mock.patch.object(alf.summary, "get_global_counter", return_value=9):
+            rollout_start = dict(
+                type="skip_start",
+                start_rollout_opportunity=100,
+                end_rollout_opportunity=100,
+                skip_length=1)
+            trainer._handle_rollout_skip_eval_event(rollout_start, state_dict)
+            self.assertEqual(trainer._rollout_skip_evaluator.eval.call_count, 1)
+            self.assertEqual(trainer._next_rollout_skip_eval_start, 200)
+            self.assertEqual(trainer._next_grad_gate_eval_start, 100)
+
+            trainer._handle_rollout_skip_eval_event(
+                dict(
+                    type="grad_extension_start",
+                    start_step=50,
+                    end_step=50,
+                    extension_length=1), state_dict)
+            trainer._handle_rollout_skip_eval_event(
+                dict(
+                    type="grad_extension_end",
+                    start_step=50,
+                    end_step=60,
+                    extension_length=3), state_dict)
+            self.assertEqual(trainer._rollout_skip_evaluator.eval.call_count, 1)
+
+            grad_start = dict(
+                type="grad_extension_start",
+                start_step=100,
+                end_step=100,
+                extension_length=1)
+            grad_end = dict(
+                type="grad_extension_end",
+                start_step=100,
+                end_step=101,
+                extension_length=1)
+            trainer._handle_rollout_skip_eval_event(grad_start, state_dict)
+            trainer._handle_rollout_skip_eval_event(grad_end, state_dict)
+            self.assertEqual(trainer._rollout_skip_evaluator.eval.call_count, 3)
+            trainer._rollout_skip_evaluator.eval.assert_any_call(
+                event=grad_start,
+                state_dict=state_dict,
+                global_counter=9,
+                step_metric_values={"EnvironmentSteps": 123})
+            trainer._rollout_skip_evaluator.eval.assert_any_call(
+                event=grad_end,
+                state_dict=state_dict,
+                global_counter=9,
+                step_metric_values={"EnvironmentSteps": 123})
+            self.assertEqual(trainer._next_grad_gate_eval_start, 200)
+            self.assertEqual(trainer._sampled_grad_gate_eval_starts, set())
 
 
 if __name__ == "__main__":

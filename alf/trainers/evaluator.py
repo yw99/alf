@@ -19,6 +19,7 @@ import math
 import torch.multiprocessing as mp
 import os
 import sys
+import time
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Union
@@ -580,6 +581,7 @@ def _rollout_skip_worker(job_queue: mp.Queue,
             job = job_queue.get()
             if job.type == "eval":
                 event = job.event
+                start_time = time.monotonic()
                 alf.summary.set_global_counter(job.global_counter)
                 env_steps = job.step_metrics.get("EnvironmentSteps", 0)
                 policy_trainer.Trainer.get_trainer_progress().update(
@@ -588,6 +590,10 @@ def _rollout_skip_worker(job_queue: mp.Queue,
                 metrics = evaluate(env, algorithm, config.num_eval_episodes,
                                    config.num_eval_steps, job_queue)
                 if metrics is None:
+                    logging.info(
+                        "Policy-boundary evaluation job aborted: event=%s "
+                        "elapsed_sec=%.3f", event,
+                        time.monotonic() - start_time)
                     continue
                 average_return = _average_return_from_metrics(metrics)
                 with alf.summary.push_summary_writer(summary_writer):
@@ -633,6 +639,11 @@ def _rollout_skip_worker(job_queue: mp.Queue,
                                 "Unknown policy-boundary event type %s" %
                                 event["type"])
                     summary_writer.flush()
+                logging.info(
+                    "Finished policy-boundary evaluation job: event=%s "
+                    "average_return=%.6g elapsed_sec=%.3f", event,
+                    average_return,
+                    time.monotonic() - start_time)
             elif job.type == "wait":
                 done_queue.put(None)
             elif job.type == "stop":

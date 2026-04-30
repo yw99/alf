@@ -136,6 +136,8 @@ alf.config(
     mini_batch_size=256,
     evaluate=False,
     grad_gate_eval=False,
+    rollout_skip_eval_interval=100,
+    grad_gate_eval_interval=100,
     debug_summaries=False,
     summary_interval=1000,
     summarize_grads_and_vars=False,

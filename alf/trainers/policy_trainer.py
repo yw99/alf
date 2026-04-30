@@ -281,6 +281,12 @@ class Trainer(object):
         self._evaluate = config.evaluate
         self._rollout_skip_eval = config.rollout_skip_eval
         self._grad_gate_eval = config.grad_gate_eval
+        self._rollout_skip_eval_interval = config.rollout_skip_eval_interval
+        self._grad_gate_eval_interval = config.grad_gate_eval_interval
+        self._next_rollout_skip_eval_start = self._rollout_skip_eval_interval
+        self._next_grad_gate_eval_start = self._grad_gate_eval_interval
+        self._sampled_rollout_skip_eval_starts = set()
+        self._sampled_grad_gate_eval_starts = set()
         self._eval_uncertainty = config.eval_uncertainty
 
         if config.num_evals is not None:
@@ -702,6 +708,45 @@ class RLTrainer(Trainer):
             else:
                 set_callback(self._handle_rollout_skip_eval_event)
 
+    def _advance_policy_boundary_eval_threshold(self, attr_name, interval,
+                                                start_step):
+        while getattr(self, attr_name) <= start_step:
+            setattr(self, attr_name, getattr(self, attr_name) + interval)
+
+    def _should_queue_policy_boundary_eval_event(self, event):
+        event_type = event["type"]
+        if event_type == "skip_start":
+            start_step = int(event["start_rollout_opportunity"])
+            if start_step < self._next_rollout_skip_eval_start:
+                return False
+            self._advance_policy_boundary_eval_threshold(
+                "_next_rollout_skip_eval_start",
+                self._rollout_skip_eval_interval, start_step)
+            self._sampled_rollout_skip_eval_starts.add(start_step)
+            return True
+        if event_type == "skip_end":
+            start_step = int(event["start_rollout_opportunity"])
+            if start_step not in self._sampled_rollout_skip_eval_starts:
+                return False
+            self._sampled_rollout_skip_eval_starts.remove(start_step)
+            return True
+        if event_type == "grad_extension_start":
+            start_step = int(event["start_step"])
+            if start_step < self._next_grad_gate_eval_start:
+                return False
+            self._advance_policy_boundary_eval_threshold(
+                "_next_grad_gate_eval_start", self._grad_gate_eval_interval,
+                start_step)
+            self._sampled_grad_gate_eval_starts.add(start_step)
+            return True
+        if event_type == "grad_extension_end":
+            start_step = int(event["start_step"])
+            if start_step not in self._sampled_grad_gate_eval_starts:
+                return False
+            self._sampled_grad_gate_eval_starts.remove(start_step)
+            return True
+        return False
+
     def _handle_rollout_skip_eval_event(self, event, state_dict):
         if self._rollout_skip_evaluator is None:
             return
@@ -715,6 +760,8 @@ class RLTrainer(Trainer):
         else:
             logging.warning("Ignoring unknown policy-boundary eval event: %s",
                             event)
+            return
+        if not self._should_queue_policy_boundary_eval_event(event):
             return
         step_metrics = self._algorithm.get_step_metrics()
         step_metrics = dict((m.name, int(m.result())) for m in step_metrics)
