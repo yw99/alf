@@ -14,6 +14,7 @@
 
 import functools
 import tempfile
+from unittest import mock
 import torch
 
 import alf
@@ -21,6 +22,7 @@ from alf.algorithms.hypernetwork_algorithm import HyperNetwork
 from alf.algorithms.rl_algorithm_test import MyEnv, MyAlg
 from alf.trainers.policy_trainer import RLTrainer, TrainerConfig, play
 from alf.trainers.policy_trainer import SLTrainer
+from alf.trainers import evaluator
 from alf.utils import common, datagen
 
 
@@ -114,6 +116,64 @@ class TrainerTest(alf.test.TestCase):
             self.assertEqual(SLTrainer.progress(), 0.5)
             new_trainer.train()
             self.assertEqual(SLTrainer.progress(), 1)
+
+    def test_rollout_skip_eval_summary_steps_and_relative_change(self):
+        event = dict(
+            type="skip_end",
+            start_rollout_opportunity=4,
+            end_rollout_opportunity=7,
+            skip_length=3)
+
+        with mock.patch.object(alf.summary, "scalar") as scalar:
+            evaluator._write_rollout_skip_start_summary(2.0, event)
+            evaluator._write_rollout_skip_result_summaries(2.0, 3.0, event)
+
+        scalar.assert_any_call("rollout_skip_eval/start_average_return",
+                               2.0,
+                               step=4)
+        scalar.assert_any_call("rollout_skip_eval/average_return",
+                               2.0,
+                               step=4)
+        scalar.assert_any_call("rollout_skip_eval/end_average_return",
+                               3.0,
+                               step=7)
+        scalar.assert_any_call("rollout_skip_eval/average_return",
+                               3.0,
+                               step=7)
+        scalar.assert_any_call(
+            "rollout_skip_eval/relative_average_return_change",
+            0.5,
+            step=7)
+        scalar.assert_any_call("rollout_skip_eval/skip_length", 3, step=7)
+        self.assertEqual(scalar.call_count, 6)
+        self.assertAlmostEqual(
+            evaluator._relative_return_change(-2.0, -1.0), 0.5)
+
+    def test_grad_gate_eval_summary_steps_and_relative_change(self):
+        event = dict(
+            type="grad_extension_end",
+            start_step=11,
+            end_step=15,
+            extension_length=4)
+
+        with mock.patch.object(alf.summary, "scalar") as scalar:
+            evaluator._write_grad_gate_start_summary(4.0, event)
+            evaluator._write_grad_gate_result_summaries(4.0, 3.0, event)
+
+        scalar.assert_any_call("grad_gate_eval/start_average_return",
+                               4.0,
+                               step=11)
+        scalar.assert_any_call("grad_gate_eval/average_return", 4.0, step=11)
+        scalar.assert_any_call("grad_gate_eval/end_average_return",
+                               3.0,
+                               step=15)
+        scalar.assert_any_call("grad_gate_eval/average_return", 3.0, step=15)
+        scalar.assert_any_call(
+            "grad_gate_eval/relative_average_return_change",
+            -0.25,
+            step=15)
+        scalar.assert_any_call("grad_gate_eval/extension_length", 4, step=15)
+        self.assertEqual(scalar.call_count, 6)
 
 
 if __name__ == "__main__":

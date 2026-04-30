@@ -18,7 +18,7 @@ import torch
 
 import alf
 from alf.algorithms.actor_critic_algorithm import ActorCriticAlgorithm
-from alf.algorithms.agent import Agent
+from alf.algorithms.agent import Agent, AgentInfo
 from alf.algorithms.icm_algorithm import ICMAlgorithm
 from alf.algorithms.rl_algorithm import RLAlgorithm
 from alf.data_structures import TimeStep
@@ -114,6 +114,134 @@ class AgentTest(alf.test.TestCase):
         should_skip.assert_called_once()
         parent_unroll.assert_called_once()
         after_unroll.assert_called_once_with(True)
+
+    def test_rollout_skip_callback_runs_before_replay_training(self):
+        observation_spec = TensorSpec((10, ))
+        action_spec = BoundedTensorSpec((), dtype='int64')
+        actor_net = functools.partial(ActorDistributionNetwork,
+                                      fc_layer_params=(100, ))
+        value_net = functools.partial(ValueNetwork, fc_layer_params=(100, ))
+        agent = Agent(observation_spec=observation_spec,
+                      action_spec=action_spec,
+                      rl_algorithm_cls=functools.partial(
+                          ActorCriticAlgorithm,
+                          actor_network_ctor=actor_net,
+                          value_network_ctor=value_net))
+
+        event = dict(
+            type="skip_start",
+            start_rollout_opportunity=3,
+            end_rollout_opportunity=3,
+            skip_length=1)
+        agent._rl_algorithm._should_skip_unroll_iter_off_policy = mock.Mock(
+            return_value=True)
+        agent._rl_algorithm._pop_rollout_skip_event = mock.Mock(
+            return_value=event)
+        calls = []
+        agent.set_rollout_skip_eval_callback(
+            lambda event, state_dict: calls.append(
+                ("callback", event, len(state_dict))))
+        agent._replay_buffer = object()
+
+        def _train_from_replay(update_global_counter):
+            calls.append(("train", update_global_counter))
+            return 7
+
+        with mock.patch.object(
+                agent,
+                "train_from_replay_buffer",
+                side_effect=_train_from_replay):
+            steps = agent._train_iter_off_policy()
+
+        self.assertEqual(steps, 7)
+        self.assertEqual([call[0] for call in calls], ["callback", "train"])
+        self.assertEqual(calls[0][1], event)
+        self.assertGreater(calls[0][2], 0)
+        self.assertTrue(calls[1][1])
+
+    def test_rollout_skip_callback_runs_before_real_unroll(self):
+        observation_spec = TensorSpec((10, ))
+        action_spec = BoundedTensorSpec((), dtype='int64')
+        actor_net = functools.partial(ActorDistributionNetwork,
+                                      fc_layer_params=(100, ))
+        value_net = functools.partial(ValueNetwork, fc_layer_params=(100, ))
+        agent = Agent(observation_spec=observation_spec,
+                      action_spec=action_spec,
+                      rl_algorithm_cls=functools.partial(
+                          ActorCriticAlgorithm,
+                          actor_network_ctor=actor_net,
+                          value_network_ctor=value_net))
+
+        event = dict(
+            type="skip_end",
+            start_rollout_opportunity=3,
+            end_rollout_opportunity=5,
+            skip_length=2)
+        agent._rl_algorithm._should_skip_unroll_iter_off_policy = mock.Mock(
+            return_value=False)
+        agent._rl_algorithm._pop_rollout_skip_event = mock.Mock(
+            return_value=event)
+        calls = []
+        agent.set_rollout_skip_eval_callback(
+            lambda event, state_dict: calls.append(
+                ("callback", event, len(state_dict))))
+
+        def _parent_unroll():
+            calls.append(("unroll", ))
+            return True, "root", "info"
+
+        with mock.patch.object(
+                RLAlgorithm,
+                "_unroll_iter_off_policy",
+                side_effect=_parent_unroll):
+            unrolled, root_inputs, rollout_info = agent._unroll_iter_off_policy()
+
+        self.assertTrue(unrolled)
+        self.assertEqual(root_inputs, "root")
+        self.assertEqual(rollout_info, "info")
+        self.assertEqual([call[0] for call in calls], ["callback", "unroll"])
+        self.assertEqual(calls[0][1], event)
+        self.assertGreater(calls[0][2], 0)
+
+    def test_grad_gate_callback_runs_after_after_update(self):
+        observation_spec = TensorSpec((10, ))
+        action_spec = BoundedTensorSpec((), dtype='int64')
+        actor_net = functools.partial(ActorDistributionNetwork,
+                                      fc_layer_params=(100, ))
+        value_net = functools.partial(ValueNetwork, fc_layer_params=(100, ))
+        agent = Agent(observation_spec=observation_spec,
+                      action_spec=action_spec,
+                      rl_algorithm_cls=functools.partial(
+                          ActorCriticAlgorithm,
+                          actor_network_ctor=actor_net,
+                          value_network_ctor=value_net))
+
+        event = dict(
+            type="grad_extension_end",
+            start_step=10,
+            end_step=14,
+            extension_length=2)
+        agent._rl_algorithm._pop_grad_extension_event = mock.Mock(
+            return_value=event)
+        calls = []
+        agent.set_rollout_skip_eval_callback(
+            lambda event, state_dict: calls.append(
+                ("callback", event, len(state_dict))))
+
+        def _after_update(algorithms, experience, train_info):
+            calls.append(("after_update", experience, train_info))
+
+        with mock.patch.object(
+                agent._agent_helper,
+                "after_update",
+                side_effect=_after_update):
+            agent.after_update("experience", AgentInfo())
+
+        self.assertEqual([call[0] for call in calls],
+                         ["after_update", "callback"])
+        self.assertEqual(calls[0][1], "experience")
+        self.assertEqual(calls[1][1], event)
+        self.assertGreater(calls[1][2], 0)
 
 
 if __name__ == "__main__":

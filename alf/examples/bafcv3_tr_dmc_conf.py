@@ -135,6 +135,7 @@ alf.config(
     num_env_steps=int(1e6),
     mini_batch_size=256,
     evaluate=False,
+    grad_gate_eval=False,
     debug_summaries=False,
     summary_interval=1000,
     summarize_grads_and_vars=False,

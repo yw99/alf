@@ -14,6 +14,7 @@
 
 from absl import logging
 from absl import flags
+import copy
 import math
 import torch.multiprocessing as mp
 import os
@@ -32,13 +33,104 @@ from alf.utils.summary_utils import record_time
 from alf.data_structures import StepType
 from alf.algorithms.data_transformer import create_data_transformer
 from alf.environments.utils import create_environment
-from alf.trainers import policy_trainer
 from alf.utils.schedulers import Scheduler, as_scheduler
 from collections import namedtuple
 
 EvalJob = namedtuple("EvalJob",
                      ["type", "global_counter", "step_metrics", "state_dict"],
                      defaults=[None] * 4)
+
+RolloutSkipEvalJob = namedtuple(
+    "RolloutSkipEvalJob",
+    ["type", "event", "global_counter", "step_metrics", "state_dict"],
+    defaults=[None] * 5)
+
+
+def _copy_state_dict_to_cpu(state_dict):
+    return {
+        name: value.detach().cpu().clone()
+        if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+        for name, value in state_dict.items()
+    }
+
+
+def _nested_scalar_to_float(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().to(torch.float32)
+        return float(value.mean().item())
+    if isinstance(value, dict):
+        values = [_nested_scalar_to_float(v) for v in value.values()]
+        return sum(values) / len(values)
+    if isinstance(value, (list, tuple)):
+        values = [_nested_scalar_to_float(v) for v in value]
+        return sum(values) / len(values)
+    return float(value)
+
+
+def _average_return_from_metrics(metrics: List[alf.metrics.StepMetric]) -> float:
+    for metric in metrics:
+        if metric.name == "AverageReturn":
+            return _nested_scalar_to_float(metric.result())
+    raise ValueError("AverageReturn metric is missing from evaluation results")
+
+
+def _relative_return_change(start_return: float, end_return: float) -> float:
+    return (end_return - start_return) / max(abs(start_return), 1e-8)
+
+
+def _write_rollout_skip_start_summary(start_return: float, event: Dict):
+    start_step = int(event["start_rollout_opportunity"])
+    alf.summary.scalar("rollout_skip_eval/start_average_return",
+                       start_return,
+                       step=start_step)
+    alf.summary.scalar("rollout_skip_eval/average_return",
+                       start_return,
+                       step=start_step)
+
+
+def _write_rollout_skip_result_summaries(start_return: float,
+                                         end_return: float,
+                                         event: Dict):
+    end_step = int(event["end_rollout_opportunity"])
+    alf.summary.scalar("rollout_skip_eval/end_average_return",
+                       end_return,
+                       step=end_step)
+    alf.summary.scalar("rollout_skip_eval/average_return",
+                       end_return,
+                       step=end_step)
+    alf.summary.scalar("rollout_skip_eval/relative_average_return_change",
+                       _relative_return_change(start_return, end_return),
+                       step=end_step)
+    alf.summary.scalar("rollout_skip_eval/skip_length",
+                       int(event["skip_length"]),
+                       step=end_step)
+
+
+def _write_grad_gate_start_summary(start_return: float, event: Dict):
+    start_step = int(event["start_step"])
+    alf.summary.scalar("grad_gate_eval/start_average_return",
+                       start_return,
+                       step=start_step)
+    alf.summary.scalar("grad_gate_eval/average_return",
+                       start_return,
+                       step=start_step)
+
+
+def _write_grad_gate_result_summaries(start_return: float, end_return: float,
+                                      event: Dict):
+    end_step = int(event["end_step"])
+    alf.summary.scalar("grad_gate_eval/end_average_return",
+                       end_return,
+                       step=end_step)
+    alf.summary.scalar("grad_gate_eval/average_return",
+                       end_return,
+                       step=end_step)
+    alf.summary.scalar("grad_gate_eval/relative_average_return_change",
+                       _relative_return_change(start_return, end_return),
+                       step=end_step)
+    alf.summary.scalar("grad_gate_eval/extension_length",
+                       int(event["extension_length"]),
+                       step=end_step)
 
 
 class Evaluator(object):
@@ -128,6 +220,47 @@ class Evaluator(object):
             job = EvalJob(type="wait")
             self._job_queue.put(job)
             self._done_queue.get()
+
+
+class RolloutSkipEvaluator(object):
+    """Asynchronous CPU evaluator for BAFC policy boundary events."""
+
+    def __init__(self, config: TrainerConfig, conf_file: str):
+        mp.set_sharing_strategy('file_system')
+        if conf_file.endswith('.gin'):
+            raise AssertionError(
+                "policy-boundary eval is not supported for gin_file")
+        ctx = mp.get_context('spawn')
+        self._job_queue = ctx.Queue()
+        self._done_queue = ctx.Queue()
+        pre_configs = dict(alf.get_handled_pre_configs())
+        self._worker = ctx.Process(
+            target=_rollout_skip_worker,
+            args=(self._job_queue, self._done_queue, conf_file, pre_configs,
+                  config.num_eval_environments, config.root_dir,
+                  config.random_seed))
+        self._worker.start()
+
+    def eval(self, event: Dict, state_dict: Dict, global_counter: int,
+             step_metric_values: Dict[str, int]):
+        job = RolloutSkipEvalJob(
+            type="eval",
+            event=dict(event),
+            global_counter=int(global_counter),
+            step_metrics=dict(step_metric_values),
+            state_dict=_copy_state_dict_to_cpu(state_dict))
+        logging.info("Sending policy-boundary evaluation job: %s", event)
+        self._job_queue.put(job)
+
+    def wait_complete(self):
+        job = RolloutSkipEvalJob(type="wait")
+        self._job_queue.put(job)
+        self._done_queue.get()
+
+    def close(self):
+        job = RolloutSkipEvalJob(type="stop")
+        self._job_queue.put(job)
+        self._worker.join()
 
 
 def _define_flags():
@@ -237,6 +370,7 @@ class SyncEvaluator(object):
                     other_steps=step_metric_values)
             if (self._config.save_checkpoint_for_best_eval is not None
                     and self._config.save_checkpoint_for_best_eval(metrics)):
+                from alf.trainers import policy_trainer
                 logging.info("Saving the best checkpoint")
                 checkpointer = Checkpointer(
                     ckpt_dir=os.path.join(self._config.root_dir, 'train',
@@ -327,6 +461,7 @@ def _worker(job_queue: mp.Queue,
             alf.close_env()
             raise e
 
+        from alf.trainers import policy_trainer
         config = policy_trainer.TrainerConfig(root_dir=root_dir)
 
         env = alf.get_env()
@@ -379,6 +514,144 @@ def _worker(job_queue: mp.Queue,
         alf.get_env().close()
     except Exception as e:
         logging.exception(f'{mp.current_process().name} - {e}')
+
+
+def _rollout_skip_worker(job_queue: mp.Queue,
+                         done_queue: mp.Queue,
+                         conf_file: str,
+                         pre_configs: Dict,
+                         num_parallel_envs: int,
+                         root_dir: str,
+                         seed: Optional[int] = None):
+    summary_writer = None
+    env = None
+    try:
+        _define_flags()
+        FLAGS(sys.argv, known_only=True)
+        FLAGS.mark_as_parsed()
+        FLAGS.alsologtostderr = True
+        logging.set_verbosity(logging.INFO)
+        logging.get_absl_handler().use_absl_log_file(log_dir=root_dir)
+        logging.use_absl_handler()
+        alf.set_default_device("cpu")
+        if seed is not None:
+            seed = seed + 24680
+        common.set_random_seed(seed)
+        alf.config('TrainerConfig', mutable=False, random_seed=seed)
+        alf.config('create_environment',
+                   for_evaluation=True,
+                   num_parallel_environments=num_parallel_envs,
+                   mutable=False)
+        try:
+            alf.pre_config(pre_configs)
+            common.parse_conf_file(conf_file)
+        except Exception as e:
+            alf.close_env()
+            raise e
+
+        from alf.trainers import policy_trainer
+        config = policy_trainer.TrainerConfig(root_dir=root_dir)
+        env = alf.get_env()
+        env.reset()
+        data_transformer = create_data_transformer(
+            config.data_transformer_ctor, env.observation_spec())
+        config.data_transformer = data_transformer
+        common.set_global_env(env)
+        observation_spec = data_transformer.transformed_observation_spec
+        common.set_transformed_observation_spec(observation_spec)
+
+        algorithm = config.algorithm_ctor(observation_spec=observation_spec,
+                                          action_spec=env.action_spec(),
+                                          reward_spec=env.reward_spec(),
+                                          config=config)
+        algorithm.set_path('')
+        policy_trainer.Trainer.get_trainer_progress(
+        ).set_termination_criterion(config.num_iterations,
+                                    config.num_env_steps)
+        alf.summary.enable_summary()
+        summary_writer = alf.summary.create_summary_writer(
+            os.path.join(config.root_dir, 'eval'),
+            flush_secs=config.summaries_flush_secs)
+
+        pending_start_returns = {}
+        job_queue = PeekableQueue(job_queue)
+        logging.info("Policy-boundary evaluator started")
+        while True:
+            job = job_queue.get()
+            if job.type == "eval":
+                event = job.event
+                alf.summary.set_global_counter(job.global_counter)
+                env_steps = job.step_metrics.get("EnvironmentSteps", 0)
+                policy_trainer.Trainer.get_trainer_progress().update(
+                    job.global_counter, env_steps)
+                algorithm.load_state_dict(job.state_dict)
+                metrics = evaluate(env, algorithm, config.num_eval_episodes,
+                                   config.num_eval_steps, job_queue)
+                if metrics is None:
+                    continue
+                average_return = _average_return_from_metrics(metrics)
+                with alf.summary.push_summary_writer(summary_writer):
+                    with alf.summary.record_if(lambda: True):
+                        if event["type"] == "skip_start":
+                            start_step = int(
+                                event["start_rollout_opportunity"])
+                            pending_start_returns[("rollout_skip",
+                                                   start_step)] = average_return
+                            _write_rollout_skip_start_summary(
+                                average_return, event)
+                        elif event["type"] == "skip_end":
+                            start_step = int(
+                                event["start_rollout_opportunity"])
+                            start_return = pending_start_returns.pop(
+                                ("rollout_skip", start_step), None)
+                            if start_return is None:
+                                logging.warning(
+                                    "Missing rollout-skip start result for %s",
+                                    event)
+                                continue
+                            _write_rollout_skip_result_summaries(
+                                start_return, average_return, event)
+                        elif event["type"] == "grad_extension_start":
+                            start_step = int(event["start_step"])
+                            pending_start_returns[("grad_gate",
+                                                   start_step)] = average_return
+                            _write_grad_gate_start_summary(
+                                average_return, event)
+                        elif event["type"] == "grad_extension_end":
+                            start_step = int(event["start_step"])
+                            start_return = pending_start_returns.pop(
+                                ("grad_gate", start_step), None)
+                            if start_return is None:
+                                logging.warning(
+                                    "Missing grad-gate start result for %s",
+                                    event)
+                                continue
+                            _write_grad_gate_result_summaries(
+                                start_return, average_return, event)
+                        else:
+                            raise KeyError(
+                                "Unknown policy-boundary event type %s" %
+                                event["type"])
+                    summary_writer.flush()
+            elif job.type == "wait":
+                done_queue.put(None)
+            elif job.type == "stop":
+                break
+            else:
+                raise KeyError('Received message of unknown type {}'.format(
+                    job.type))
+
+        done_queue.put(None)
+    except KeyboardInterrupt:
+        if env is not None:
+            env.close()
+    except Exception as e:
+        logging.exception(f'{mp.current_process().name} - {e}')
+    finally:
+        if summary_writer is not None:
+            summary_writer.close()
+        if env is not None:
+            env.close()
 
 
 @common.mark_eval
@@ -444,6 +717,7 @@ def evaluate(
         total_num = num_eval_steps
 
     time_step = common.get_initial_time_step(env)
+    from alf.trainers import policy_trainer
 
     while counter < total_num:
         if episode_mode:

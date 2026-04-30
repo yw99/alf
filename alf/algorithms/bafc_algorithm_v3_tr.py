@@ -358,8 +358,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._trust_metric_update_counter = 0
         self._eval_gate_consecutive_rollout_skips = 0
         self._rollout_skip_due_eval_gate_count = 0
+        self._rollout_opportunity_count = 0
+        self._active_rollout_skip_start_opportunity = None
+        self._pending_rollout_skip_event = None
         self._grad_gate_actor_extension_count = 0
         self._grad_gate_consecutive_actor_extensions = 0
+        self._active_grad_extension_start_step = None
+        self._pending_grad_extension_event = None
         self._last_rollout_skipped_due_eval_gate = False
         self._last_grad_gate_actor_extended = False
         self._last_update_had_actor_step = False
@@ -1011,6 +1016,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if self._train_mode == TrainMode.actor:
             if self._actor_update_counter % self._actor_utd == 0:
                 should_extend_actor = False
+                previous_consecutive_extensions = (
+                    self._grad_gate_consecutive_actor_extensions)
                 if self._enable_grad_actor_extend_gate:
                     grad_trust = float(
                         torch.as_tensor(self._last_grad_trust).reshape(
@@ -1026,10 +1033,22 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                             self._grad_gate_max_consecutive_actor_extensions):
                         should_extend_actor = False
                 if should_extend_actor:
+                    if previous_consecutive_extensions == 0:
+                        self._active_grad_extension_start_step = int(
+                            alf.summary.get_global_counter())
                     self._last_grad_gate_actor_extended = True
                     self._grad_gate_actor_extension_count += 1
                     self._grad_gate_consecutive_actor_extensions += 1
+                    if previous_consecutive_extensions == 0:
+                        self._set_grad_extension_event(
+                            "grad_extension_start",
+                            self._grad_gate_consecutive_actor_extensions)
                 else:
+                    if previous_consecutive_extensions > 0:
+                        self._set_grad_extension_event(
+                            "grad_extension_end",
+                            previous_consecutive_extensions)
+                        self._active_grad_extension_start_step = None
                     self._grad_gate_consecutive_actor_extensions = 0
                     self._train_mode = TrainMode.critic
                     self._completed_cycles_since_rollout += 1
@@ -1174,9 +1193,45 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             '_snapshot_critic_networks'
         ]
 
+    def _pop_rollout_skip_event(self):
+        """Return and clear the pending rollout-skip boundary event."""
+        event = self._pending_rollout_skip_event
+        self._pending_rollout_skip_event = None
+        return event
+
+    def _pop_grad_extension_event(self):
+        """Return and clear the pending grad-gate extension boundary event."""
+        event = self._pending_grad_extension_event
+        self._pending_grad_extension_event = None
+        return event
+
+    def _set_grad_extension_event(self, event_type: str,
+                                  extension_length: int):
+        start_step = self._active_grad_extension_start_step
+        current_step = int(alf.summary.get_global_counter())
+        if start_step is None:
+            start_step = current_step
+        self._pending_grad_extension_event = dict(
+            type=event_type,
+            start_step=int(start_step),
+            end_step=current_step,
+            extension_length=int(extension_length))
+
+    def _set_rollout_skip_event(self, event_type: str, skip_length: int):
+        start_opportunity = self._active_rollout_skip_start_opportunity
+        if start_opportunity is None:
+            start_opportunity = max(
+                1, self._rollout_opportunity_count - skip_length)
+        self._pending_rollout_skip_event = dict(
+            type=event_type,
+            start_rollout_opportunity=int(start_opportunity),
+            end_rollout_opportunity=int(self._rollout_opportunity_count),
+            skip_length=int(skip_length))
+
     def _should_skip_unroll_iter_off_policy(self):
         """Return whether the next off-policy unroll should be skipped."""
         self._last_rollout_skipped_due_eval_gate = False
+        self._pending_rollout_skip_event = None
 
         # Preserve the default behavior during warmup/initial collection and
         # for standard (non-alternating) training mode.
@@ -1192,18 +1247,32 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 self._rollout_cycles_per_collect != 0):
             return True
 
+        self._rollout_opportunity_count += 1
+        previous_consecutive_skips = self._eval_gate_consecutive_rollout_skips
+
         # Real rollout skip: when eval trust remains below threshold, skip this
         # rollout and keep training from replay only.
         if self._enable_eval_rollout_skip_gate:
             eval_trust = float(
                 torch.as_tensor(self._last_eval_trust).reshape(()).item())
             if (eval_trust <= self._eval_trust_max
-                    and self._eval_gate_consecutive_rollout_skips <
+                    and previous_consecutive_skips <
                     self._eval_gate_max_consecutive_rollout_skips):
+                if previous_consecutive_skips == 0:
+                    self._active_rollout_skip_start_opportunity = (
+                        self._rollout_opportunity_count)
                 self._eval_gate_consecutive_rollout_skips += 1
                 self._rollout_skip_due_eval_gate_count += 1
                 self._last_rollout_skipped_due_eval_gate = True
+                if previous_consecutive_skips == 0:
+                    self._set_rollout_skip_event(
+                        "skip_start",
+                        self._eval_gate_consecutive_rollout_skips)
                 return True
+
+        if previous_consecutive_skips > 0:
+            self._set_rollout_skip_event("skip_end",
+                                         previous_consecutive_skips)
 
         return False
 
@@ -1219,20 +1288,16 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if self._training_started and self._train_mode != TrainMode.standard:
             self._completed_cycles_since_rollout = 0
         self._eval_gate_consecutive_rollout_skips = 0
+        self._active_rollout_skip_start_opportunity = None
 
-    # def _unroll_iter_off_policy(self):
-    #     """Gate rollout cadence by completed actor->critic cycles.
+    def _unroll_iter_off_policy(self):
+        """Gate rollout cadence by completed actor->critic cycles."""
+        if self._should_skip_unroll_iter_off_policy():
+            return False, None, None
 
-    #     Keep replay update budget unchanged by using the base
-    #     ``_train_iter_off_policy()`` and only controlling whether unroll is
-    #     performed for a given outer iteration.
-    #     """
-    #     if self._should_skip_unroll_iter_off_policy():
-    #         return False, None, None
-
-    #     unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()
-    #     self._after_unroll_iter_off_policy(unrolled)
-    #     return unrolled, root_inputs, rollout_info
+        unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()
+        self._after_unroll_iter_off_policy(unrolled)
+        return unrolled, root_inputs, rollout_info
 
     def after_update(self, root_inputs, info: BafcInfo):
         del info
@@ -1290,6 +1355,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._record_debug_scalar(
             'rollout_skip_due_eval_gate_count',
             float(self._rollout_skip_due_eval_gate_count))
+        self._record_debug_scalar('rollout_opportunity_count',
+                                  float(self._rollout_opportunity_count))
         self._record_debug_scalar('actor_extended_due_grad_gate',
                                   float(self._last_grad_gate_actor_extended))
         self._record_debug_scalar('actor_extension_due_grad_gate_count',

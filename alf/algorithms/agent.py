@@ -213,6 +213,7 @@ class Agent(RLAlgorithm):
         self._irm = intrinsic_reward_module
         self._goal_generator = goal_generator
         self._agent_helper = agent_helper
+        self._rollout_skip_eval_callback = None
         # Set ``use_rollout_state``` for all submodules using the setter.
         # Need to make sure that no submodules use ``self._use_rollout_state``
         # before this line.
@@ -221,6 +222,22 @@ class Agent(RLAlgorithm):
     def set_path(self, path):
         super().set_path(path)
         self._agent_helper.set_path(path)
+
+    def set_rollout_skip_eval_callback(self, callback: Callable):
+        """Set callback for policy-boundary eval events from the RL algorithm."""
+        self._rollout_skip_eval_callback = callback
+
+    def _maybe_emit_policy_eval_events(self):
+        if self._rollout_skip_eval_callback is None:
+            return
+        for pop_event_name in ("_pop_rollout_skip_event",
+                               "_pop_grad_extension_event"):
+            pop_event = getattr(self._rl_algorithm, pop_event_name, None)
+            if pop_event is None:
+                continue
+            event = pop_event()
+            if event is not None:
+                self._rollout_skip_eval_callback(event, self.state_dict())
 
     def predict_step(self, time_step: TimeStep, state: AgentState):
         """Predict for one step."""
@@ -365,7 +382,10 @@ class Agent(RLAlgorithm):
         should_skip_unroll = getattr(
             self._rl_algorithm, "_should_skip_unroll_iter_off_policy", None)
         if should_skip_unroll is not None and should_skip_unroll():
+            self._maybe_emit_policy_eval_events()
             return False, None, None
+
+        self._maybe_emit_policy_eval_events()
 
         unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()
 
@@ -471,6 +491,7 @@ class Agent(RLAlgorithm):
         ]
         algorithms = list(filter(lambda a: a is not None, algorithms))
         self._agent_helper.after_update(algorithms, experience, train_info)
+        self._maybe_emit_policy_eval_events()
 
     def after_train_iter(self, experience, info: AgentInfo):
         """Call ``after_train_iter()`` of the RL algorithm and goal generator,

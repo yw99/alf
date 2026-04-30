@@ -47,6 +47,8 @@ class TrainerConfig(object):
                  confirm_checkpoint_upon_crash=True,
                  no_thread_env_for_conf=False,
                  evaluate=False,
+                 rollout_skip_eval=False,
+                 grad_gate_eval=False,
                  num_evals=None,
                  eval_interval=10,
                  epsilon_greedy=0.,
@@ -218,6 +220,12 @@ class TrainerConfig(object):
                 of creating an unwrapped env won't affect training; it's used to
                 correctly display inoperative configurations in subprocesses.
             evaluate (bool): A bool to evaluate when training
+            rollout_skip_eval (bool): If True, run skip-only policy evaluations
+                around BAFC eval-gated rollout skip streaks. This is independent
+                from ``evaluate`` and does not enable periodic evaluation.
+            grad_gate_eval (bool): If True, run policy evaluations around BAFC
+                grad-gated actor extension streaks. This is independent from
+                ``evaluate`` and does not enable periodic evaluation.
             num_evals (int): how many evaluations are needed throughout the training.
                 If not None, an automatically calculated ``eval_interval`` will
                 replace ``config.eval_interval``.
@@ -400,6 +408,8 @@ class TrainerConfig(object):
         self.confirm_checkpoint_upon_crash = confirm_checkpoint_upon_crash
         self.no_thread_env_for_conf = no_thread_env_for_conf
         self.evaluate = evaluate
+        self.rollout_skip_eval = rollout_skip_eval
+        self.grad_gate_eval = grad_gate_eval
         self.num_evals = num_evals
         self.eval_interval = eval_interval
         self.epsilon_greedy = epsilon_greedy

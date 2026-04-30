@@ -204,6 +204,7 @@ else
     echo "  actor_extend_cap: ${ACTOR_EXTEND_CAP}"
     echo "  Eval rollout-skip gate: ${ENABLE_EVAL_ROLLOUT_SKIP_GATE}"
     echo "  Grad actor-extend gate: ${ENABLE_GRAD_ACTOR_EXTEND_GATE}"
+    echo "  Grad gate eval: ${ENABLE_GRAD_ACTOR_EXTEND_GATE}"
 fi
 echo "  Root dir: ${RUN_DIR}"
 echo ""
@@ -229,6 +230,7 @@ else
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
+        --conf_param "TrainerConfig.grad_gate_eval=${ENABLE_GRAD_ACTOR_EXTEND_GATE}" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         --conf_param "BafcAlgorithmV3.monitor_trust_metrics=True" \
         --conf_param "BafcAlgorithmV3.eval_trust_max=${EVAL_TRUST_MAX}" \

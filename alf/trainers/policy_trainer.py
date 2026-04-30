@@ -52,7 +52,7 @@ from alf.utils.schedulers import update_progress
 import alf.utils.datagen as datagen
 from alf.utils.per_process_context import PerProcessContext
 from alf.utils.summary_utils import record_time
-from .evaluator import Evaluator
+from .evaluator import Evaluator, RolloutSkipEvaluator
 
 
 class TrainerProgress(nn.Module):
@@ -279,6 +279,8 @@ class Trainer(object):
         self._checkpointer = None
 
         self._evaluate = config.evaluate
+        self._rollout_skip_eval = config.rollout_skip_eval
+        self._grad_gate_eval = config.grad_gate_eval
         self._eval_uncertainty = config.eval_uncertainty
 
         if config.num_evals is not None:
@@ -686,6 +688,41 @@ class RLTrainer(Trainer):
 
         if self._evaluate:
             self._evaluator = Evaluator(self._config, common.get_conf_file())
+        self._rollout_skip_evaluator = None
+        if ((self._rollout_skip_eval or self._grad_gate_eval)
+                and self._rank <= 0):
+            self._rollout_skip_evaluator = RolloutSkipEvaluator(
+                self._config, common.get_conf_file())
+            set_callback = getattr(self._algorithm,
+                                   "set_rollout_skip_eval_callback", None)
+            if set_callback is None:
+                logging.warning(
+                    "rollout_skip_eval=True or grad_gate_eval=True, but the "
+                    "algorithm does not support policy-boundary callbacks.")
+            else:
+                set_callback(self._handle_rollout_skip_eval_event)
+
+    def _handle_rollout_skip_eval_event(self, event, state_dict):
+        if self._rollout_skip_evaluator is None:
+            return
+        event_type = event.get("type")
+        if event_type in ("skip_start", "skip_end"):
+            if not self._rollout_skip_eval:
+                return
+        elif event_type in ("grad_extension_start", "grad_extension_end"):
+            if not self._grad_gate_eval:
+                return
+        else:
+            logging.warning("Ignoring unknown policy-boundary eval event: %s",
+                            event)
+            return
+        step_metrics = self._algorithm.get_step_metrics()
+        step_metrics = dict((m.name, int(m.result())) for m in step_metrics)
+        self._rollout_skip_evaluator.eval(
+            event=event,
+            state_dict=state_dict,
+            global_counter=int(alf.summary.get_global_counter()),
+            step_metric_values=step_metrics)
 
     def _close_envs(self):
         """Close all envs to release their resources."""
@@ -770,6 +807,8 @@ class RLTrainer(Trainer):
 
         if self._evaluate:
             self._evaluator.wait_complete()
+        if self._rollout_skip_evaluator is not None:
+            self._rollout_skip_evaluator.wait_complete()
 
         if self._rank >= 0:
             torch.distributed.barrier()
@@ -870,6 +909,8 @@ class RLTrainer(Trainer):
         self._close_envs()
         if self._evaluate:
             self._evaluator.close()
+        if self._rollout_skip_evaluator is not None:
+            self._rollout_skip_evaluator.close()
 
     def _restore_checkpoint(self):
         checkpointer = Checkpointer(

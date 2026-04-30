@@ -219,6 +219,7 @@ else
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
+        --conf_param "TrainerConfig.grad_gate_eval=True" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         --conf_param "BafcAlgorithmV3.monitor_trust_metrics=True" \
         --conf_param "BafcAlgorithmV3.eval_trust_max=${EVAL_TRUST_MAX_A}" \
@@ -238,6 +239,7 @@ else
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
+        --conf_param "TrainerConfig.grad_gate_eval=True" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         --conf_param "BafcAlgorithmV3.monitor_trust_metrics=True" \
         --conf_param "BafcAlgorithmV3.eval_trust_max=${EVAL_TRUST_MAX_B}" \

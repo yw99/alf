@@ -41,7 +41,7 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v6_evalonly_oldref"
+BASE_DIR="/root/alf_results_v6_evalonly_oldref_skiplogging"
 NUM_ENV_STEPS=1000000
 SEED=0
 GPU_IDS=(0 1 2 3)
@@ -185,6 +185,7 @@ for i in "${!GPU_IDS[@]}"; do
         --conf_param "TrainerConfig.random_seed=${SEED}" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
+        --conf_param "TrainerConfig.rollout_skip_eval=True" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         --conf_param "BafcAlgorithmV3.monitor_trust_metrics=True" \
         --conf_param "BafcAlgorithmV3.eval_trust_max=${EVAL_TRUST_MAX}" \

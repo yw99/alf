@@ -920,7 +920,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             num_updates_per_train_iter=12,
             actor_utd=1,
             critic_utd=2,
-            rollout_cycles_per_collect=3)
+            rollout_cycles_per_collect=3,
+            reference_actor_sync_interval=1)
         alg._training_started = True
         alg._train_mode = TrainMode.critic
         alg._completed_cycles_since_rollout = 2
@@ -1011,7 +1012,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             rollout_cycles_per_collect=3,
             enable_eval_rollout_skip_gate=True,
             monitor_trust_metrics=False,
-            eval_gate_max_consecutive_rollout_skips=2)
+            eval_gate_max_consecutive_rollout_skips=2,
+            reference_actor_sync_interval=1)
         alg._training_started = True
         alg._train_mode = TrainMode.critic
         alg._completed_cycles_since_rollout = 3
@@ -1034,13 +1036,87 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         parent_unroll.assert_called_once()
         sync_mock.assert_called_once()
 
+    def test_rollout_skip_events_track_start_continue_and_end(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3,
+            enable_eval_rollout_skip_gate=True,
+            monitor_trust_metrics=False)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._last_eval_trust = torch.tensor(1.0)
+
+        alg._completed_cycles_since_rollout = 2
+        self.assertTrue(alg._should_skip_unroll_iter_off_policy())
+        self.assertEqual(alg._rollout_opportunity_count, 0)
+        self.assertIsNone(alg._pop_rollout_skip_event())
+
+        alg._completed_cycles_since_rollout = 3
+        self.assertTrue(alg._should_skip_unroll_iter_off_policy())
+        self.assertEqual(alg._rollout_opportunity_count, 1)
+        self.assertEqual(
+            alg._pop_rollout_skip_event(),
+            dict(
+                type="skip_start",
+                start_rollout_opportunity=1,
+                end_rollout_opportunity=1,
+                skip_length=1))
+
+        alg._completed_cycles_since_rollout = 3
+        self.assertTrue(alg._should_skip_unroll_iter_off_policy())
+        self.assertEqual(alg._rollout_opportunity_count, 2)
+        self.assertIsNone(alg._pop_rollout_skip_event())
+
+        alg._last_eval_trust = torch.tensor(10.0)
+        alg._completed_cycles_since_rollout = 3
+        self.assertFalse(alg._should_skip_unroll_iter_off_policy())
+        self.assertEqual(alg._rollout_opportunity_count, 3)
+        self.assertEqual(
+            alg._pop_rollout_skip_event(),
+            dict(
+                type="skip_end",
+                start_rollout_opportunity=1,
+                end_rollout_opportunity=3,
+                skip_length=2))
+
+    def test_rollout_skip_cap_emits_end_event(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3,
+            enable_eval_rollout_skip_gate=True,
+            monitor_trust_metrics=False,
+            eval_gate_max_consecutive_rollout_skips=2)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._last_eval_trust = torch.tensor(1.0)
+
+        for _ in range(2):
+            alg._completed_cycles_since_rollout = 3
+            self.assertTrue(alg._should_skip_unroll_iter_off_policy())
+            alg._pop_rollout_skip_event()
+
+        alg._completed_cycles_since_rollout = 3
+        self.assertFalse(alg._should_skip_unroll_iter_off_policy())
+        self.assertEqual(
+            alg._pop_rollout_skip_event(),
+            dict(
+                type="skip_end",
+                start_rollout_opportunity=1,
+                end_rollout_opportunity=3,
+                skip_length=2))
+
     def test_unroll_iter_off_policy_delegates_during_warmup_or_standard_mode(
             self):
         alg = self._make_alg(
             num_updates_per_train_iter=12,
             actor_utd=1,
             critic_utd=2,
-            rollout_cycles_per_collect=3)
+            rollout_cycles_per_collect=3,
+            reference_actor_sync_interval=1)
         alg._completed_cycles_since_rollout = 0
 
         with mock.patch.object(
@@ -1126,20 +1202,50 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg._train_mode = TrainMode.actor
         alg._actor_update_counter = 1
 
-        alg._last_grad_trust = torch.tensor(1.0)
-        before = alg._trust_metric_update_counter
-        alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.actor)
-        self.assertTrue(alg._last_grad_gate_actor_extended)
-        self.assertEqual(alg._grad_gate_actor_extension_count, 1)
-        self.assertEqual(alg._trust_metric_update_counter, before)
+        old_counter = int(alf.summary.get_global_counter())
+        try:
+            alf.summary.set_global_counter(10)
+            alg._last_grad_trust = torch.tensor(1.0)
+            before = alg._trust_metric_update_counter
+            alg._update_train_mode()
+            self.assertEqual(alg._train_mode, TrainMode.actor)
+            self.assertTrue(alg._last_grad_gate_actor_extended)
+            self.assertEqual(alg._grad_gate_actor_extension_count, 1)
+            self.assertEqual(alg._trust_metric_update_counter, before)
+            self.assertEqual(
+                alg._pop_grad_extension_event(),
+                dict(
+                    type="grad_extension_start",
+                    start_step=10,
+                    end_step=10,
+                    extension_length=1))
 
-        alg._last_grad_trust = torch.tensor(3.0)
-        before = alg._trust_metric_update_counter
-        alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.critic)
-        self.assertFalse(alg._last_grad_gate_actor_extended)
-        self.assertEqual(alg._trust_metric_update_counter, before)
+            alf.summary.set_global_counter(11)
+            alg._last_grad_trust = torch.tensor(1.0)
+            before = alg._trust_metric_update_counter
+            alg._update_train_mode()
+            self.assertEqual(alg._train_mode, TrainMode.actor)
+            self.assertTrue(alg._last_grad_gate_actor_extended)
+            self.assertEqual(alg._grad_gate_actor_extension_count, 2)
+            self.assertEqual(alg._trust_metric_update_counter, before)
+            self.assertIsNone(alg._pop_grad_extension_event())
+
+            alf.summary.set_global_counter(12)
+            alg._last_grad_trust = torch.tensor(3.0)
+            before = alg._trust_metric_update_counter
+            alg._update_train_mode()
+            self.assertEqual(alg._train_mode, TrainMode.critic)
+            self.assertFalse(alg._last_grad_gate_actor_extended)
+            self.assertEqual(alg._trust_metric_update_counter, before)
+            self.assertEqual(
+                alg._pop_grad_extension_event(),
+                dict(
+                    type="grad_extension_end",
+                    start_step=10,
+                    end_step=12,
+                    extension_length=2))
+        finally:
+            alf.summary.set_global_counter(old_counter)
 
     def test_grad_gate_extension_cap_forces_critic_switch_without_counter_bump(
             self):
@@ -1154,21 +1260,41 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         alg._actor_update_counter = 1
         alg._last_grad_trust = torch.tensor(0.0)
 
-        before = alg._trust_metric_update_counter
-        alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.actor)
-        self.assertTrue(alg._last_grad_gate_actor_extended)
-        self.assertEqual(alg._grad_gate_consecutive_actor_extensions, 1)
-        self.assertEqual(alg._grad_gate_actor_extension_count, 1)
-        self.assertEqual(alg._trust_metric_update_counter, before)
+        old_counter = int(alf.summary.get_global_counter())
+        try:
+            alf.summary.set_global_counter(20)
+            before = alg._trust_metric_update_counter
+            alg._update_train_mode()
+            self.assertEqual(alg._train_mode, TrainMode.actor)
+            self.assertTrue(alg._last_grad_gate_actor_extended)
+            self.assertEqual(alg._grad_gate_consecutive_actor_extensions, 1)
+            self.assertEqual(alg._grad_gate_actor_extension_count, 1)
+            self.assertEqual(alg._trust_metric_update_counter, before)
+            self.assertEqual(
+                alg._pop_grad_extension_event(),
+                dict(
+                    type="grad_extension_start",
+                    start_step=20,
+                    end_step=20,
+                    extension_length=1))
 
-        before = alg._trust_metric_update_counter
-        alg._update_train_mode()
-        self.assertEqual(alg._train_mode, TrainMode.critic)
-        self.assertFalse(alg._last_grad_gate_actor_extended)
-        self.assertEqual(alg._grad_gate_consecutive_actor_extensions, 0)
-        self.assertEqual(alg._grad_gate_actor_extension_count, 1)
-        self.assertEqual(alg._trust_metric_update_counter, before)
+            alf.summary.set_global_counter(21)
+            before = alg._trust_metric_update_counter
+            alg._update_train_mode()
+            self.assertEqual(alg._train_mode, TrainMode.critic)
+            self.assertFalse(alg._last_grad_gate_actor_extended)
+            self.assertEqual(alg._grad_gate_consecutive_actor_extensions, 0)
+            self.assertEqual(alg._grad_gate_actor_extension_count, 1)
+            self.assertEqual(alg._trust_metric_update_counter, before)
+            self.assertEqual(
+                alg._pop_grad_extension_event(),
+                dict(
+                    type="grad_extension_end",
+                    start_step=20,
+                    end_step=21,
+                    extension_length=1))
+        finally:
+            alf.summary.set_global_counter(old_counter)
 
     def test_grad_gate_disabled_keeps_default_mode_switch(self):
         alg = self._make_alg(
@@ -1188,6 +1314,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._train_mode, TrainMode.critic)
         self.assertFalse(alg._last_grad_gate_actor_extended)
         self.assertEqual(alg._trust_metric_update_counter, before)
+        self.assertIsNone(alg._pop_grad_extension_event())
 
     def test_critic_boundary_switches_to_actor_without_extension(self):
         alg = self._make_alg(
