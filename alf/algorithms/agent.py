@@ -227,6 +227,21 @@ class Agent(RLAlgorithm):
         """Set callback for policy-boundary eval events from the RL algorithm."""
         self._rollout_skip_eval_callback = callback
 
+    def get_policy_boundary_eval_state(self):
+        """Return transient policy state for policy-boundary evaluation."""
+        get_state = getattr(self._rl_algorithm,
+                            "get_policy_boundary_eval_state", None)
+        if get_state is None:
+            return None
+        return get_state()
+
+    def set_policy_boundary_eval_state(self, state):
+        """Restore transient policy state for policy-boundary evaluation."""
+        set_state = getattr(self._rl_algorithm,
+                            "set_policy_boundary_eval_state", None)
+        if set_state is not None:
+            set_state(state)
+
     def _maybe_emit_policy_eval_events(self):
         if self._rollout_skip_eval_callback is None:
             return
@@ -237,6 +252,10 @@ class Agent(RLAlgorithm):
                 continue
             event = pop_event()
             if event is not None:
+                event = dict(event)
+                policy_eval_state = self.get_policy_boundary_eval_state()
+                if policy_eval_state is not None:
+                    event["policy_eval_state"] = policy_eval_state
                 self._rollout_skip_eval_callback(event, self.state_dict())
 
     def predict_step(self, time_step: TimeStep, state: AgentState):

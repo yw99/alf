@@ -159,6 +159,52 @@ class AgentTest(alf.test.TestCase):
         self.assertGreater(calls[0][2], 0)
         self.assertTrue(calls[1][1])
 
+    def test_policy_boundary_eval_state_is_delegated_and_emitted(self):
+        observation_spec = TensorSpec((10, ))
+        action_spec = BoundedTensorSpec((), dtype='int64')
+        actor_net = functools.partial(ActorDistributionNetwork,
+                                      fc_layer_params=(100, ))
+        value_net = functools.partial(ValueNetwork, fc_layer_params=(100, ))
+        agent = Agent(observation_spec=observation_spec,
+                      action_spec=action_spec,
+                      rl_algorithm_cls=functools.partial(
+                          ActorCriticAlgorithm,
+                          actor_network_ctor=actor_net,
+                          value_network_ctor=value_net))
+
+        event = dict(
+            type="skip_start",
+            start_rollout_opportunity=3,
+            end_rollout_opportunity=3,
+            skip_length=1)
+        policy_eval_state = dict(training_started=True, rollout_actor_id=2)
+        agent._rl_algorithm._should_skip_unroll_iter_off_policy = mock.Mock(
+            return_value=True)
+        agent._rl_algorithm._pop_rollout_skip_event = mock.Mock(
+            return_value=event)
+        agent._rl_algorithm.get_policy_boundary_eval_state = mock.Mock(
+            return_value=policy_eval_state)
+        agent._rl_algorithm.set_policy_boundary_eval_state = mock.Mock()
+        calls = []
+        agent.set_rollout_skip_eval_callback(
+            lambda event, state_dict: calls.append(
+                ("callback", event, len(state_dict))))
+        agent._replay_buffer = object()
+
+        self.assertEqual(agent.get_policy_boundary_eval_state(),
+                         policy_eval_state)
+        agent.set_policy_boundary_eval_state(policy_eval_state)
+
+        with mock.patch.object(
+                agent, "train_from_replay_buffer", return_value=7):
+            steps = agent._train_iter_off_policy()
+
+        self.assertEqual(steps, 7)
+        agent._rl_algorithm.set_policy_boundary_eval_state.assert_called_once_with(
+            policy_eval_state)
+        self.assertEqual(calls[0][1]["policy_eval_state"], policy_eval_state)
+        self.assertNotIn("policy_eval_state", event)
+
     def test_rollout_skip_callback_runs_before_real_unroll(self):
         observation_spec = TensorSpec((10, ))
         action_spec = BoundedTensorSpec((), dtype='int64')

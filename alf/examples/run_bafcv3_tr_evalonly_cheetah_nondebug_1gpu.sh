@@ -41,17 +41,17 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v6_evalonly_oldref_skiplogging"
+BASE_DIR="/root/alf_results_v6_evalonly_oldref_skiplogging_fixed"
 NUM_ENV_STEPS=1000000
-SEED=0
-GPU_IDS=(2)
-EVAL_TRUST_MAXES=(80.0)
+SEED=1
+GPU_IDS=(0 1)
+EVAL_TRUST_MAXES=(40.0 50.0)
 GPU="${GPU_IDS[0]}"
 EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[0]}"
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
 ROLLOUT_SKIP_CAP=4
-ROLLOUT_SKIP_EVAL_INTERVAL=1
+ROLLOUT_SKIP_EVAL_INTERVAL=40
 USE_SINGLE_CLI_RUN=false
 
 while [[ $# -gt 0 ]]; do
@@ -185,6 +185,7 @@ for i in "${!GPU_IDS[@]}"; do
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
+        --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "TrainerConfig.rollout_skip_eval=True" \

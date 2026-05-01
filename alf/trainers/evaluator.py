@@ -134,6 +134,16 @@ def _write_grad_gate_result_summaries(start_return: float, end_return: float,
                        step=end_step)
 
 
+def _restore_policy_boundary_eval_state(algorithm: RLAlgorithm, event: Dict):
+    policy_eval_state = event.get("policy_eval_state")
+    if policy_eval_state is None:
+        return
+    set_policy_eval_state = getattr(algorithm,
+                                    "set_policy_boundary_eval_state", None)
+    if set_policy_eval_state is not None:
+        set_policy_eval_state(policy_eval_state)
+
+
 class Evaluator(object):
     """Evaluator for performing evaluation on the current algorithm.
 
@@ -587,6 +597,7 @@ def _rollout_skip_worker(job_queue: mp.Queue,
                 policy_trainer.Trainer.get_trainer_progress().update(
                     job.global_counter, env_steps)
                 algorithm.load_state_dict(job.state_dict)
+                _restore_policy_boundary_eval_state(algorithm, event)
                 metrics = evaluate(env, algorithm, config.num_eval_episodes,
                                    config.num_eval_steps, job_queue)
                 if metrics is None:

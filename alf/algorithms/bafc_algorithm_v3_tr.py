@@ -1193,6 +1193,18 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             '_snapshot_critic_networks'
         ]
 
+    def get_policy_boundary_eval_state(self):
+        """Return transient policy state needed by boundary evaluators."""
+        rollout_actor_id = torch.as_tensor(self._rollout_actor_id).reshape(())
+        return dict(
+            training_started=bool(self._training_started),
+            rollout_actor_id=int(rollout_actor_id.item()))
+
+    def set_policy_boundary_eval_state(self, state):
+        """Restore transient policy state needed by ``predict_step()``."""
+        self._training_started = bool(state["training_started"])
+        self._rollout_actor_id = int(state["rollout_actor_id"])
+
     def _pop_rollout_skip_event(self):
         """Return and clear the pending rollout-skip boundary event."""
         event = self._pending_rollout_skip_event

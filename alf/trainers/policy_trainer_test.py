@@ -195,6 +195,22 @@ class TrainerTest(alf.test.TestCase):
         scalar.assert_any_call("grad_gate_eval/extension_length", 4, step=15)
         self.assertEqual(scalar.call_count, 6)
 
+    def test_policy_boundary_eval_state_restore(self):
+        algorithm = mock.Mock()
+        state = dict(training_started=True, rollout_actor_id=2)
+        event = dict(type="skip_start", policy_eval_state=state)
+
+        evaluator._restore_policy_boundary_eval_state(algorithm, event)
+
+        algorithm.set_policy_boundary_eval_state.assert_called_once_with(state)
+
+    def test_policy_boundary_eval_state_restore_ignores_missing_hook(self):
+        algorithm = object()
+        state = dict(training_started=True, rollout_actor_id=2)
+        event = dict(type="skip_start", policy_eval_state=state)
+
+        evaluator._restore_policy_boundary_eval_state(algorithm, event)
+
     def test_rollout_skip_eval_interval_samples_complete_windows(self):
         trainer = self._make_policy_boundary_eval_trainer(
             rollout_interval=100)

@@ -217,6 +217,23 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._num_actor_critic, 3)
         self.assertEqual(alg._train_mode, TrainMode.standard)
 
+    def test_policy_boundary_eval_state_round_trip(self):
+        alg = self._make_alg()
+        alg._training_started = True
+        alg._rollout_actor_id = torch.tensor(2)
+
+        state = alg.get_policy_boundary_eval_state()
+
+        self.assertEqual(
+            state, dict(training_started=True, rollout_actor_id=2))
+
+        alg._training_started = False
+        alg._rollout_actor_id = 0
+        alg.set_policy_boundary_eval_state(state)
+
+        self.assertTrue(alg._training_started)
+        self.assertEqual(int(torch.as_tensor(alg._rollout_actor_id).item()), 2)
+
     def test_trust_metric_update_interval_must_be_positive(self):
         with self.assertRaises(AssertionError):
             self._make_alg(trust_metric_update_interval=0)
