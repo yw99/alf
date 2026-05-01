@@ -876,21 +876,39 @@ class ParallelFC(nn.Module):
     def _selective_forward(self, inputs, id):
         """Forward using a selective member of the parallel layer.
         """
-        if id < 0 or id >= self._n:
-            raise IndexError(f"Index {id} out of range for {self._n} parallel layers")
+        id = self._normalize_parallel_id(id)
         weight = self._weight[id]
         if self._use_bias:
             bias = self._bias[id]
             y = torch.addmm(bias, inputs, weight.t())
         else:
-            y = inputs.matmul(self._weight.t())
+            y = inputs.matmul(weight.t())
         if self._use_ln:
-            if not self._use_bias:
-                self._ln.bias.data.zero_()
-            y = self._ln(y)
+            y = self._selected_layer_norm(y, id)
         if self._use_bn:
             y = self._bn(y)
         return self._activation(y)
+
+    def _normalize_parallel_id(self, id):
+        """Normalize a selected parallel member id to a Python int."""
+        if isinstance(id, torch.Tensor):
+            assert id.numel() == 1, f"id must be scalar, got shape {id.shape}"
+            id = int(id.reshape(()).item())
+        else:
+            id = int(id)
+        if id < 0 or id >= self._n:
+            raise IndexError(f"Index {id} out of range for {self._n} parallel layers")
+        return id
+
+    def _selected_layer_norm(self, y, id):
+        """Apply the GroupNorm slice for one selected parallel member."""
+        if not self._use_bias:
+            self._ln.bias.data.zero_()
+        start = id * self._output_size
+        end = start + self._output_size
+        return F.group_norm(
+            y, 1, self._ln.weight[start:end],
+            self._ln.bias[start:end], self._ln.eps)
 
     @property
     def weight(self):
@@ -1161,8 +1179,7 @@ class ParallelModulatedFC(ParallelFC):
     def _selective_forward(self, inputs, noise, id):
         """Forward using a selective member of the parallel layer.
         """
-        if id < 0 or id >= self._n:
-            raise IndexError(f"Index {id} out of range for {self._n} parallel layers")
+        id = self._normalize_parallel_id(id)
         # Build modulation m: [B, n, l] → align to [n, B, l]
         m = self._build_modulation(noise, id=id)  # [B, l]
         x_mod = inputs * m  # [B, l]
@@ -1182,9 +1199,7 @@ class ParallelModulatedFC(ParallelFC):
             y = y + self._bias[id]
 
         if self._use_ln:
-            if not self._use_bias:
-                self._ln.bias.data.zero_()
-            y = self._ln(y)
+            y = self._selected_layer_norm(y, id)
         if self._use_bn:
             y = self._bn(y)
 

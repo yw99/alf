@@ -66,6 +66,23 @@ class ActorNetworkTest(alf.test.TestCase, parameterized.TestCase):
         # (batch_size, num_actions)
         self.assertEqual(action.shape, (1, 5))
 
+    def test_actor_fc_network_selective_forward_with_layer_norm(self):
+        obs_spec = TensorSpec((4, ), torch.float32)
+        action_spec = BoundedTensorSpec((2, ), torch.float32, -1., 1.)
+        n = 3
+        actor_net = actor_network.ActorFCNetwork(
+            obs_spec,
+            action_spec,
+            fc_layer_params=(8, 8),
+            n_groups=n,
+            use_ln=True)
+        obs = torch.randn(5, 4)
+
+        full, _ = actor_net(obs)
+        for i in range(n):
+            selective, _ = actor_net(obs, id=torch.tensor(i))
+            self.assertLess((selective - full[:, i, :]).abs().max(), 1e-5)
+
 
 if __name__ == '__main__':
     alf.test.main()

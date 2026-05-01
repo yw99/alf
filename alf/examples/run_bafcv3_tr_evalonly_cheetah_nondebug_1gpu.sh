@@ -41,11 +41,11 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v6_evalonly_oldref_skiplogging_fixed"
+BASE_DIR="/root/alf_results_v7_eval"
 NUM_ENV_STEPS=1000000
 SEED=1
-GPU_IDS=(0 1)
-EVAL_TRUST_MAXES=(40.0 50.0)
+GPU_IDS=(1)
+EVAL_TRUST_MAXES=(50.0)
 GPU="${GPU_IDS[0]}"
 EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[0]}"
 NUM_FEATURE_COORDS=4

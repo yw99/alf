@@ -44,18 +44,18 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v6_full_gradonly_oldref_skiplogging"
+BASE_DIR="/root/alf_results_v7_grad"
 NUM_ENV_STEPS=1000000
-SEED=0
-GPU=0
+SEED=1
+GPU=1
 EVAL_TRUST_MAX=115.0 #40.0
 DELTA_TRUST_MAX=115.0 #40.0
 NUM_FEATURE_COORDS=2
 METRIC_INTERVAL=8
 ROLLOUT_SKIP_CAP=4
 ACTOR_EXTEND_CAP=4
-ROLLOUT_SKIP_EVAL_INTERVAL=200
-GRAD_GATE_EVAL_INTERVAL=200
+ROLLOUT_SKIP_EVAL_INTERVAL=20
+GRAD_GATE_EVAL_INTERVAL=20
 ENABLE_EVAL_ROLLOUT_SKIP_GATE=False
 ENABLE_GRAD_ACTOR_EXTEND_GATE=True
 ORIGINAL_ALGO=false
@@ -219,6 +219,7 @@ if [[ "${ORIGINAL_ALGO}" == "true" ]]; then
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
+        --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
@@ -232,6 +233,7 @@ else
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
+        --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
         --conf_param "TrainerConfig.rollout_skip_eval_interval=${ROLLOUT_SKIP_EVAL_INTERVAL}" \

@@ -103,6 +103,57 @@ class LayersTest(parameterized.TestCase, alf.test.TestCase):
             self.assertLess((y - py[:, i, :]).abs().max(), 1e-5)
 
     @parameterized.parameters(
+        dict(output_size=1, use_bias=True),
+        dict(output_size=6, use_bias=True),
+        dict(output_size=6, use_bias=False),
+    )
+    def test_parallel_fc_selective_forward_with_layer_norm(
+            self, output_size=6, use_bias=True):
+        batch_size = 5
+        n = 3
+        x_dim = 4
+        pfc = alf.layers.ParallelFC(
+            x_dim,
+            output_size,
+            n=n,
+            activation=math_ops.identity,
+            use_bias=use_bias,
+            use_ln=True)
+        x = torch.randn(batch_size, x_dim)
+
+        full = pfc(x)
+        for i in range(n):
+            selective = pfc(x, id=torch.tensor(i))
+            self.assertLess((selective - full[:, i, :]).abs().max(), 1e-5)
+
+    @parameterized.parameters(
+        dict(output_size=1, use_bias=True),
+        dict(output_size=6, use_bias=True),
+        dict(output_size=6, use_bias=False),
+    )
+    def test_parallel_modulated_fc_selective_forward_with_layer_norm(
+            self, output_size=6, use_bias=True):
+        batch_size = 5
+        n = 3
+        x_dim = 4
+        noise_dim = 7
+        pfc = alf.layers.ParallelModulatedFC(
+            x_dim,
+            output_size,
+            n=n,
+            activation=math_ops.identity,
+            use_bias=use_bias,
+            use_ln=True,
+            noise_dim=noise_dim)
+        x = torch.randn(batch_size, x_dim)
+        noise = torch.randn(batch_size, noise_dim)
+
+        full = pfc(x, noise=noise)
+        for i in range(n):
+            selective = pfc(x, noise=noise, id=torch.tensor(i))
+            self.assertLess((selective - full[:, i, :]).abs().max(), 1e-5)
+
+    @parameterized.parameters(
         dict(n=1,
              act=math_ops.identity,
              use_bias=False,

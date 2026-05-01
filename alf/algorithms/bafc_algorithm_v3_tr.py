@@ -788,16 +788,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             action, state = actor_net(
                 observation, state=state.actor_network)
         else:
-            if self._actor_use_ln:
-                action, state = actor_net(
-                    observation, state=state.actor_network)
-                # [n_env, n_actor, d_a] --> [n_env, d_a]
-                action = action[:, self._rollout_actor_id, :]
-            else:
-                action, state = actor_net(
-                    observation,
-                    id=self._rollout_actor_id,
-                    state=state.actor_network)
+            action, state = actor_net(
+                observation,
+                id=self._rollout_actor_id,
+                state=state.actor_network)
         new_state = BafcActionState(actor_network=state)
 
         return action, new_state

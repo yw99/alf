@@ -144,6 +144,15 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
     def _make_alg(self, **kwargs):
         num_updates_per_train_iter = kwargs.pop("num_updates_per_train_iter",
                                                 3)
+        actor_network_cls = kwargs.pop(
+            "actor_network_cls",
+            partial(ActorFCNetwork, fc_layer_params=(32, 32)))
+        critic_network_cls = kwargs.pop(
+            "critic_network_cls",
+            partial(
+                FuncCriticNetwork,
+                obs_action_joint_fc_layer_params=(32, 32),
+                actor_obs_action_joint_fc_layer_params=(32, 32)))
         config = TrainerConfig(
             root_dir=tempfile.mkdtemp(prefix="bafc_v3_tr_test_"),
             unroll_length=2,
@@ -155,11 +164,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             observation_spec=TensorSpec((4, )),
             action_spec=BoundedTensorSpec((2, ), minimum=-1.0, maximum=1.0),
             config=config,
-            actor_network_cls=partial(ActorFCNetwork, fc_layer_params=(32, 32)),
-            critic_network_cls=partial(
-                FuncCriticNetwork,
-                obs_action_joint_fc_layer_params=(32, 32),
-                actor_obs_action_joint_fc_layer_params=(32, 32)),
+            actor_network_cls=actor_network_cls,
+            critic_network_cls=critic_network_cls,
             actor_encoder_cls=partial(
                 TransformerEncoder, num_layers=2, num_attention_heads=1),
             num_actor_critic=3,
@@ -233,6 +239,28 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
 
         self.assertTrue(alg._training_started)
         self.assertEqual(int(torch.as_tensor(alg._rollout_actor_id).item()), 2)
+
+    def test_predict_step_selects_single_actor_with_layer_norm(self):
+        alg = self._make_alg(
+            actor_network_cls=partial(
+                ActorFCNetwork, fc_layer_params=(32, 32), use_ln=True),
+            actor_use_ln=True)
+        alg._training_started = True
+        alg._rollout_actor_id = torch.tensor(1)
+        time_step = self._make_rollout_time_step(batch_size=3)
+        state = alg.get_initial_predict_state(batch_size=3)
+
+        with mock.patch.object(
+                alg._actor_networks,
+                "forward",
+                wraps=alg._actor_networks.forward) as forward:
+            pred = alg.predict_step(time_step, state)
+
+        self.assertEqual(
+            int(torch.as_tensor(forward.call_args.kwargs["id"]).item()), 1)
+        full_action, _ = alg._actor_networks(
+            time_step.observation, state=state.actor_network)
+        self.assertTensorClose(pred.output, full_action[:, 1, :])
 
     def test_trust_metric_update_interval_must_be_positive(self):
         with self.assertRaises(AssertionError):
