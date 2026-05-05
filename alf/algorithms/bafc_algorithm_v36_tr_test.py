@@ -254,6 +254,84 @@ class BafcAlgorithmV36TRTest(alf.test.TestCase):
         self.assertTensorClose(alg._last_grad_trust, pending_metric)
         self.assertIsNone(alg._pending_preupdate_grad_trust)
 
+    def test_rollout_actor_hold_events_are_popped_once(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            eval_trust_max=2.0,
+            eval_gate_max_consecutive_rollout_actor_holds=5)
+
+        alg._last_eval_trust = torch.tensor(1.0)
+        alg._update_rollout_actor_from_eval_gate()
+        self.assertEqual(
+            alg._pop_rollout_skip_event(),
+            dict(
+                type="skip_start",
+                start_rollout_opportunity=1,
+                end_rollout_opportunity=1,
+                skip_length=1))
+        self.assertIsNone(alg._pop_rollout_skip_event())
+
+        alg._last_eval_trust = torch.tensor(1.0)
+        alg._update_rollout_actor_from_eval_gate()
+        self.assertIsNone(alg._pop_rollout_skip_event())
+
+        alg._last_eval_trust = torch.tensor(3.0)
+        alg._update_rollout_actor_from_eval_gate()
+        self.assertEqual(
+            alg._pop_rollout_skip_event(),
+            dict(
+                type="skip_end",
+                start_rollout_opportunity=1,
+                end_rollout_opportunity=3,
+                skip_length=2))
+        self.assertIsNone(alg._pop_rollout_skip_event())
+
+    def test_grad_extension_events_are_popped_once(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=1,
+            num_updates_per_train_iter=2,
+            enable_grad_actor_extend_gate=True,
+            delta_trust_max=2.0)
+        alg._train_mode = TrainMode.actor
+        alg._actor_update_counter = 1
+
+        alg._last_grad_trust = torch.tensor(1.0)
+        alg._update_train_mode()
+        event = alg._pop_grad_extension_event()
+        self.assertEqual(event["type"], "grad_extension_start")
+        self.assertEqual(event["extension_length"], 1)
+        self.assertEqual(event["start_step"], event["end_step"])
+        self.assertIsNone(alg._pop_grad_extension_event())
+
+        alg._last_grad_trust = torch.tensor(1.0)
+        alg._update_train_mode()
+        self.assertIsNone(alg._pop_grad_extension_event())
+
+        alg._last_grad_trust = torch.tensor(3.0)
+        alg._update_train_mode()
+        event = alg._pop_grad_extension_event()
+        self.assertEqual(event["type"], "grad_extension_end")
+        self.assertEqual(event["extension_length"], 2)
+        self.assertEqual(event["start_step"], event["end_step"])
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertIsNone(alg._pop_grad_extension_event())
+
+    def test_policy_boundary_eval_state_restores_rollout_actor_state(self):
+        alg = self._make_alg()
+        alg._training_started = True
+        alg._rollout_actor_id = 2
+
+        state = alg.get_policy_boundary_eval_state()
+        self.assertEqual(state, dict(training_started=True, rollout_actor_id=2))
+
+        alg._training_started = False
+        alg._rollout_actor_id = 0
+        alg.set_policy_boundary_eval_state(state)
+
+        self.assertTrue(alg._training_started)
+        self.assertEqual(alg._rollout_actor_id, 2)
+
     @staticmethod
     def _ensure_group_action(alg, observation):
         action = alg._actor_networks(observation)[0]

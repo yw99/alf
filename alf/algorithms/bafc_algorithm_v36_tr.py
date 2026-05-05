@@ -387,8 +387,13 @@ class BafcAlgorithmV36(OffPolicyAlgorithm):
         self._trust_metric_update_counter = 0
         self._eval_gate_consecutive_rollout_actor_holds = 0
         self._rollout_actor_hold_due_eval_gate_count = 0
+        self._rollout_hold_opportunity_count = 0
+        self._active_rollout_hold_start_opportunity = None
+        self._pending_rollout_skip_event = None
         self._grad_gate_actor_extension_count = 0
         self._grad_gate_consecutive_actor_extensions = 0
+        self._active_grad_extension_start_step = None
+        self._pending_grad_extension_event = None
         self._last_rollout_actor_held_due_eval_gate = False
         self._last_rollout_actor_refreshed_from_reference = False
         self._last_rollout_actor_refresh_forced_by_eval_gate_cap = False
@@ -422,36 +427,73 @@ class BafcAlgorithmV36(OffPolicyAlgorithm):
         self._behavior_actor_networks.load_state_dict(
             self._reference_actor_networks.state_dict())
 
+    def _set_rollout_hold_event(self, event_type: str, hold_length: int):
+        start_opportunity = self._active_rollout_hold_start_opportunity
+        if start_opportunity is None:
+            start_opportunity = max(
+                1, self._rollout_hold_opportunity_count - hold_length)
+        self._pending_rollout_skip_event = dict(
+            type=event_type,
+            start_rollout_opportunity=int(start_opportunity),
+            end_rollout_opportunity=int(self._rollout_hold_opportunity_count),
+            skip_length=int(hold_length))
+
     def _update_rollout_actor_from_eval_gate(self):
         self._last_rollout_actor_held_due_eval_gate = False
         self._last_rollout_actor_refreshed_from_reference = False
         self._last_rollout_actor_refresh_forced_by_eval_gate_cap = False
+        self._pending_rollout_skip_event = None
 
         if not self._enable_eval_rollout_skip_gate:
+            previous_consecutive_holds = (
+                self._eval_gate_consecutive_rollout_actor_holds)
+            if previous_consecutive_holds > 0:
+                self._set_rollout_hold_event("skip_end",
+                                             previous_consecutive_holds)
             self._sync_behavior_from_reference()
             self._last_rollout_actor_refreshed_from_reference = True
             self._eval_gate_consecutive_rollout_actor_holds = 0
+            self._active_rollout_hold_start_opportunity = None
             return
+
+        self._rollout_hold_opportunity_count += 1
+        previous_consecutive_holds = (
+            self._eval_gate_consecutive_rollout_actor_holds)
 
         eval_trust = float(
             torch.as_tensor(self._last_eval_trust).reshape(()).item())
         if eval_trust > self._eval_trust_max:
+            if previous_consecutive_holds > 0:
+                self._set_rollout_hold_event("skip_end",
+                                             previous_consecutive_holds)
             self._sync_behavior_from_reference()
             self._last_rollout_actor_refreshed_from_reference = True
             self._eval_gate_consecutive_rollout_actor_holds = 0
+            self._active_rollout_hold_start_opportunity = None
             return
 
         if (self._eval_gate_consecutive_rollout_actor_holds >=
                 self._eval_gate_max_consecutive_rollout_actor_holds):
+            if previous_consecutive_holds > 0:
+                self._set_rollout_hold_event("skip_end",
+                                             previous_consecutive_holds)
             self._sync_behavior_from_reference()
             self._last_rollout_actor_refreshed_from_reference = True
             self._last_rollout_actor_refresh_forced_by_eval_gate_cap = True
             self._eval_gate_consecutive_rollout_actor_holds = 0
+            self._active_rollout_hold_start_opportunity = None
             return
 
+        if previous_consecutive_holds == 0:
+            self._active_rollout_hold_start_opportunity = (
+                self._rollout_hold_opportunity_count)
         self._eval_gate_consecutive_rollout_actor_holds += 1
         self._rollout_actor_hold_due_eval_gate_count += 1
         self._last_rollout_actor_held_due_eval_gate = True
+        if previous_consecutive_holds == 0:
+            self._set_rollout_hold_event(
+                "skip_start",
+                self._eval_gate_consecutive_rollout_actor_holds)
 
     def _sync_snapshot_critic_from_current(self):
         self._snapshot_critic_networks.load_state_dict(
@@ -2298,9 +2340,12 @@ class BafcAlgorithmV36(OffPolicyAlgorithm):
 
     def _update_train_mode(self):
         self._last_grad_gate_actor_extended = False
+        self._pending_grad_extension_event = None
         if self._train_mode == TrainMode.actor:
             if self._actor_update_counter % self._actor_utd == 0:
                 should_extend_actor = False
+                previous_consecutive_extensions = (
+                    self._grad_gate_consecutive_actor_extensions)
                 if self._enable_grad_actor_extend_gate:
                     grad_trust = float(
                         torch.as_tensor(self._last_grad_trust).reshape(
@@ -2316,10 +2361,22 @@ class BafcAlgorithmV36(OffPolicyAlgorithm):
                             self._grad_gate_max_consecutive_actor_extensions):
                         should_extend_actor = False
                 if should_extend_actor:
+                    if previous_consecutive_extensions == 0:
+                        self._active_grad_extension_start_step = int(
+                            alf.summary.get_global_counter())
                     self._last_grad_gate_actor_extended = True
                     self._grad_gate_actor_extension_count += 1
                     self._grad_gate_consecutive_actor_extensions += 1
+                    if previous_consecutive_extensions == 0:
+                        self._set_grad_extension_event(
+                            "grad_extension_start",
+                            self._grad_gate_consecutive_actor_extensions)
                 else:
+                    if previous_consecutive_extensions > 0:
+                        self._set_grad_extension_event(
+                            "grad_extension_end",
+                            previous_consecutive_extensions)
+                        self._active_grad_extension_start_step = None
                     self._grad_gate_consecutive_actor_extensions = 0
                     self._train_mode = TrainMode.critic
                     self._completed_cycles_since_rollout += 1
@@ -2486,6 +2543,42 @@ class BafcAlgorithmV36(OffPolicyAlgorithm):
             '_target_critic_networks', '_reference_actor_networks',
             '_behavior_actor_networks', '_snapshot_critic_networks'
         ]
+
+    def get_policy_boundary_eval_state(self):
+        """Return transient policy state needed by boundary evaluators."""
+        rollout_actor_id = torch.as_tensor(self._rollout_actor_id).reshape(())
+        return dict(
+            training_started=bool(self._training_started),
+            rollout_actor_id=int(rollout_actor_id.item()))
+
+    def set_policy_boundary_eval_state(self, state):
+        """Restore transient policy state needed by ``predict_step()``."""
+        self._training_started = bool(state["training_started"])
+        self._rollout_actor_id = int(state["rollout_actor_id"])
+
+    def _pop_rollout_skip_event(self):
+        """Return and clear the pending rollout-hold boundary event."""
+        event = self._pending_rollout_skip_event
+        self._pending_rollout_skip_event = None
+        return event
+
+    def _pop_grad_extension_event(self):
+        """Return and clear the pending grad-gate extension boundary event."""
+        event = self._pending_grad_extension_event
+        self._pending_grad_extension_event = None
+        return event
+
+    def _set_grad_extension_event(self, event_type: str,
+                                  extension_length: int):
+        start_step = self._active_grad_extension_start_step
+        current_step = int(alf.summary.get_global_counter())
+        if start_step is None:
+            start_step = current_step
+        self._pending_grad_extension_event = dict(
+            type=event_type,
+            start_step=int(start_step),
+            end_step=current_step,
+            extension_length=int(extension_length))
 
     def _unroll_iter_off_policy(self):
         """Gate rollout cadence by completed actor->critic cycles.
