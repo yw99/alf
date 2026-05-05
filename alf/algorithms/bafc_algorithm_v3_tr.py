@@ -1244,13 +1244,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if not self._training_started or self._train_mode == TrainMode.standard:
             return False
 
-        # Skip rollout until the next rollout boundary. This checks the eval
-        # gate once every ``rollout_cycles_per_collect`` completed cycles, so an
-        # eval-gated skip extends training by another full rollout interval.
-        if (self._completed_cycles_since_rollout <
-                self._rollout_cycles_per_collect
-                or self._completed_cycles_since_rollout %
-                self._rollout_cycles_per_collect != 0):
+        # Skip rollout until enough actor->critic cycles have completed since
+        # the previous rollout. Once the threshold is reached, this iter becomes
+        # a rollout opportunity.
+        if self._completed_cycles_since_rollout < self._rollout_cycles_per_collect:
             return True
 
         self._rollout_opportunity_count += 1
@@ -1299,6 +1296,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
     def _unroll_iter_off_policy(self):
         """Gate rollout cadence by completed actor->critic cycles."""
         if self._should_skip_unroll_iter_off_policy():
+            # Keep summary-step progression aligned with the parent off-policy
+            # path when BAFC bypasses ``super()._unroll_iter_off_policy()``.
+            if not self._config.update_counter_every_mini_batch:
+                alf.summary.increment_global_counter()
             return False, None, None
 
         unrolled, root_inputs, rollout_info = super()._unroll_iter_off_policy()

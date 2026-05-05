@@ -984,7 +984,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         parent_unroll.assert_not_called()
         sync_mock.assert_not_called()
 
-        alg._completed_cycles_since_rollout = 3
+        # Above-threshold cycle counts should also be eligible for rollout.
+        alg._completed_cycles_since_rollout = 5
         with mock.patch.object(
                 RLAlgorithm,
                 "_unroll_iter_off_policy",
@@ -1029,7 +1030,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             monitor_trust_metrics=False)
         alg._training_started = True
         alg._train_mode = TrainMode.critic
-        alg._completed_cycles_since_rollout = 3
+        alg._completed_cycles_since_rollout = 5
         alg._last_eval_trust = torch.tensor(1.0)
 
         with mock.patch.object(
@@ -1042,7 +1043,8 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertFalse(unrolled)
         self.assertIsNone(root_inputs)
         self.assertIsNone(rollout_info)
-        self.assertEqual(alg._completed_cycles_since_rollout, 3)
+        self.assertEqual(alg._completed_cycles_since_rollout, 5)
+        self.assertEqual(alg._rollout_opportunity_count, 1)
         self.assertEqual(alg._eval_gate_consecutive_rollout_skips, 1)
         self.assertEqual(alg._rollout_skip_due_eval_gate_count, 1)
         self.assertTrue(alg._last_rollout_skipped_due_eval_gate)
@@ -1216,6 +1218,31 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         unroll_mock.assert_called_once()
         replay_mock.assert_called_once_with(update_global_counter=True)
         after_iter_mock.assert_not_called()
+
+    def test_unroll_skip_increments_counter_when_not_per_minibatch(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=2,
+            rollout_cycles_per_collect=3)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._completed_cycles_since_rollout = 2
+        self.assertFalse(alg._config.update_counter_every_mini_batch)
+
+        old_counter = int(alf.summary.get_global_counter())
+        try:
+            alf.summary.set_global_counter(100)
+            with mock.patch.object(RLAlgorithm, "_unroll_iter_off_policy") as parent_unroll:
+                unrolled, root_inputs, rollout_info = alg._unroll_iter_off_policy()
+
+            self.assertFalse(unrolled)
+            self.assertIsNone(root_inputs)
+            self.assertIsNone(rollout_info)
+            self.assertEqual(int(alf.summary.get_global_counter()), 101)
+            parent_unroll.assert_not_called()
+        finally:
+            alf.summary.set_global_counter(old_counter)
 
     def test_after_update_does_not_sync_reference_from_current(self):
         alg = self._make_alg(
