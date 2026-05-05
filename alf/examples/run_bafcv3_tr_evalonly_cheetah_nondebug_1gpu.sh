@@ -43,9 +43,9 @@ fi
 ENV_NAME="cheetah:run"
 BASE_DIR="/root/alf_results_v7_eval"
 NUM_ENV_STEPS=1000000
-SEED=1
-GPU_IDS=(1)
-EVAL_TRUST_MAXES=(50.0)
+SEED=2
+GPU_IDS=(0 1 2)
+EVAL_TRUST_MAXES=(40.0 50.0 60.0)
 GPU="${GPU_IDS[0]}"
 EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[0]}"
 NUM_FEATURE_COORDS=4
@@ -188,6 +188,7 @@ for i in "${!GPU_IDS[@]}"; do
         --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
+        --conf_param "TrainerConfig.num_checkpoints=20" \
         --conf_param "TrainerConfig.rollout_skip_eval=True" \
         --conf_param "TrainerConfig.rollout_skip_eval_interval=${ROLLOUT_SKIP_EVAL_INTERVAL}" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \

@@ -7,6 +7,7 @@
 #   -n, --steps NUM_STEPS              Total env steps (default: 1000000)
 #   -s, --seed SEED                    Seed for the run (default: 0)
 #   -g, --gpu ID                       GPU id for the run (default: 0)
+#       --actor-ln                     Enable actor layer normalization
 #   -h, --help                         Show this help message
 #
 # Example:
@@ -26,10 +27,11 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v7_original_algo"
+BASE_DIR="/root/alf_results_v7_original_algo_ln"
 NUM_ENV_STEPS=1000000
-SEED=1
+SEED=2
 GPU=3
+ACTOR_USE_LN=True
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -52,6 +54,10 @@ while [[ $# -gt 0 ]]; do
         -g|--gpu)
             GPU="$2"
             shift 2
+            ;;
+        --actor-ln)
+            ACTOR_USE_LN=True
+            shift
             ;;
         -h|--help)
             sed -n '4,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -76,6 +82,7 @@ echo "  Environment: ${ENV_NAME}"
 echo "  Num env steps: ${NUM_ENV_STEPS}"
 echo "  GPU: ${GPU}"
 echo "  Seed: ${SEED}"
+echo "  Actor layer norm: ${ACTOR_USE_LN}"
 echo "  Repo root: ${REPO_ROOT}"
 echo "  Python: ${PYTHON_BIN}"
 echo "  Root dir: ${RUN_DIR}"
@@ -86,6 +93,8 @@ CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
     --conf "${CONF_FILE}" \
     --root_dir "${RUN_DIR}" \
     --conf_param "TrainerConfig.random_seed=${SEED}" \
+    --conf_param "bafcv3_actor_use_ln=${ACTOR_USE_LN}" \
+    --conf_param "TrainerConfig.num_checkpoints=20" \
     --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
     --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
