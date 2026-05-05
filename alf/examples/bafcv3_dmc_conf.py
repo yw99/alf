@@ -24,6 +24,8 @@ from alf.optimizers import Adam
 
 alf.define_config('debug_mode', False)
 debug_mode = alf.get_config_value('debug_mode')
+alf.define_config('bafcv3_actor_use_ln', False)
+actor_use_ln = alf.get_config_value('bafcv3_actor_use_ln')
 
 # Enable find_unused_parameters for DDP (needed for multi-GPU training)
 alf.config('make_ddp_performer', find_unused_parameters=True)
@@ -31,7 +33,6 @@ alf.config('make_ddp_performer', find_unused_parameters=True)
 optimizer = Adam(lr=3e-4)
 use_obs_normalizer = True
 obs_normalizer_clipping = False
-actor_use_ln = False
 
 if debug_mode:
     actor_hidden_layers = (32, 32)

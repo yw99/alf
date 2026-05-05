@@ -26,10 +26,10 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v3"
+BASE_DIR="/root/alf_results_v7_ppo"
 NUM_ENV_STEPS=1000000
-SEED=0
-GPU=1
+SEED=1
+GPU=2
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -85,10 +85,11 @@ cd "${REPO_ROOT}"
 CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
     --conf "${CONF_FILE}" \
     --root_dir "${RUN_DIR}" \
-    --conf_param "debug_mode=True" \
     --conf_param "TrainerConfig.random_seed=${SEED}" \
     --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
     --conf_param "TrainerConfig.debug_summaries=True" \
+    --conf_param "TrainerConfig.num_checkpoints=20" \
+    --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
     > "${RUN_DIR}/out.log" 2>&1 &
 PID=$!
