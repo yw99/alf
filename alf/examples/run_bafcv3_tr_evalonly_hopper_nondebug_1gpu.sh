@@ -1,15 +1,15 @@
 #!/bin/bash
-# Launcher for one or more BAFCv3-TR eval-only runs on 1-4 GPUs.
+# Launcher for one or more BAFCv3-TR eval-only hopper runs on 1-4 GPUs.
 # Eval-only means:
 #   - eval rollout skip gate enabled
 #   - grad actor-extend gate disabled
 #   - expensive grad trust metric compute skipped
 #
-# Usage: bash run_bafcv3_tr_evalonly_cheetah_nondebug_1gpu.sh [options]
-#   -e, --env ENV_NAME                 DMC environment (default: cheetah:run)
-#   -d, --dir BASE_DIR                 Base results directory (default: /root/alf_results_v5_evalonly_rolloutskip)
+# Usage: bash run_bafcv3_tr_evalonly_hopper_nondebug_1gpu.sh [options]
+#   -e, --env ENV_NAME                 DMC environment (default: hopper:hop)
+#   -d, --dir BASE_DIR                 Base results directory (default: /root/alf_results_v7_eval)
 #   -n, --steps NUM_STEPS              Total env steps (default: 1000000)
-#   -s, --seed SEED                    Seed for the run (default: 0)
+#   -s, --seed SEED                    Seed for the run (default: 3)
 #   -g, --gpu ID                       GPU id for a single CLI-selected run
 #       --gpus A,B                     Compatibility alias; uses GPU A and ignores GPU B
 #       --gpu-a ID                     Compatibility alias for --gpu
@@ -19,13 +19,13 @@
 #       --eval-b VALUE                 Ignored compatibility flag
 #       --num-feature-coords VALUE     Trust metric feature coords (default: 4)
 #       --metric-interval VALUE        Trust metric update interval (default: 8)
-#       --rollout-skip-cap VALUE       Max consecutive eval-gated rollout skips (default: 10)
+#       --rollout-skip-cap VALUE       Max consecutive eval-gated rollout skips (default: 4)
 #       --delta VALUE                  Ignored in eval-only mode
 #       --actor-extend-cap VALUE       Ignored in eval-only mode
 #   -h, --help                         Show this help message
 #
 # Example:
-#   bash run_bafcv3_tr_evalonly_cheetah_nondebug_1gpu.sh --gpu 0 --eval 40 --rollout-skip-cap 20
+#   bash run_bafcv3_tr_evalonly_hopper_nondebug_1gpu.sh --gpu 0 --eval 40 --rollout-skip-cap 20
 
 set -euo pipefail
 
@@ -40,7 +40,7 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     exit 1
 fi
 
-ENV_NAME="cheetah:run"
+ENV_NAME="hopper:hop"
 BASE_DIR="/root/alf_results_v7_eval"
 NUM_ENV_STEPS=1000000
 SEED=3

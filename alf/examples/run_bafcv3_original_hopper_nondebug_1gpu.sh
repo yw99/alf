@@ -1,22 +1,23 @@
 #!/bin/bash
-# Launcher for a single PPO DMC run.
+# Launcher for a single original BAFCv3 hopper run.
 #
-# Usage: bash run_ppo_cheetah_run_1gpu.sh [options]
-#   -e, --env ENV_NAME                 DMC environment (default: cheetah:run)
-#   -d, --dir BASE_DIR                 Base results directory (default: /root/alf_results_v3)
+# Usage: bash run_bafcv3_original_hopper_nondebug_1gpu.sh [options]
+#   -e, --env ENV_NAME                 DMC environment (default: hopper:hop)
+#   -d, --dir BASE_DIR                 Base results directory (default: /root/alf_results_v7_original_algo_ln)
 #   -n, --steps NUM_STEPS              Total env steps (default: 1000000)
-#   -s, --seed SEED                    Seed for the run (default: 0)
-#   -g, --gpu ID                       GPU id for the run (default: 0)
+#   -s, --seed SEED                    Seed for the run (default: 3)
+#   -g, --gpu ID                       GPU id for the run (default: 3)
+#       --actor-ln                     Enable actor layer normalization
 #   -h, --help                         Show this help message
 #
 # Example:
-#   bash run_ppo_cheetah_run_1gpu.sh --gpu 0 --seed 0
+#   bash run_bafcv3_original_hopper_nondebug_1gpu.sh --gpu 0 --seed 0
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-CONF_FILE="${SCRIPT_DIR}/ppo_dmc_conf.py"
+CONF_FILE="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -25,11 +26,12 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     exit 1
 fi
 
-ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v7_ppo"
-NUM_ENV_STEPS=250000000
-SEED=2
-GPU=2
+ENV_NAME="hopper:hop"
+BASE_DIR="/root/alf_results_v7_original_algo_ln"
+NUM_ENV_STEPS=1000000
+SEED=3
+GPU=3
+ACTOR_USE_LN=True
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -53,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             GPU="$2"
             shift 2
             ;;
+        --actor-ln)
+            ACTOR_USE_LN=True
+            shift
+            ;;
         -h|--help)
             sed -n '4,14p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -66,16 +72,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 ENV_DIR="$(echo "${ENV_NAME}" | cut -d':' -f1)"
-ROOT_BASE="${BASE_DIR}/${ENV_DIR}/ppo_dmc"
+ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_dmc_original_algo"
 RUN_DIR="${ROOT_BASE}/seed${SEED}"
 mkdir -p "${RUN_DIR}"
 
-echo "Launching PPO DMC run (single GPU)"
+echo "Launching original BAFCv3 run (single GPU)"
 echo "  Config: ${CONF_FILE}"
 echo "  Environment: ${ENV_NAME}"
 echo "  Num env steps: ${NUM_ENV_STEPS}"
 echo "  GPU: ${GPU}"
 echo "  Seed: ${SEED}"
+echo "  Actor layer norm: ${ACTOR_USE_LN}"
 echo "  Repo root: ${REPO_ROOT}"
 echo "  Python: ${PYTHON_BIN}"
 echo "  Root dir: ${RUN_DIR}"
@@ -86,10 +93,10 @@ CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
     --conf "${CONF_FILE}" \
     --root_dir "${RUN_DIR}" \
     --conf_param "TrainerConfig.random_seed=${SEED}" \
-    --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
-    --conf_param "TrainerConfig.debug_summaries=True" \
+    --conf_param "bafcv3_actor_use_ln=${ACTOR_USE_LN}" \
     --conf_param "TrainerConfig.num_checkpoints=20" \
     --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
+    --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
     > "${RUN_DIR}/out.log" 2>&1 &
 PID=$!

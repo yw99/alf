@@ -572,6 +572,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if self._debug_summaries and alf.summary.should_record_summaries():
             self._do_critic_summary = True
             safe_mean_hist_summary('eval_samples', self._actor_eval_samples)
+            safe_mean_hist_summary('eval_samples/per_dim_mean',
+                                   self._actor_eval_samples.mean(dim=0))
+            safe_mean_hist_summary(
+                'eval_samples/per_dim_std',
+                self._actor_eval_samples.std(dim=0, unbiased=False))
+            safe_mean_hist_summary('eval_samples/per_sample_l2_norm',
+                                   self._actor_eval_samples.norm(dim=-1))
 
         info = BafcInfo(
             reward=inputs.reward,
