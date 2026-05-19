@@ -20,6 +20,8 @@
 #       --num-feature-coords VALUE     Trust metric feature coords (default: 4)
 #       --metric-interval VALUE        Trust metric update interval (default: 8)
 #       --rollout-skip-cap VALUE       Max consecutive eval-gated rollout skips (default: 4)
+#       --actor-ln                     Enable actor layer normalization
+#       --no-actor-ln                  Disable actor layer normalization
 #       --delta VALUE                  Ignored in eval-only mode
 #       --actor-extend-cap VALUE       Ignored in eval-only mode
 #   -h, --help                         Show this help message
@@ -42,16 +44,17 @@ fi
 
 ENV_NAME="hopper:hop"
 BASE_DIR="/root/alf_results_v7_eval"
-NUM_ENV_STEPS=1000000
-SEED=3
+NUM_ENV_STEPS=600000
+SEED=4
 GPU_IDS=(0 1 2)
-EVAL_TRUST_MAXES=(40.0 50.0 60.0)
+EVAL_TRUST_MAXES=(25.0 30.0 40.0)
 GPU="${GPU_IDS[0]}"
 EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[0]}"
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
 ROLLOUT_SKIP_CAP=4
-ROLLOUT_SKIP_EVAL_INTERVAL=40
+ROLLOUT_SKIP_EVAL_INTERVAL=60
+ACTOR_USE_LN=True
 USE_SINGLE_CLI_RUN=false
 
 while [[ $# -gt 0 ]]; do
@@ -113,6 +116,14 @@ while [[ $# -gt 0 ]]; do
             ROLLOUT_SKIP_CAP="$2"
             shift 2
             ;;
+        --actor-ln)
+            ACTOR_USE_LN=True
+            shift
+            ;;
+        --no-actor-ln)
+            ACTOR_USE_LN=False
+            shift
+            ;;
         --delta|--delta-a|--delta-b)
             echo "Ignoring $1 in eval-only mode (grad gate is disabled)" >&2
             shift 2
@@ -168,6 +179,7 @@ echo "  num_feature_coords: ${NUM_FEATURE_COORDS}"
 echo "  metric_interval: ${METRIC_INTERVAL}"
 echo "  rollout_skip_cap: ${ROLLOUT_SKIP_CAP}"
 echo "  rollout_skip_eval_interval: ${ROLLOUT_SKIP_EVAL_INTERVAL}"
+echo "  Actor layer norm: ${ACTOR_USE_LN}"
 echo "  Eval rollout-skip gate: enabled"
 echo "  Grad actor-extend gate: disabled"
 echo ""
@@ -178,13 +190,14 @@ PIDS=()
 for i in "${!GPU_IDS[@]}"; do
     GPU="${GPU_IDS[$i]}"
     EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[$i]}"
-    RUN_DIR="${ROOT_BASE}/eval${EVAL_TRUST_MAX}_nf${NUM_FEATURE_COORDS}_mi${METRIC_INTERVAL}_cap${ROLLOUT_SKIP_CAP}_seed${SEED}"
+    RUN_DIR="${ROOT_BASE}/eval${EVAL_TRUST_MAX}_nf${NUM_FEATURE_COORDS}_mi${METRIC_INTERVAL}_cap${ROLLOUT_SKIP_CAP}_seed${SEED}_ln${ACTOR_USE_LN}"
     mkdir -p "${RUN_DIR}"
 
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
+        --conf_param "bafcv3_tr_actor_use_ln=${ACTOR_USE_LN}" \
         --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \

@@ -27,11 +27,11 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="hopper:hop"
-BASE_DIR="/root/alf_results_v7_original_algo_ln"
-NUM_ENV_STEPS=1000000
-SEED=3
+BASE_DIR="/root/alf_results_v7_original_algo"
+NUM_ENV_STEPS=600000
+SEED=4
 GPU=3
-ACTOR_USE_LN=True
+ACTOR_USE_LN=False
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
