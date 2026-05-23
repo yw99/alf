@@ -45,7 +45,7 @@ fi
 ENV_NAME="hopper:hop"
 BASE_DIR="/root/alf_results_v7_eval"
 NUM_ENV_STEPS=600000
-SEED=4
+SEED=5
 GPU_IDS=(0 1 2)
 EVAL_TRUST_MAXES=(25.0 30.0 40.0)
 GPU="${GPU_IDS[0]}"

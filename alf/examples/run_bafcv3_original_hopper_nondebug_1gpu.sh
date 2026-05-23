@@ -29,9 +29,9 @@ fi
 ENV_NAME="hopper:hop"
 BASE_DIR="/root/alf_results_v7_original_algo"
 NUM_ENV_STEPS=600000
-SEED=4
+SEED=5
 GPU=3
-ACTOR_USE_LN=False
+ACTOR_USE_LN=True
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
