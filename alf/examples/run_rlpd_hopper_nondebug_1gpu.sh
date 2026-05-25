@@ -7,6 +7,7 @@
 #   -n, --steps NUM_STEPS              Total env steps (default: 600000)
 #   -s, --seed, --seeds SEEDS          Comma-separated seeds (default: 4)
 #   -g, --gpu, --gpus IDS              Comma-separated GPU ids (default: 3)
+#       --critic-utd VALUE             Critic update-to-data ratio (default: 10)
 #   -h, --help                         Show this help message
 #
 # Examples:
@@ -31,6 +32,9 @@ BASE_DIR="/root/alf_results_v7_benchmark_algo"
 NUM_ENV_STEPS=600000
 SEEDS=(3 4 5)
 GPUS=(0 1 2)
+DEFAULT_CRITIC_UTD=10
+CRITIC_UTD="${DEFAULT_CRITIC_UTD}"
+CRITIC_UTD=3
 
 parse_csv_list() {
     local raw="$1"
@@ -65,8 +69,12 @@ while [[ $# -gt 0 ]]; do
             parse_csv_list "$2" GPUS
             shift 2
             ;;
+        --critic-utd|--critic_utd)
+            CRITIC_UTD="$2"
+            shift 2
+            ;;
         -h|--help)
-            sed -n '4,14p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '4,15p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -77,6 +85,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ ! "${CRITIC_UTD}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "critic_utd must be a positive integer, got: ${CRITIC_UTD}" >&2
+    exit 1
+fi
+NUM_UPDATES_PER_TRAIN_ITER=$((1 + CRITIC_UTD))
+
 if [[ ${#SEEDS[@]} -ne ${#GPUS[@]} ]]; then
     echo "Seed list and GPU list must have the same length." >&2
     echo "  Seeds: ${SEEDS[*]}" >&2
@@ -86,16 +100,22 @@ fi
 
 ENV_DIR="$(echo "${ENV_NAME}" | cut -d':' -f1)"
 ROOT_BASE="${BASE_DIR}/${ENV_DIR}/rlpd_dmc"
+RUN_BASE="${ROOT_BASE}"
+if [[ "${CRITIC_UTD}" -ne "${DEFAULT_CRITIC_UTD}" ]]; then
+    RUN_BASE="${ROOT_BASE}/critic_utd${CRITIC_UTD}"
+fi
 
 echo "Launching ${#SEEDS[@]} RLPD run(s)"
 echo "  Config: ${CONF_FILE}"
 echo "  Environment: ${ENV_NAME}"
 echo "  Num env steps: ${NUM_ENV_STEPS}"
+echo "  Critic UTD: ${CRITIC_UTD}"
+echo "  Num updates per train iter: ${NUM_UPDATES_PER_TRAIN_ITER}"
 echo "  Seeds: ${SEEDS[*]}"
 echo "  GPUs: ${GPUS[*]}"
 echo "  Repo root: ${REPO_ROOT}"
 echo "  Python: ${PYTHON_BIN}"
-echo "  Root dir: ${ROOT_BASE}"
+echo "  Root dir: ${RUN_BASE}"
 echo ""
 
 cd "${REPO_ROOT}"
@@ -104,7 +124,7 @@ for i in "${!SEEDS[@]}"; do
     SEED="${SEEDS[$i]}"
     GPU="${GPUS[$i]}"
 
-    RUN_DIR="${ROOT_BASE}/seed${SEED}"
+    RUN_DIR="${RUN_BASE}/seed${SEED}"
     mkdir -p "${RUN_DIR}"
 
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
@@ -114,6 +134,8 @@ for i in "${!SEEDS[@]}"; do
         --conf_param "TrainerConfig.num_checkpoints=20" \
         --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
+        --conf_param "TrainerConfig.num_updates_per_train_iter=${NUM_UPDATES_PER_TRAIN_ITER}" \
+        --conf_param "RlpdAlgorithm.critic_utd=${CRITIC_UTD}" \
         --conf_param "create_environment.env_name='${ENV_NAME}'" \
         > "${RUN_DIR}/out.log" 2>&1 &
     PID=$!
