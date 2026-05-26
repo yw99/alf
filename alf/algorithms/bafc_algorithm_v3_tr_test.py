@@ -890,7 +890,7 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             all(param.grad is None
                 for param in alg._snapshot_critic_networks.parameters()))
 
-    def test_snapshot_feature_map_matches_penultimate_critic_layer(self):
+    def test_snapshot_feature_map_is_normalized_penultimate_critic_layer(self):
         alg = self._make_alg(trust_metric_num_obs=3)
         obs = torch.randn(5, 4)
         action = alg._ensure_group_action(
@@ -899,25 +899,17 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
             alg._reference_actor_networks).detach()
 
         phi = alg._compute_snapshot_feature_map(obs, actor_encoding, action)
-        critic = alg._snapshot_critic_networks
-        critic_core = getattr(critic, "_pnet", critic)
-        head_idx = alg._critic_feature_head_index(critic)
-        head = critic_core._networks[head_idx]
-        q_from_phi = head(phi)
-        if isinstance(q_from_phi, tuple):
-            q_from_phi = q_from_phi[0]
-        critic_obs = obs.unsqueeze(1).expand(-1, alg._num_actor_critic, -1)
-        q_direct = critic(
-            (actor_encoding.unsqueeze(0).expand(obs.shape[0], -1, -1),
-             (critic_obs, action)))[0]
-        if q_from_phi.ndim == q_direct.ndim + 1 and q_from_phi.shape[-1] == 1:
-            q_from_phi = q_from_phi.squeeze(-1)
+        feature_norm = phi.norm(p=2, dim=-1)
+        nonzero = feature_norm > 1e-6
 
-        self.assertEqual(tuple(phi.shape[:2]), tuple(q_direct.shape[:2]))
+        self.assertEqual(tuple(phi.shape[:2]),
+                         (obs.shape[0], alg._num_actor_critic))
         self.assertGreater(phi.shape[-1], 1)
         self.assertNotEqual(phi.shape[-1], action.shape[-1])
-        self.assertEqual(tuple(q_from_phi.shape), tuple(q_direct.shape))
-        self.assertTensorClose(q_from_phi, q_direct)
+        self.assertTrue(torch.isfinite(phi).all().item())
+        self.assertTrue(nonzero.any().item())
+        self.assertLess(
+            (feature_norm[nonzero] - 1.).abs().max().item(), 1e-5)
 
     def test_utd_mode_switch_via_after_update(self):
         alg = self._make_alg(

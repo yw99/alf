@@ -43,18 +43,18 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="hopper:hop"
-BASE_DIR="/root/alf_results_v7_eval"
+BASE_DIR="/root/alf_results_v8_eval" # v8 uses normalized penultimate features
 NUM_ENV_STEPS=600000
 SEED=5
-GPU_IDS=(0 1 2)
-EVAL_TRUST_MAXES=(25.0 30.0 40.0)
+GPU_IDS=(0 1 2 3)
+EVAL_TRUST_MAXES=(10.0 20.0 30.0 40.0)
 GPU="${GPU_IDS[0]}"
 EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[0]}"
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
-ROLLOUT_SKIP_CAP=4
+ROLLOUT_SKIP_CAP=3
 ROLLOUT_SKIP_EVAL_INTERVAL=60
-ACTOR_USE_LN=True
+ACTOR_USE_LN=False
 USE_SINGLE_CLI_RUN=false
 
 while [[ $# -gt 0 ]]; do

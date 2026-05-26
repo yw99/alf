@@ -597,10 +597,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                                       actor_encoding,
                                       action,
                                       critic_network=None):
-        """Return the frozen snapshot critic feature map before the scalar head.
+        """Return the normalized snapshot critic feature map before the scalar head.
 
         The feature map is the pre-activation input to the last scalar critic
-        head, not the raw action and not the final scalar Q value.
+        head, not the raw action and not the final scalar Q value. Each
+        feature vector is L2-normalized along the feature dimension.
         """
         critic_network = (self._snapshot_critic_networks
                           if critic_network is None else critic_network)
@@ -622,7 +623,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                     raise RuntimeError(
                         "Unexpected snapshot critic feature-map shape %s" %
                         (type(x), ))
-                return x
+                norm = x.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
+                return x / norm
             if isinstance(module, Network):
                 x = module(x)[0]
             else:
