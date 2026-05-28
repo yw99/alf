@@ -28,8 +28,8 @@ fi
 
 ENV_NAME="cheetah:run"
 BASE_DIR="/root/alf_results_v7_original_algo_ln"
-NUM_ENV_STEPS=1000000
-SEED=3
+NUM_ENV_STEPS=600000
+SEED=5
 GPU=3
 ACTOR_USE_LN=True
 

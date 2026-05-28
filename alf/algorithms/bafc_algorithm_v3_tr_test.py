@@ -223,6 +223,47 @@ class BafcAlgorithmV3TRTest(alf.test.TestCase):
         self.assertEqual(alg._num_actor_critic, 3)
         self.assertEqual(alg._train_mode, TrainMode.standard)
 
+    def test_eval_samples_default_to_trainable_parameter(self):
+        alg = self._make_alg()
+
+        self.assertIn("_actor_eval_samples", dict(alg.named_parameters()))
+        self.assertNotIn("_actor_eval_samples", dict(alg.named_buffers()))
+
+    def test_frozen_eval_samples_are_checkpointed_buffers(self):
+        alg = self._make_alg(freeze_eval_samples=True)
+
+        self.assertNotIn("_actor_eval_samples", dict(alg.named_parameters()))
+        self.assertIn("_actor_eval_samples", dict(alg.named_buffers()))
+        self.assertIn("_actor_eval_samples", alg.state_dict())
+        self.assertFalse(alg._actor_eval_samples.requires_grad)
+
+    def test_frozen_eval_samples_stay_frozen_across_mode_switches(self):
+        alg = self._make_alg(
+            freeze_eval_samples=True,
+            actor_utd=1,
+            critic_utd=2,
+            num_updates_per_train_iter=3,
+            enable_grad_actor_extend_gate=False,
+            monitor_trust_metrics=False)
+        alg._train_mode = TrainMode.actor
+        alg._actor_update_counter = 1
+        alg._last_grad_trust = torch.tensor(0.0)
+
+        alg._update_train_mode()
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        self.assertFalse(alg._actor_eval_samples.requires_grad)
+
+        alg._critic_update_counter = 2
+        alg._update_train_mode()
+        self.assertEqual(alg._train_mode, TrainMode.actor)
+        self.assertFalse(alg._actor_eval_samples.requires_grad)
+
+    def test_freeze_eval_samples_rejects_eval_samples_optimizer(self):
+        with self.assertRaisesRegex(AssertionError, "eval_samples_optimizer"):
+            self._make_alg(
+                freeze_eval_samples=True,
+                eval_samples_optimizer=alf.optimizers.Adam(lr=1e-3))
+
     def test_policy_boundary_eval_state_round_trip(self):
         alg = self._make_alg()
         alg._training_started = True

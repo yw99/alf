@@ -105,6 +105,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  num_actor_eval_samples=256,
                  eval_samples_init_method='normal',
                  eval_samples_clipping=False,
+                 freeze_eval_samples: bool = False,
                  actor_eval_type='full',
                  actor_encoder_cls=TransformerEncoder,
                  actor_encoding_dim=128,
@@ -157,6 +158,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             enable_eval_rollout_skip_gate (bool): whether to skip rollout
                 collection when eval trust is below threshold. When False,
                 eval trust is not computed (to save compute).
+            freeze_eval_samples (bool): If True, keep actor eval samples fixed
+                throughout training instead of optimizing them.
             rollout_cycles_per_collect (int): number of completed
                 critic-actor cycles to train on replay data after each unroll.
                 A cycle is counted when train mode switches from ``actor`` back
@@ -180,6 +183,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             "trust_metric_update_interval must be >= 1")
         assert eval_gate_max_consecutive_rollout_skips >= 1, (
             "eval_gate_max_consecutive_rollout_skips must be >= 1")
+        assert not (freeze_eval_samples and eval_samples_optimizer is not None), (
+            "eval_samples_optimizer cannot be set when freeze_eval_samples=True.")
         if grad_gate_max_consecutive_actor_extensions is not None:
             assert grad_gate_max_consecutive_actor_extensions >= 1, (
                 "grad_gate_max_consecutive_actor_extensions must be >= 1 when set")
@@ -236,6 +241,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._enable_grad_actor_extend_gate = enable_grad_actor_extend_gate
         self._eval_gate_max_consecutive_rollout_skips = (
             eval_gate_max_consecutive_rollout_skips)
+        self._freeze_eval_samples = freeze_eval_samples
         self._grad_gate_max_consecutive_actor_extensions = (
             grad_gate_max_consecutive_actor_extensions)
         self._rollout_cycles_per_collect = rollout_cycles_per_collect
@@ -313,9 +319,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             self.add_optimizer(critic_optimizer, [critic_networks])
         if actor_encoder_optimizer is not None:
             self.add_optimizer(actor_encoder_optimizer, [actor_encoder])
-        self._actor_eval_samples = nn.Parameter(actor_eval_samples)
-        if eval_samples_optimizer is not None:
-            self.add_optimizer(eval_samples_optimizer, [self._actor_eval_samples])
+        if freeze_eval_samples:
+            self.register_buffer('_actor_eval_samples', actor_eval_samples)
+        else:
+            self._actor_eval_samples = nn.Parameter(actor_eval_samples)
+            if eval_samples_optimizer is not None:
+                self.add_optimizer(eval_samples_optimizer,
+                                   [self._actor_eval_samples])
 
         self._actor_networks = actor_networks
         self._reference_actor_networks = actor_networks.copy(
@@ -1051,7 +1061,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                     # self._critic_network.set_obs_action_batch_dominate(False)
                     for p in self._actor_networks.parameters():
                         p.requires_grad_(False)
-                    self._actor_eval_samples.requires_grad_(True)
+                    if not self._freeze_eval_samples:
+                        self._actor_eval_samples.requires_grad_(True)
         elif self._train_mode == TrainMode.critic:
             if self._critic_update_counter % self._critic_utd == 0:
                 self._train_mode = TrainMode.actor

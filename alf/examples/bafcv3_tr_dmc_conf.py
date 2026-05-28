@@ -96,6 +96,7 @@ alf.config(
     num_actor_eval_samples=num_actor_eval_samples,
     eval_samples_init_method='normal',
     eval_samples_clipping=obs_normalizer_clipping,
+    freeze_eval_samples=False,
     actor_eval_type='last_two',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,

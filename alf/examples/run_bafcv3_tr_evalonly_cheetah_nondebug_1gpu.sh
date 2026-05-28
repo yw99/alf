@@ -20,6 +20,7 @@
 #       --num-feature-coords VALUE     Trust metric feature coords (default: 4)
 #       --metric-interval VALUE        Trust metric update interval (default: 8)
 #       --rollout-skip-cap VALUE       Max consecutive eval-gated rollout skips (default: 10)
+#       --freeze-eval-samples          Keep actor eval samples fixed for the run
 #       --delta VALUE                  Ignored in eval-only mode
 #       --actor-extend-cap VALUE       Ignored in eval-only mode
 #   -h, --help                         Show this help message
@@ -41,17 +42,18 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ENV_NAME="cheetah:run"
-BASE_DIR="/root/alf_results_v7_eval"
-NUM_ENV_STEPS=1000000
-SEED=3
-GPU_IDS=(0 1 2)
-EVAL_TRUST_MAXES=(40.0 50.0 60.0)
+BASE_DIR="/root/alf_results_v8_eval" # v8 uses normalized penultimate features
+NUM_ENV_STEPS=600000
+SEED=5
+GPU_IDS=(0 1 2 3)
+EVAL_TRUST_MAXES=(30.0 40.0 50.0 60.0)
 GPU="${GPU_IDS[0]}"
 EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[0]}"
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
-ROLLOUT_SKIP_CAP=4
+ROLLOUT_SKIP_CAP=3
 ROLLOUT_SKIP_EVAL_INTERVAL=40
+FREEZE_EVAL_SAMPLES=True
 USE_SINGLE_CLI_RUN=false
 
 while [[ $# -gt 0 ]]; do
@@ -113,6 +115,10 @@ while [[ $# -gt 0 ]]; do
             ROLLOUT_SKIP_CAP="$2"
             shift 2
             ;;
+        --freeze-eval-samples)
+            FREEZE_EVAL_SAMPLES=True
+            shift
+            ;;
         --delta|--delta-a|--delta-b)
             echo "Ignoring $1 in eval-only mode (grad gate is disabled)" >&2
             shift 2
@@ -155,6 +161,10 @@ fi
 
 ENV_DIR="${ENV_NAME%%:*}"
 ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_tr_dmc_evalonly_single_run"
+RUN_SUFFIX=""
+if [[ "${FREEZE_EVAL_SAMPLES}" == "True" ]]; then
+    RUN_SUFFIX="_freezeEvalSamples"
+fi
 echo "Launching ${#GPU_IDS[@]} BAFCv3-TR eval-only run(s)"
 echo "  Config: ${CONF_FILE}"
 echo "  Environment: ${ENV_NAME}"
@@ -168,6 +178,8 @@ echo "  num_feature_coords: ${NUM_FEATURE_COORDS}"
 echo "  metric_interval: ${METRIC_INTERVAL}"
 echo "  rollout_skip_cap: ${ROLLOUT_SKIP_CAP}"
 echo "  rollout_skip_eval_interval: ${ROLLOUT_SKIP_EVAL_INTERVAL}"
+echo "  freeze_eval_samples: ${FREEZE_EVAL_SAMPLES}"
+echo "  Actor layer norm: False"
 echo "  Eval rollout-skip gate: enabled"
 echo "  Grad actor-extend gate: disabled"
 echo ""
@@ -178,13 +190,14 @@ PIDS=()
 for i in "${!GPU_IDS[@]}"; do
     GPU="${GPU_IDS[$i]}"
     EVAL_TRUST_MAX="${EVAL_TRUST_MAXES[$i]}"
-    RUN_DIR="${ROOT_BASE}/eval${EVAL_TRUST_MAX}_nf${NUM_FEATURE_COORDS}_mi${METRIC_INTERVAL}_cap${ROLLOUT_SKIP_CAP}_seed${SEED}"
+    RUN_DIR="${ROOT_BASE}/eval${EVAL_TRUST_MAX}_nf${NUM_FEATURE_COORDS}_mi${METRIC_INTERVAL}_cap${ROLLOUT_SKIP_CAP}_seed${SEED}${RUN_SUFFIX}"
     mkdir -p "${RUN_DIR}"
 
     CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON_BIN}" -m alf.bin.train \
         --conf "${CONF_FILE}" \
         --root_dir "${RUN_DIR}" \
         --conf_param "TrainerConfig.random_seed=${SEED}" \
+        --conf_param "bafcv3_tr_actor_use_ln=False" \
         --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
         --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
         --conf_param "TrainerConfig.debug_summaries=True" \
@@ -197,6 +210,7 @@ for i in "${!GPU_IDS[@]}"; do
         --conf_param "BafcAlgorithmV3.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
         --conf_param "BafcAlgorithmV3.trust_metric_update_interval=${METRIC_INTERVAL}" \
         --conf_param "BafcAlgorithmV3.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}" \
+        --conf_param "BafcAlgorithmV3.freeze_eval_samples=${FREEZE_EVAL_SAMPLES}" \
         --conf_param "BafcAlgorithmV3.enable_eval_rollout_skip_gate=True" \
         --conf_param "BafcAlgorithmV3.enable_grad_actor_extend_gate=False" \
         > "${RUN_DIR}/out.log" 2>&1 &
