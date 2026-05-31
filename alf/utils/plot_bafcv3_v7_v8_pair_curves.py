@@ -45,28 +45,28 @@ OUTPUT_ROOT = "/root/alf_results_v7_eval/plots_bafcv3_v7_v8_pairs"
 
 SERIES = [
     {
-        "label": "v7 eval25 seed4 + v8 eval20 seed5",
+        "label": "eval25",
         "run_dirs": [
             os.path.join(V7_ROOT, "eval25.0_nf4_mi8_cap4_seed4_lnTrue"),
             os.path.join(V8_ROOT, "eval20.0_nf4_mi8_cap3_seed5_lnFalse"),
         ],
     },
     {
-        "label": "v7 eval30 seed4 + v8 eval30 seed5",
+        "label": "eval30",
         "run_dirs": [
             os.path.join(V7_ROOT, "eval30.0_nf4_mi8_cap4_seed4_lnTrue"),
             os.path.join(V8_ROOT, "eval30.0_nf4_mi8_cap3_seed5_lnFalse"),
         ],
     },
     {
-        "label": "v7 eval40 seed4 + v8 eval40 seed5",
+        "label": "eval40",
         "run_dirs": [
             os.path.join(V7_ROOT, "eval40.0_nf4_mi8_cap4_seed4_lnTrue"),
             os.path.join(V8_ROOT, "eval40.0_nf4_mi8_cap3_seed5_lnFalse"),
         ],
     },
     {
-        "label": "v7 RLPD seed4 + seed5",
+        "label": "rlpd",
         "run_dirs": [
             os.path.join(RLPD_ROOT, "seed4"),
             os.path.join(RLPD_ROOT, "seed5"),
