@@ -46,6 +46,33 @@ from torch.utils.tensorboard import SummaryWriter
 OUTPUT_ROOT = "/root/alf_results_v7_eval/tb_aggregated"
 OVERWRITE_OUTPUT = True
 
+MANUAL_RUN_SPEC_ENV_NAME = "cheetah"
+# Optional comma-separated `label:path` specs for explicit manual aggregation.
+# When non-empty, labels matching `eval*_sN` are grouped by their `eval*` prefix
+# and replace the default TARGETS below. Other labels are parsed but skipped.
+MANUAL_RUN_SPECS = (
+    "eval40_s2:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval40.0_nf4_mi8_cap4_seed2,"
+    "eval50_s2:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval50.0_nf4_mi8_cap4_seed2,"
+    "eval60_s2:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval60.0_nf4_mi8_cap4_seed2,"
+    "original_ln_s3:/root/alf_results_v7_original_algo_ln/cheetah/"
+    "bafcv3_dmc_original_algo/seed3,"
+    "eval40_s3:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval40.0_nf4_mi8_cap4_seed3,"
+    "eval50_s3:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval50.0_nf4_mi8_cap4_seed3,"
+    "eval60_s3:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval60.0_nf4_mi8_cap4_seed3,"
+    "eval40_s4:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval40.0_nf4_mi8_cap4_seed4,"
+    "eval50_s4:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval50.0_nf4_mi8_cap4_seed4,"
+    "eval60_s4:/root/alf_results_v7_eval/cheetah/"
+    "bafcv3_tr_dmc_evalonly_single_run/eval60.0_nf4_mi8_cap4_seed4"
+)
+
 RUN_ROOT = (
     "/root/alf_results_v7_eval/hopper/"
     "bafcv3_tr_dmc_evalonly_single_run"
@@ -116,7 +143,68 @@ MANUAL_TARGETS = [
 ]
 
 
-TARGETS = [_build_target(threshold) for threshold in EVAL_THRESHOLDS] + MANUAL_TARGETS
+def _parse_manual_run_specs(run_specs: str | Iterable[str]) -> list[tuple[str, str]]:
+    if isinstance(run_specs, str):
+        raw_specs = run_specs.split(",")
+    else:
+        raw_specs = run_specs
+
+    parsed = []
+    for raw_spec in raw_specs:
+        spec = raw_spec.strip()
+        if not spec:
+            continue
+        if ":" not in spec:
+            raise ValueError("Manual run spec must be `label:path`: %r" % spec)
+        label, path = spec.split(":", 1)
+        label = label.strip()
+        path = path.strip()
+        if not label or not path:
+            raise ValueError("Manual run spec must be `label:path`: %r" % spec)
+        parsed.append((label, path))
+    return parsed
+
+
+def _build_manual_run_spec_targets(
+        specs: Iterable[tuple[str, str]]) -> list[dict]:
+    eval_label_re = re.compile(r"^(?P<prefix>eval[^_]+)_s(?P<seed>\d+)$")
+    grouped: dict[str, list[tuple[int, str]]] = {}
+
+    for label, path in specs:
+        match = eval_label_re.match(label)
+        if not match:
+            continue
+        prefix = match.group("prefix")
+        seed = int(match.group("seed"))
+        grouped.setdefault(prefix, []).append((seed, path))
+
+    targets = []
+    for prefix, seed_paths in grouped.items():
+        seed_paths = sorted(seed_paths, key=lambda item: item[0])
+        seed_label = "_".join("s%d" % seed for seed, _ in seed_paths)
+        targets.append({
+            "name": "%s_bafcv3_tr_%s_%s" %
+                    (MANUAL_RUN_SPEC_ENV_NAME, prefix, seed_label),
+            "run_dirs": [path for _, path in seed_paths],
+            "curves": CURVES,
+        })
+    return targets
+
+
+def _build_targets() -> list[dict]:
+    manual_specs = _parse_manual_run_specs(MANUAL_RUN_SPECS)
+    if manual_specs:
+        manual_targets = _build_manual_run_spec_targets(manual_specs)
+        if not manual_targets:
+            raise ValueError(
+                "MANUAL_RUN_SPECS did not contain any eval*_sN entries")
+        return manual_targets
+
+    return [_build_target(threshold)
+            for threshold in EVAL_THRESHOLDS] + MANUAL_TARGETS
+
+
+TARGETS = _build_targets()
 
 
 @dataclass(frozen=True)
