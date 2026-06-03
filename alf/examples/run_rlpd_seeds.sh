@@ -77,6 +77,7 @@ CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29500 python -m alf.bin.train \
     --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
     --conf_param "TrainerConfig.num_updates_per_train_iter=${NUM_UPDATES_PER_TRAIN_ITER}" \
     --conf_param "RlpdAlgorithm.critic_utd=${CRITIC_UTD}" \
+    --conf_param "make_ddp_performer.find_unused_parameters=True" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
     --distributed multi-gpu \
     > "${ROOT_DIR}/seed_0/out.log" 2>&1 &
@@ -91,6 +92,7 @@ CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29501 python -m alf.bin.train \
     --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
     --conf_param "TrainerConfig.num_updates_per_train_iter=${NUM_UPDATES_PER_TRAIN_ITER}" \
     --conf_param "RlpdAlgorithm.critic_utd=${CRITIC_UTD}" \
+    --conf_param "make_ddp_performer.find_unused_parameters=True" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
     --distributed multi-gpu \
     > "${ROOT_DIR}/seed_1/out.log" 2>&1 &
@@ -106,6 +108,7 @@ CUDA_VISIBLE_DEVICES=2,3 MASTER_PORT=29502 python -m alf.bin.train \
     --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
     --conf_param "TrainerConfig.num_updates_per_train_iter=${NUM_UPDATES_PER_TRAIN_ITER}" \
     --conf_param "RlpdAlgorithm.critic_utd=${CRITIC_UTD}" \
+    --conf_param "make_ddp_performer.find_unused_parameters=True" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
     --distributed multi-gpu \
     > "${ROOT_DIR}/seed_2/out.log" 2>&1 &
@@ -120,6 +123,7 @@ CUDA_VISIBLE_DEVICES=2,3 MASTER_PORT=29503 python -m alf.bin.train \
     --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
     --conf_param "TrainerConfig.num_updates_per_train_iter=${NUM_UPDATES_PER_TRAIN_ITER}" \
     --conf_param "RlpdAlgorithm.critic_utd=${CRITIC_UTD}" \
+    --conf_param "make_ddp_performer.find_unused_parameters=True" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
     --distributed multi-gpu \
     > "${ROOT_DIR}/seed_3/out.log" 2>&1 &
