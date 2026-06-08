@@ -22,6 +22,7 @@ The script writes two PNG figures:
 
 * BAFCv3-TR vs RLPD AverageReturn over environment steps.
 * BAFCv3-TR rollout-skip signed absolute AverageReturn change.
+* BAFCv3-TR rollout-skip relative AverageReturn change.
 
 Each figure plots the across-seed mean and shades +/-1 std. By default, the
 2-GPU run set uses seeds 1,2,3 and the 4-GPU run set uses seeds 0,1,2,3. Curves
@@ -61,6 +62,7 @@ RETURN_TAG = "Metrics_vs_EnvironmentSteps/AverageReturn"
 START_RETURN_TAG = "rollout_skip_eval/start_average_return"
 END_RETURN_TAG = "rollout_skip_eval/end_average_return"
 ABS_CHANGE_TAG = "rollout_skip_eval/absolute_average_return_change"
+REL_CHANGE_TAG = "rollout_skip_eval/relative_average_return_change"
 
 
 def _display_list(items: Iterable[str], limit: int = 12) -> str:
@@ -299,6 +301,29 @@ def _plot_absolute_return_change(env: str, bafc_dirs: list[str],
     )
 
 
+def _plot_relative_return_change(env: str, bafc_dirs: list[str],
+                                 output_root: str) -> str:
+    eval_logdirs = _source_logdirs(bafc_dirs, "eval")
+    curves = [_read_scalar_curve(logdir, REL_CHANGE_TAG)
+              for logdir in eval_logdirs]
+    aggregate = _aggregate_curves(curves, eval_logdirs, REL_CHANGE_TAG)
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
+    _plot_aggregate(ax, aggregate, "BAFCv3-TR")
+    _print_aggregate_summary("BAFCv3-TR", REL_CHANGE_TAG, aggregate)
+
+    return _finish_plot(
+        fig=fig,
+        ax=ax,
+        title="%s Rollout-Skip Relative Average Return Change" % _env_dir(env),
+        xlabel="Rollout-skip end step",
+        ylabel="Relative Average Return Change",
+        output_path=os.path.join(
+            output_root, "rollout_skip_eval_relative_average_return_change.png"
+        ),
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot numeric-result BAFCv3-TR and RLPD curves.")
@@ -350,6 +375,7 @@ def main() -> None:
 
     _plot_average_return(args.env, bafc_dirs, rlpd_dirs, output_root)
     _plot_absolute_return_change(args.env, bafc_dirs, output_root)
+    _plot_relative_return_change(args.env, bafc_dirs, output_root)
 
 
 if __name__ == "__main__":
