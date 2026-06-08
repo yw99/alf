@@ -23,9 +23,10 @@ The script writes two PNG figures:
 * BAFCv3-TR vs RLPD AverageReturn over environment steps.
 * BAFCv3-TR rollout-skip signed absolute AverageReturn change.
 
-Each figure plots the across-seed mean and shades +/-1 std for seeds 1,2,3 by
-default. Curves are aligned on the overlapping step range and interpolated using
-the same logic as ``aggregate_tb_mean_std.py``.
+Each figure plots the across-seed mean and shades +/-1 std. By default, the
+2-GPU run set uses seeds 1,2,3 and the 4-GPU run set uses seeds 0,1,2,3. Curves
+are aligned on the overlapping step range and interpolated using the same logic
+as ``aggregate_tb_mean_std.py``.
 """
 
 from __future__ import annotations
@@ -49,8 +50,12 @@ except ModuleNotFoundError:
 
 
 DEFAULT_BASE_DIR = "/root/numeric_results"
-DEFAULT_ENV = "cheetah"
-DEFAULT_SEEDS = "1,2,3"
+DEFAULT_ENV = "hopper" #"cheetah"
+DEFAULT_RUN_SET = "2g"
+DEFAULT_SEEDS_BY_RUN_SET = {
+    "2g": "1,2,3",
+    "4g": "0,1,2,3",
+}
 
 RETURN_TAG = "Metrics_vs_EnvironmentSteps/AverageReturn"
 START_RETURN_TAG = "rollout_skip_eval/start_average_return"
@@ -87,16 +92,29 @@ def _env_dir(env: str) -> str:
     return env.split(":", 1)[0]
 
 
-def _default_output_root(base_dir: str, env: str) -> str:
-    return os.path.join(base_dir, _env_dir(env),
-                        "plots_bafcv3_tr_rlpd_curves")
+def _default_seeds(run_set: str) -> list[int]:
+    return _parse_seeds(DEFAULT_SEEDS_BY_RUN_SET[run_set])
 
 
-def _build_run_dirs(base_dir: str, env: str,
+def _default_output_root(base_dir: str, env: str, run_set: str) -> str:
+    output_name = "plots_bafcv3_tr_rlpd_curves"
+    if run_set == "4g":
+        output_name += "_4g"
+    return os.path.join(base_dir, _env_dir(env), output_name)
+
+
+def _build_run_dirs(base_dir: str, env: str, run_set: str,
                     seeds: list[int]) -> tuple[list[str], list[str]]:
     env_dir = _env_dir(env)
-    bafc_root = os.path.join(base_dir, env_dir, "bafcv3_tr_dmc")
-    rlpd_root = os.path.join(base_dir, env_dir, "rlpd_dmc", "critic_utd3")
+    if run_set == "4g":
+        bafc_run_name = "bafcv3_tr_dmc_4g"
+        rlpd_run_name = "rlpd_dmc_4g"
+    else:
+        bafc_run_name = "bafcv3_tr_dmc"
+        rlpd_run_name = "rlpd_dmc"
+
+    bafc_root = os.path.join(base_dir, env_dir, bafc_run_name)
+    rlpd_root = os.path.join(base_dir, env_dir, rlpd_run_name, "critic_utd3")
     bafc_dirs = [os.path.join(bafc_root, "seed_%d" % seed) for seed in seeds]
     rlpd_dirs = [os.path.join(rlpd_root, "seed_%d" % seed) for seed in seeds]
     return bafc_dirs, rlpd_dirs
@@ -285,23 +303,36 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot numeric-result BAFCv3-TR and RLPD curves.")
     parser.add_argument("--env", default=DEFAULT_ENV,
-                        help="Environment directory/name (default: cheetah).")
+                        help="Environment directory/name (default: %(default)s).")
     parser.add_argument("--base-dir", default=DEFAULT_BASE_DIR,
-                        help="Base result directory (default: /root/numeric_results).")
+                        help="Base result directory (default: %(default)s).")
+    parser.add_argument("--run-set", default=DEFAULT_RUN_SET,
+                        choices=sorted(DEFAULT_SEEDS_BY_RUN_SET),
+                        help=("Run directory preset. Use 2g for "
+                              "bafcv3_tr_dmc/rlpd_dmc or 4g for "
+                              "bafcv3_tr_dmc_4g/rlpd_dmc_4g "
+                              "(default: %(default)s)."))
     parser.add_argument("--seeds", type=_parse_seeds,
-                        default=_parse_seeds(DEFAULT_SEEDS),
-                        help="Comma-separated seed IDs (default: 1,2,3).")
+                        default=None,
+                        help=("Comma-separated seed IDs. Defaults to 1,2,3 "
+                              "for --run-set 2g and 0,1,2,3 for --run-set "
+                              "4g."))
     parser.add_argument("--output-root", default=None,
                         help=("Output directory. Defaults to "
-                              "<base-dir>/<env>/plots_bafcv3_tr_rlpd_curves."))
+                              "<base-dir>/<env>/plots_bafcv3_tr_rlpd_curves "
+                              "for 2g and the same path with _4g appended "
+                              "for 4g."))
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    seeds = args.seeds if args.seeds is not None else _default_seeds(
+        args.run_set)
     output_root = args.output_root or _default_output_root(
-        args.base_dir, args.env)
-    bafc_dirs, rlpd_dirs = _build_run_dirs(args.base_dir, args.env, args.seeds)
+        args.base_dir, args.env, args.run_set)
+    bafc_dirs, rlpd_dirs = _build_run_dirs(args.base_dir, args.env,
+                                           args.run_set, seeds)
 
     _check_dirs(bafc_dirs, "BAFCv3-TR run directories")
     _check_dirs(rlpd_dirs, "RLPD run directories")
@@ -313,7 +344,8 @@ def main() -> None:
                 "BAFCv3-TR eval log directories")
 
     print("env: %s" % args.env)
-    print("seeds: %s" % ",".join(str(seed) for seed in args.seeds))
+    print("run_set: %s" % args.run_set)
+    print("seeds: %s" % ",".join(str(seed) for seed in seeds))
     print("output: %s" % output_root)
 
     _plot_average_return(args.env, bafc_dirs, rlpd_dirs, output_root)

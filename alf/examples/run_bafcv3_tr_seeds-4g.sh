@@ -17,8 +17,8 @@
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="${SCRIPT_DIR}/bafcv3_tr_dmc_conf.py"
-# ENV_NAME="hopper:hop"
-ENV_NAME="cheetah:run"
+ENV_NAME="hopper:hop"
+# ENV_NAME="cheetah:run"
 BASE_DIR="/root/numeric_results"
 NUM_ENV_STEPS=400000
 NUM_CHECKPOINTS=10

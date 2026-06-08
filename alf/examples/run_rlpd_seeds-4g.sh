@@ -17,10 +17,10 @@
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="${SCRIPT_DIR}/rlpd_dmc_conf.py"
-# ENV_NAME="hopper:hop"
-ENV_NAME="cheetah:run"
+ENV_NAME="hopper:hop"
+# ENV_NAME="cheetah:run"
 BASE_DIR="/root/numeric_results"
-NUM_ENV_STEPS=400000
+NUM_ENV_STEPS=800000
 NUM_CHECKPOINTS=10
 CRITIC_UTD=3
 NUM_UPDATES_PER_TRAIN_ITER=4
@@ -54,7 +54,7 @@ done
 
 # Extract domain name for directory (e.g., hopper:hop -> hopper)
 ENV_DIR=$(echo "$ENV_NAME" | cut -d':' -f1)
-ROOT_DIR="${BASE_DIR}/${ENV_DIR}/rlpd_dmc_4g/critic_utd${CRITIC_UTD}"
+ROOT_DIR="${BASE_DIR}/${ENV_DIR}_${NUM_ENV_STEPS}/rlpd_dmc_4g/critic_utd${CRITIC_UTD}"
 
 echo "Starting RLPD critic_utd=${CRITIC_UTD} training with 4 seeds on shared GPUs 0,1,2,3"
 echo "  Config: $CONF_FILE"
