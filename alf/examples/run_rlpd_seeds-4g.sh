@@ -17,12 +17,12 @@
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="${SCRIPT_DIR}/rlpd_dmc_conf.py"
-ENV_NAME="hopper:hop"
+ENV_NAME="cheetah:run"
 # ENV_NAME="cheetah:run"
 BASE_DIR="/root/numeric_results"
 NUM_ENV_STEPS=800000
 NUM_CHECKPOINTS=10
-CRITIC_UTD=3
+CRITIC_UTD=10
 NUM_UPDATES_PER_TRAIN_ITER=4
 
 # Parse command line arguments

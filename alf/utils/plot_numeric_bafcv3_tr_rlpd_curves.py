@@ -51,11 +51,11 @@ except ModuleNotFoundError:
 
 
 DEFAULT_BASE_DIR = "/root/numeric_results"
-DEFAULT_ENV = "hopper" #"cheetah"
+DEFAULT_ENV = "cheetah" #"hopper"
 DEFAULT_RUN_SET = "2g"
 DEFAULT_SEEDS_BY_RUN_SET = {
     "2g": "1,2,3",
-    "4g": "0,1,2,3",
+    "4g": "1,2,3,4",
 }
 
 RETURN_TAG = "Metrics_vs_EnvironmentSteps/AverageReturn"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Launcher script for running RLPD critic_utd=3 with 4 seeds in parallel
-# Seeds 0,1 share GPUs 0,1; Seeds 2,3 share GPUs 2,3
+# Seeds 4,1 share GPUs 0,1; Seeds 2,3 share GPUs 2,3
 # Each seed uses 2 GPUs via DDP for 2 parallel environments
 #
 # Usage: bash run_rlpd_seeds.sh [options]
@@ -20,9 +20,9 @@ CONF_FILE="${SCRIPT_DIR}/rlpd_dmc_conf.py"
 # ENV_NAME="hopper:hop"
 ENV_NAME="cheetah:run"
 BASE_DIR="/root/numeric_results"
-NUM_ENV_STEPS=400000
+NUM_ENV_STEPS=800000
 NUM_CHECKPOINTS=10
-CRITIC_UTD=3
+CRITIC_UTD=10
 NUM_UPDATES_PER_TRAIN_ITER=4
 
 # Parse command line arguments
@@ -66,13 +66,13 @@ echo "  Critic UTD: $CRITIC_UTD"
 echo "  Num updates per train iter: $NUM_UPDATES_PER_TRAIN_ITER"
 echo ""
 
-mkdir -p "${ROOT_DIR}/seed_0" "${ROOT_DIR}/seed_1" "${ROOT_DIR}/seed_2" "${ROOT_DIR}/seed_3"
+mkdir -p "${ROOT_DIR}/seed_4" "${ROOT_DIR}/seed_1" "${ROOT_DIR}/seed_2" "${ROOT_DIR}/seed_3"
 
 # Seeds 0,1 share GPUs 0,1 (different MASTER_PORT)
 CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29500 python -m alf.bin.train \
     --conf "$CONF_FILE" \
-    --root_dir "${ROOT_DIR}/seed_0" \
-    --conf_param "TrainerConfig.random_seed=0" \
+    --root_dir "${ROOT_DIR}/seed_4" \
+    --conf_param "TrainerConfig.random_seed=4" \
     --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
     --conf_param "TrainerConfig.num_checkpoints=${NUM_CHECKPOINTS}" \
     --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
@@ -81,7 +81,7 @@ CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29500 python -m alf.bin.train \
     --conf_param "make_ddp_performer.find_unused_parameters=True" \
     --conf_param "create_environment.env_name='${ENV_NAME}'" \
     --distributed multi-gpu \
-    > "${ROOT_DIR}/seed_0/out.log" 2>&1 &
+    > "${ROOT_DIR}/seed_4/out.log" 2>&1 &
 PID0=$!
 
 CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29501 python -m alf.bin.train \
@@ -130,7 +130,7 @@ CUDA_VISIBLE_DEVICES=2,3 MASTER_PORT=29503 python -m alf.bin.train \
     > "${ROOT_DIR}/seed_3/out.log" 2>&1 &
 PID3=$!
 
-echo "Seed 0 running on GPUs 0,1 port 29500 (PID: $PID0)"
+echo "Seed 4 running on GPUs 0,1 port 29500 (PID: $PID0)"
 echo "Seed 1 running on GPUs 0,1 port 29501 (PID: $PID1)"
 echo "Seed 2 running on GPUs 2,3 port 29502 (PID: $PID2)"
 echo "Seed 3 running on GPUs 2,3 port 29503 (PID: $PID3)"
