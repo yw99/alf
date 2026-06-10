@@ -20,10 +20,10 @@ CONF_FILE="${SCRIPT_DIR}/rlpd_dmc_conf.py"
 # ENV_NAME="hopper:hop"
 ENV_NAME="cheetah:run"
 BASE_DIR="/root/numeric_results"
-NUM_ENV_STEPS=800000
+NUM_ENV_STEPS=400000
 NUM_CHECKPOINTS=10
 CRITIC_UTD=10
-NUM_UPDATES_PER_TRAIN_ITER=4
+NUM_UPDATES_PER_TRAIN_ITER=11
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
