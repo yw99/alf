@@ -25,7 +25,7 @@ The script writes two PNG figures:
 * BAFCv3-TR rollout-skip relative AverageReturn change.
 
 Each figure plots the across-seed mean and shades +/-1 std. By default, the
-2-GPU run set uses seeds 1,2,3 and the 4-GPU run set uses seeds 0,1,2,3. Curves
+2-GPU run set uses seeds 1,2,3 and the 4-GPU run set uses seeds 1,2,3,4. Curves
 are aligned on the overlapping step range and interpolated using the same logic
 as ``aggregate_tb_mean_std.py``.
 """
@@ -53,6 +53,7 @@ except ModuleNotFoundError:
 DEFAULT_BASE_DIR = "/root/numeric_results"
 DEFAULT_ENV = "cheetah" #"hopper"
 DEFAULT_RUN_SET = "2g"
+DEFAULT_RLPD_CRITIC_UTD = 3
 DEFAULT_SEEDS_BY_RUN_SET = {
     "2g": "1,2,3",
     "4g": "1,2,3,4",
@@ -98,15 +99,19 @@ def _default_seeds(run_set: str) -> list[int]:
     return _parse_seeds(DEFAULT_SEEDS_BY_RUN_SET[run_set])
 
 
-def _default_output_root(base_dir: str, env: str, run_set: str) -> str:
+def _default_output_root(base_dir: str, env: str, run_set: str,
+                         rlpd_critic_utd: int) -> str:
     output_name = "plots_bafcv3_tr_rlpd_curves"
     if run_set == "4g":
         output_name += "_4g"
+    if rlpd_critic_utd != DEFAULT_RLPD_CRITIC_UTD:
+        output_name += "_critic_utd%d" % rlpd_critic_utd
     return os.path.join(base_dir, _env_dir(env), output_name)
 
 
 def _build_run_dirs(base_dir: str, env: str, run_set: str,
-                    seeds: list[int]) -> tuple[list[str], list[str]]:
+                    seeds: list[int],
+                    rlpd_critic_utd: int) -> tuple[list[str], list[str]]:
     env_dir = _env_dir(env)
     if run_set == "4g":
         bafc_run_name = "bafcv3_tr_dmc_4g"
@@ -116,7 +121,8 @@ def _build_run_dirs(base_dir: str, env: str, run_set: str,
         rlpd_run_name = "rlpd_dmc"
 
     bafc_root = os.path.join(base_dir, env_dir, bafc_run_name)
-    rlpd_root = os.path.join(base_dir, env_dir, rlpd_run_name, "critic_utd3")
+    rlpd_root = os.path.join(base_dir, env_dir, rlpd_run_name,
+                             "critic_utd%d" % rlpd_critic_utd)
     bafc_dirs = [os.path.join(bafc_root, "seed_%d" % seed) for seed in seeds]
     rlpd_dirs = [os.path.join(rlpd_root, "seed_%d" % seed) for seed in seeds]
     return bafc_dirs, rlpd_dirs
@@ -340,8 +346,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", type=_parse_seeds,
                         default=None,
                         help=("Comma-separated seed IDs. Defaults to 1,2,3 "
-                              "for --run-set 2g and 0,1,2,3 for --run-set "
+                              "for --run-set 2g and 1,2,3,4 for --run-set "
                               "4g."))
+    parser.add_argument("--rlpd-critic-utd", type=int,
+                        default=DEFAULT_RLPD_CRITIC_UTD,
+                        help=("RLPD critic UTD directory suffix "
+                              "(default: %(default)s)."))
     parser.add_argument("--output-root", default=None,
                         help=("Output directory. Defaults to "
                               "<base-dir>/<env>/plots_bafcv3_tr_rlpd_curves "
@@ -355,9 +365,10 @@ def main() -> None:
     seeds = args.seeds if args.seeds is not None else _default_seeds(
         args.run_set)
     output_root = args.output_root or _default_output_root(
-        args.base_dir, args.env, args.run_set)
+        args.base_dir, args.env, args.run_set, args.rlpd_critic_utd)
     bafc_dirs, rlpd_dirs = _build_run_dirs(args.base_dir, args.env,
-                                           args.run_set, seeds)
+                                           args.run_set, seeds,
+                                           args.rlpd_critic_utd)
 
     _check_dirs(bafc_dirs, "BAFCv3-TR run directories")
     _check_dirs(rlpd_dirs, "RLPD run directories")
@@ -371,6 +382,7 @@ def main() -> None:
     print("env: %s" % args.env)
     print("run_set: %s" % args.run_set)
     print("seeds: %s" % ",".join(str(seed) for seed in seeds))
+    print("rlpd_critic_utd: %d" % args.rlpd_critic_utd)
     print("output: %s" % output_root)
 
     _plot_average_return(args.env, bafc_dirs, rlpd_dirs, output_root)
