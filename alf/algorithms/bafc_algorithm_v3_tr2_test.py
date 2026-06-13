@@ -20,10 +20,11 @@ from unittest import mock
 import torch
 
 import alf
-from alf.algorithms.bafc_algorithm_v3_tr2 import BafcAlgorithmV3TR2, BafcInfo
+from alf.algorithms.bafc_algorithm_v3_tr2 import (BafcAlgorithmV3TR2,
+                                                  BafcCriticInfo, BafcInfo)
 from alf.algorithms.config import TrainerConfig
 from alf.algorithms.rlpd_algorithm import TrainMode
-from alf.data_structures import StepType, TimeStep
+from alf.data_structures import LossInfo, StepType, TimeStep
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
 
@@ -115,6 +116,115 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self.assertEqual(BafcAlgorithmV3TR2.__name__, "BafcAlgorithmV3TR2")
         self.assertEqual(alg._num_actor_critic, 3)
         self.assertEqual(alg._trust_metric_target_obs_cache_size, 32)
+        self.assertFalse(alg._enable_critic_reweighting)
+        self.assertEqual(alg._critic_reweighting_solver_iters, 5)
+
+    def test_critic_reweighting_disabled_returns_empty_weight(self):
+        alg = self._make_alg()
+        weight = alg._compute_critic_sample_weights(
+            torch.randn(4, 4), torch.randn(4, 2))
+
+        self.assertEqual(weight, ())
+
+    def test_critic_reweighting_weights_are_normalized(self):
+        alg = self._make_alg(
+            enable_critic_reweighting=True,
+            critic_reweighting_solver_iters=2,
+            trust_metric_num_feature_coords=3)
+        obs = torch.randn(2, 3, 4)
+        action = torch.randn(2, 3, 2)
+        phi_target = torch.randn(5, alg._num_actor_critic, 4)
+        phi_behavior = torch.randn(6, alg._num_actor_critic, 4)
+
+        with mock.patch.object(
+                alg,
+                "_compute_reference_metric_feature_maps",
+                return_value=(phi_target, phi_behavior)) as feature_mock:
+            weight = alg._compute_critic_sample_weights(obs, action)
+
+        feature_mock.assert_called_once()
+        self.assertEqual(tuple(weight.shape), (2, 3))
+        self.assertTrue(torch.isfinite(weight).all().item())
+        self.assertTrue((weight >= 0).all().item())
+        self.assertAlmostEqual(weight.mean().item(), 1.0, places=5)
+
+    def test_critic_reweighting_degenerate_features_fall_back_to_uniform(self):
+        alg = self._make_alg(enable_critic_reweighting=True)
+        obs = torch.randn(4, 4)
+        action = torch.randn(4, 2)
+        phi_target = torch.full((4, alg._num_actor_critic, 3), float('nan'))
+        phi_behavior = torch.full((4, alg._num_actor_critic, 3), float('nan'))
+
+        with mock.patch.object(
+                alg,
+                "_compute_reference_metric_feature_maps",
+                return_value=(phi_target, phi_behavior)):
+            weight = alg._compute_critic_sample_weights(obs, action)
+
+        self.assertTensorClose(weight, torch.ones(4))
+
+    def test_critic_reweighting_solver_returns_simplex_distribution(self):
+        alg = self._make_alg(
+            enable_critic_reweighting=True, critic_reweighting_solver_iters=2)
+        projected = alg._project_simplex(torch.tensor([-1.0, 2.0, 0.5]))
+        self.assertTrue((projected >= 0).all().item())
+        self.assertAlmostEqual(projected.sum().item(), 1.0, places=6)
+
+        features = torch.randn(5, alg._num_actor_critic, 3)
+        target = torch.randn(4, alg._num_actor_critic, 3)
+        target_cov = alg._feature_covariance(target)
+        p = alg._solve_critic_reweighting_distribution(
+            features, target_cov, torch.tensor(0.5), torch.tensor(1e-3))
+
+        self.assertEqual(tuple(p.shape), (5, ))
+        self.assertTrue(torch.isfinite(p).all().item())
+        self.assertTrue((p >= 0).all().item())
+        self.assertAlmostEqual(p.sum().item(), 1.0, places=5)
+
+    def test_critic_loss_applies_sample_weight(self):
+        alg = self._make_alg()
+        t, b, n = 2, 3, alg._num_actor_critic
+        sample_weight = torch.tensor([[0.5, 1.0, 1.5], [2.0, 0.25, 0.75]])
+
+        class _UnitLoss:
+
+            def __call__(self, info, value, target_value):
+                del info, value, target_value
+                return LossInfo(loss=torch.ones(t, b))
+
+        alg._critic_losses = [_UnitLoss() for _ in range(n)]
+        info = BafcInfo(
+            critic=BafcCriticInfo(
+                critic=torch.zeros(t, b, n, n),
+                target_critic=torch.zeros(t, b, n, n),
+                critic_sample_weight=sample_weight),
+            bootstrap_mask=torch.ones(t, b, n))
+
+        loss = alg._calc_critic_loss(info)
+
+        self.assertTensorClose(loss.loss, sample_weight * float(n))
+
+    def test_eval_and_reweighting_share_reference_feature_helper(self):
+        alg = self._make_alg(
+            enable_critic_reweighting=True, critic_reweighting_solver_iters=1)
+        obs = torch.randn(4, 4)
+        action = torch.randn(4, 2)
+        phi_target = torch.randn(4, alg._num_actor_critic, 3)
+        phi_behavior = torch.randn(4, alg._num_actor_critic, 3)
+
+        with mock.patch.object(
+                alg,
+                "_compute_reference_metric_feature_maps",
+                return_value=(phi_target, phi_behavior)) as feature_mock:
+            alg._compute_eval_trust_metric(obs, action)
+        feature_mock.assert_called_once()
+
+        with mock.patch.object(
+                alg,
+                "_compute_reference_metric_feature_maps",
+                return_value=(phi_target, phi_behavior)) as feature_mock:
+            alg._compute_critic_sample_weights(obs, action)
+        feature_mock.assert_called_once()
 
     def test_eval_trust_uses_reference_encoding_cache_and_replay_action(self):
         alg = self._make_alg(trust_metric_num_obs=4)

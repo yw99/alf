@@ -53,7 +53,10 @@ BafcState = namedtuple(
     default_value=())
 
 BafcCriticInfo = namedtuple(
-    "BafcCriticInfo", ["critic", "target_critic", "eval_trust_metric"],
+    "BafcCriticInfo", [
+        "critic", "target_critic", "eval_trust_metric",
+        "critic_sample_weight"
+    ],
     default_value=())
 
 BafcActorInfo = namedtuple(
@@ -120,6 +123,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                  monitor_trust_metrics: bool = True,
                  enable_eval_rollout_skip_gate: bool = False,
                  enable_grad_actor_extend_gate: bool = False,
+                 enable_critic_reweighting: bool = False,
+                 critic_reweighting_beta: Optional[float] = None,
+                 critic_reweighting_ridge: Optional[float] = None,
+                 critic_reweighting_solver_iters: int = 5,
+                 critic_reweighting_max_weight: float = 10.0,
                  eval_gate_max_consecutive_rollout_skips: int = 5,
                  grad_gate_max_consecutive_actor_extensions: Optional[int] = None,
                  actor_utd: Optional[int] = None,
@@ -188,6 +196,16 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             "trust_metric_update_interval must be >= 1")
         assert eval_gate_max_consecutive_rollout_skips >= 1, (
             "eval_gate_max_consecutive_rollout_skips must be >= 1")
+        if critic_reweighting_beta is not None:
+            assert critic_reweighting_beta >= 0, (
+                "critic_reweighting_beta must be nonnegative when set")
+        if critic_reweighting_ridge is not None:
+            assert critic_reweighting_ridge > 0, (
+                "critic_reweighting_ridge must be > 0 when set")
+        assert critic_reweighting_solver_iters >= 1, (
+            "critic_reweighting_solver_iters must be >= 1")
+        assert critic_reweighting_max_weight > 0, (
+            "critic_reweighting_max_weight must be > 0")
         assert not (freeze_eval_samples and eval_samples_optimizer is not None), (
             "eval_samples_optimizer cannot be set when freeze_eval_samples=True.")
         if grad_gate_max_consecutive_actor_extensions is not None:
@@ -246,6 +264,13 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._monitor_trust_metrics = monitor_trust_metrics
         self._enable_eval_rollout_skip_gate = enable_eval_rollout_skip_gate
         self._enable_grad_actor_extend_gate = enable_grad_actor_extend_gate
+        self._enable_critic_reweighting = enable_critic_reweighting
+        self._critic_reweighting_beta = critic_reweighting_beta
+        self._critic_reweighting_ridge = (
+            trust_cov_reg if critic_reweighting_ridge is None
+            else critic_reweighting_ridge)
+        self._critic_reweighting_solver_iters = critic_reweighting_solver_iters
+        self._critic_reweighting_max_weight = critic_reweighting_max_weight
         self._eval_gate_max_consecutive_rollout_skips = (
             eval_gate_max_consecutive_rollout_skips)
         self._freeze_eval_samples = freeze_eval_samples
@@ -729,17 +754,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         weighted_norm = self._compute_weighted_feature_norm(phi_ref, inv_cov)
         return torch.clamp(weighted_norm.pow(2).mean(), min=0.)
 
-    def _should_refresh_trust_metrics(self):
-        return (self._monitor_trust_metrics and self._last_update_had_actor_step
-                and self._trust_metric_update_counter %
-                self._trust_metric_update_interval == 0)
-
     @torch.no_grad()
-    def _compute_eval_trust_metric(self, observation, behavior_action):
-        replay_obs, replay_action = self._sample_metric_observation_action(
-            observation, behavior_action)
-        if not isinstance(replay_obs, torch.Tensor):
-            return torch.ones_like(self._last_eval_trust)
+    def _compute_reference_metric_feature_maps(self, replay_obs, replay_action):
+        if not isinstance(replay_obs, torch.Tensor) or not isinstance(
+                replay_action, torch.Tensor):
+            return (), ()
 
         target_obs = self._sample_target_metric_observations(replay_obs)
         if not isinstance(target_obs, torch.Tensor):
@@ -759,6 +778,205 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             target_obs, reference_encoding, target_action).detach()
         phi_behavior = self._compute_snapshot_feature_map(
             replay_obs, reference_encoding, behavior_action).detach()
+        return phi_target, phi_behavior
+
+    def _feature_covariance(self, feature_map):
+        return (feature_map.permute(1, 2, 0) @
+                feature_map.permute(1, 0, 2) / feature_map.shape[0])
+
+    def _project_simplex(self, values):
+        values = torch.as_tensor(values)
+        if values.ndim != 1 or values.numel() == 0:
+            return values
+        sorted_values = torch.sort(values, descending=True).values
+        cssv = torch.cumsum(sorted_values, dim=0) - 1.0
+        ind = torch.arange(
+            1, values.numel() + 1, device=values.device, dtype=values.dtype)
+        active = sorted_values - cssv / ind > 0
+        if not active.any():
+            return torch.full_like(values, 1.0 / values.numel())
+        rho = torch.nonzero(active, as_tuple=False)[-1, 0]
+        theta = cssv[rho] / ind[rho]
+        projected = torch.clamp(values - theta, min=0.)
+        total = projected.sum()
+        if not torch.isfinite(total) or total <= 0:
+            return torch.full_like(values, 1.0 / values.numel())
+        return projected / total
+
+    def _critic_reweighting_beta_value(self, num_samples, device, dtype):
+        if self._critic_reweighting_beta is not None:
+            return torch.as_tensor(
+                self._critic_reweighting_beta, device=device, dtype=dtype)
+        gamma = torch.as_tensor(
+            self._critic_losses[0].gamma, device=device, dtype=dtype).reshape(-1)[0]
+        denom = (1.0 - gamma).clamp_min(1e-6)
+        return 1.0 / (float(num_samples) * denom)
+
+    def _critic_reweighting_objective_and_grad(self, p, features, target_cov,
+                                               beta, ridge):
+        num_features = features.shape[-1]
+        eye = torch.eye(
+            num_features, dtype=features.dtype, device=features.device).unsqueeze(0)
+        sigma = torch.einsum('n,ngd,nge->gde', p, features, features)
+        sigma = sigma + ridge * eye
+        inv_sigma = torch.linalg.pinv(sigma)
+        m_mat = torch.einsum('n,ngd,nge->gde', p.pow(2), features, features)
+
+        h_obj = torch.einsum('gij,gji->g', target_cov, inv_sigma)
+        g_obj = torch.einsum('gij,gjk,gkl,gli->g', target_cov, inv_sigma,
+                             m_mat, inv_sigma)
+        objective = (g_obj + beta * h_obj).mean()
+
+        c_ell = inv_sigma @ target_cov @ inv_sigma
+        c_h = c_ell @ m_mat @ inv_sigma
+        ell = torch.einsum('ngd,gde,nge->ng', features, c_ell, features)
+        h = torch.einsum('ngd,gde,nge->ng', features, c_h, features)
+        grad = ((2.0 * p).unsqueeze(-1) - beta) * ell - 2.0 * h
+        grad = grad.mean(dim=1)
+        fw_gap = -beta * h_obj.mean() - grad.min()
+        return objective, grad, fw_gap
+
+    def _solve_critic_reweighting_distribution(self, features, target_cov, beta,
+                                               ridge):
+        num_samples = features.shape[0]
+        if num_samples <= 1:
+            return torch.full(
+                (num_samples, ),
+                1.0 / max(1, num_samples),
+                dtype=features.dtype,
+                device=features.device)
+
+        uniform = torch.full(
+            (num_samples, ),
+            1.0 / num_samples,
+            dtype=features.dtype,
+            device=features.device)
+        starts = [uniform]
+        try:
+            _, uniform_grad, _ = self._critic_reweighting_objective_and_grad(
+                uniform, features, target_cov, beta, ridge)
+            vertex = torch.zeros_like(uniform)
+            vertex[torch.argmin(uniform_grad)] = 1.0
+            starts.append(0.5 * uniform + 0.5 * vertex)
+        except RuntimeError:
+            starts.append(uniform)
+
+        best_p = uniform
+        best_obj = None
+        for start in starts:
+            p = self._project_simplex(start)
+            try:
+                obj, grad, fw_gap = self._critic_reweighting_objective_and_grad(
+                    p, features, target_cov, beta, ridge)
+                if not torch.isfinite(obj):
+                    continue
+                for _ in range(self._critic_reweighting_solver_iters):
+                    candidates = []
+                    step = 1.0
+                    for _ in range(8):
+                        cand = self._project_simplex(p - step * grad)
+                        cand_obj, _, _ = self._critic_reweighting_objective_and_grad(
+                            cand, features, target_cov, beta, ridge)
+                        if torch.isfinite(cand_obj) and cand_obj <= obj + 1e-12:
+                            candidates.append((cand_obj, cand))
+                            break
+                        step *= 0.5
+
+                    if torch.isfinite(fw_gap) and fw_gap > 1e-8:
+                        vertex = torch.zeros_like(p)
+                        vertex[torch.argmin(grad)] = 1.0
+                        direction = vertex - p
+                        alpha = 1.0
+                        for _ in range(8):
+                            cand = self._project_simplex(p + alpha * direction)
+                            cand_obj, _, _ = self._critic_reweighting_objective_and_grad(
+                                cand, features, target_cov, beta, ridge)
+                            if torch.isfinite(cand_obj) and cand_obj <= obj + 1e-12:
+                                candidates.append((cand_obj, cand))
+                                break
+                            alpha *= 0.5
+
+                    if not candidates:
+                        break
+                    obj, p = min(candidates, key=lambda item: float(item[0]))
+                    obj, grad, fw_gap = self._critic_reweighting_objective_and_grad(
+                        p, features, target_cov, beta, ridge)
+
+                if best_obj is None or obj < best_obj:
+                    best_obj = obj
+                    best_p = p
+            except RuntimeError:
+                continue
+
+        if best_obj is None or not torch.isfinite(best_p).all():
+            return uniform
+        return self._project_simplex(best_p)
+
+    @torch.no_grad()
+    def _compute_critic_sample_weights(self, observation, action):
+        if not self._enable_critic_reweighting:
+            return ()
+        if not isinstance(observation, torch.Tensor):
+            return ()
+        outer_shape = observation.shape[:-len(self._observation_spec.shape)]
+        if not outer_shape:
+            outer_shape = (observation.shape[0], )
+        obs = self._flatten_metric_observations(observation)
+        act = self._flatten_metric_actions(action)
+        if not isinstance(obs, torch.Tensor) or not isinstance(act, torch.Tensor):
+            return torch.ones(outer_shape, dtype=observation.dtype, device=observation.device)
+        num_samples = obs.shape[0]
+        if num_samples == 0 or act.shape[0] != num_samples:
+            return torch.ones(outer_shape, dtype=observation.dtype, device=observation.device)
+
+        try:
+            phi_target, phi_behavior = self._compute_reference_metric_feature_maps(
+                obs, act)
+            if not isinstance(phi_target, torch.Tensor) or not isinstance(
+                    phi_behavior, torch.Tensor):
+                raise RuntimeError("empty critic reweighting feature map")
+            feature_dim = phi_behavior.shape[-1]
+            feature_coords = self._sample_feature_coords(feature_dim,
+                                                         phi_behavior.device)
+            phi_behavior = phi_behavior[:, :, feature_coords]
+            phi_target = phi_target[:, :, feature_coords]
+            target_cov = self._feature_covariance(phi_target)
+            beta = self._critic_reweighting_beta_value(
+                num_samples, phi_behavior.device, phi_behavior.dtype)
+            ridge = torch.as_tensor(
+                self._critic_reweighting_ridge,
+                device=phi_behavior.device,
+                dtype=phi_behavior.dtype)
+            p = self._solve_critic_reweighting_distribution(
+                phi_behavior, target_cov, beta, ridge)
+            weights = p * float(num_samples)
+            weights = weights.clamp(
+                min=0., max=float(self._critic_reweighting_max_weight))
+            mean = weights.mean().clamp_min(1e-12)
+            weights = weights / mean
+            if not torch.isfinite(weights).all():
+                raise RuntimeError("non-finite critic reweighting weights")
+            return weights.to(device=observation.device,
+                              dtype=observation.dtype).reshape(outer_shape)
+        except RuntimeError:
+            return torch.ones(outer_shape, dtype=observation.dtype, device=observation.device)
+
+    def _should_refresh_trust_metrics(self):
+        return (self._monitor_trust_metrics and self._last_update_had_actor_step
+                and self._trust_metric_update_counter %
+                self._trust_metric_update_interval == 0)
+
+    @torch.no_grad()
+    def _compute_eval_trust_metric(self, observation, behavior_action):
+        replay_obs, replay_action = self._sample_metric_observation_action(
+            observation, behavior_action)
+        if not isinstance(replay_obs, torch.Tensor):
+            return torch.ones_like(self._last_eval_trust)
+
+        phi_target, phi_behavior = self._compute_reference_metric_feature_maps(
+            replay_obs, replay_action)
+        if not isinstance(phi_target, torch.Tensor):
+            return torch.ones_like(self._last_eval_trust)
 
         return self._compute_eval_trust_from_features(phi_target, phi_behavior)
 
@@ -1077,6 +1295,8 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
 
         state = BafcCriticState(
             critic=critic_state, target_critic=target_critic_state)
+        critic_sample_weight = self._compute_critic_sample_weights(
+            observation, rollout_info.action)
         info = BafcCriticInfo(
             critic=critics,
             target_critic=target_critics,
@@ -1084,7 +1304,8 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                 self._last_eval_trust,
                 critics.shape[:-2],
                 critics.device,
-                critics.dtype))
+                critics.dtype),
+            critic_sample_weight=critic_sample_weight)
 
         return state, info
 
@@ -1267,6 +1488,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                     bootstrap_mask = info.bootstrap_mask[:, :,
                                                          i] / self._bootstrap_mask_prob
                     critic_loss = critic_loss * bootstrap_mask
+                sample_weight = critic_info.critic_sample_weight
+                if isinstance(sample_weight, torch.Tensor):
+                    while sample_weight.ndim < critic_loss.ndim:
+                        sample_weight = sample_weight.unsqueeze(-1)
+                    critic_loss = critic_loss * sample_weight
                 critic_losses.append(critic_loss)
 
         self._do_critic_summary = False
