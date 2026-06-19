@@ -52,8 +52,19 @@ BafcState = namedtuple(
     "BafcState", ["action", "actor", "critic"],
     default_value=())
 
+BafcCriticReweightingInfo = namedtuple(
+    "BafcCriticReweightingInfo", [
+        "final_weight", "raw_weight", "clipped_weight", "sample_age",
+        "fallback_to_uniform", "solver_objective_initial",
+        "solver_objective_final"
+    ],
+    default_value=())
+
 BafcCriticInfo = namedtuple(
-    "BafcCriticInfo", ["critic", "target_critic", "critic_sample_weight"],
+    "BafcCriticInfo", [
+        "critic", "target_critic", "critic_sample_weight",
+        "critic_reweighting_info"
+    ],
     default_value=())
 
 BafcActorInfo = namedtuple(
@@ -798,8 +809,12 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 solver_objective_final,
                 dtype=final_weights.dtype,
                 device=final_weights.device)
-            if (torch.isfinite(solver_objective_initial)
-                    and torch.isfinite(solver_objective_final)):
+            if (solver_objective_initial.numel() > 0
+                    and solver_objective_final.numel() > 0
+                    and torch.isfinite(solver_objective_initial).all().item()
+                    and torch.isfinite(solver_objective_final).all().item()):
+                solver_objective_initial = solver_objective_initial.reshape(())
+                solver_objective_final = solver_objective_final.reshape(())
                 alf.summary.scalar(
                     'critic_reweighting/solver_objective_initial',
                     solver_objective_initial)
@@ -857,12 +872,88 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                     'critic_reweighting/newest_over_oldest_weight_ratio',
                     newest_mean / oldest_mean.clamp_min(1e-12))
 
+    def _make_critic_reweighting_info(self,
+                                      final_weight,
+                                      raw_weight=None,
+                                      clipped_weight=None,
+                                      sample_age=(),
+                                      fallback_to_uniform=False,
+                                      solver_objective_initial=(),
+                                      solver_objective_final=()):
+        if raw_weight is None:
+            raw_weight = final_weight
+        if clipped_weight is None:
+            clipped_weight = final_weight
+        if isinstance(final_weight, torch.Tensor):
+            fallback_to_uniform = torch.as_tensor(
+                float(fallback_to_uniform),
+                dtype=final_weight.dtype,
+                device=final_weight.device)
+        return BafcCriticReweightingInfo(
+            final_weight=final_weight,
+            raw_weight=raw_weight,
+            clipped_weight=clipped_weight,
+            sample_age=sample_age,
+            fallback_to_uniform=fallback_to_uniform,
+            solver_objective_initial=solver_objective_initial,
+            solver_objective_final=solver_objective_final)
+
+    def _record_critic_reweighting_info_summaries(self, reweighting_info):
+        if not isinstance(reweighting_info, BafcCriticReweightingInfo):
+            return
+        self._record_critic_reweighting_summaries(
+            reweighting_info.final_weight,
+            raw_weights=reweighting_info.raw_weight,
+            clipped_weights=reweighting_info.clipped_weight,
+            sample_age=reweighting_info.sample_age,
+            fallback_to_uniform=reweighting_info.fallback_to_uniform,
+            solver_objective_initial=reweighting_info.solver_objective_initial,
+            solver_objective_final=reweighting_info.solver_objective_final)
+
+    def _sanitize_critic_reweighting_info_for_train_info(self, reweighting_info):
+        del reweighting_info
+        return ()
+
+    def _sanitize_critic_info_for_train_info(self, critic_info):
+        if not isinstance(critic_info, BafcCriticInfo):
+            return critic_info
+        reweighting_info = self._sanitize_critic_reweighting_info_for_train_info(
+            critic_info.critic_reweighting_info)
+        if reweighting_info == critic_info.critic_reweighting_info:
+            return critic_info
+        return critic_info._replace(critic_reweighting_info=reweighting_info)
+
+    def _empty_actor_info_for_train_info(self, reward):
+        if not isinstance(reward, torch.Tensor):
+            return LossInfo(extra=BafcActorInfo())
+        zero = torch.zeros_like(reward)
+        return LossInfo(
+            loss=zero,
+            extra=BafcActorInfo(eval_action_loss=torch.zeros_like(reward)))
+
+    def _empty_critic_info_for_train_info(self, reward):
+        if not isinstance(reward, torch.Tensor):
+            return BafcCriticInfo()
+        critic_shape = reward.shape + (
+            self._num_actor_critic,
+            self._num_actor_critic,
+        )
+        critic = reward.new_zeros(critic_shape)
+        critic_sample_weight = ()
+        if self._enable_critic_reweighting:
+            critic_sample_weight = torch.ones_like(reward)
+        return BafcCriticInfo(
+            critic=critic,
+            target_critic=torch.zeros_like(critic),
+            critic_sample_weight=critic_sample_weight,
+            critic_reweighting_info=())
+
     @torch.no_grad()
     def _compute_critic_sample_weights(self, observation, action, sample_age=()):
         if not self._enable_critic_reweighting:
-            return ()
+            return (), ()
         if not isinstance(observation, torch.Tensor):
-            return ()
+            return (), ()
         outer_shape = observation.shape[:-len(self._observation_spec.shape)]
         if not outer_shape:
             outer_shape = (observation.shape[0], )
@@ -870,15 +961,13 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         act = self._flatten_reweighting_actions(action)
         ones = torch.ones(
             outer_shape, dtype=observation.dtype, device=observation.device)
+        fallback_info = self._make_critic_reweighting_info(
+            ones, sample_age=sample_age, fallback_to_uniform=True)
         if not isinstance(obs, torch.Tensor) or not isinstance(act, torch.Tensor):
-            self._record_critic_reweighting_summaries(
-                ones, sample_age=sample_age, fallback_to_uniform=True)
-            return ones
+            return ones, fallback_info
         num_samples = obs.shape[0]
         if num_samples == 0 or act.shape[0] != num_samples:
-            self._record_critic_reweighting_summaries(
-                ones, sample_age=sample_age, fallback_to_uniform=True)
-            return ones
+            return ones, fallback_info
 
         try:
             phi_target, phi_behavior = self._compute_reweighting_feature_maps(
@@ -922,20 +1011,20 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             weights = clipped_weights / mean
             if not torch.isfinite(weights).all():
                 raise RuntimeError("non-finite critic reweighting weights")
-            self._record_critic_reweighting_summaries(
+            weights = weights.to(
+                device=observation.device,
+                dtype=observation.dtype).reshape(outer_shape)
+            reweighting_info = self._make_critic_reweighting_info(
                 weights,
-                raw_weights=raw_weights,
-                clipped_weights=clipped_weights,
+                raw_weight=raw_weights,
+                clipped_weight=clipped_weights,
                 sample_age=sample_age,
                 fallback_to_uniform=False,
                 solver_objective_initial=solver_objective_initial,
                 solver_objective_final=solver_objective_final)
-            return weights.to(device=observation.device,
-                              dtype=observation.dtype).reshape(outer_shape)
+            return weights, reweighting_info
         except RuntimeError:
-            self._record_critic_reweighting_summaries(
-                ones, sample_age=sample_age, fallback_to_uniform=True)
-            return ones
+            return ones, fallback_info
 
     def preprocess_experience(self, root_inputs: TimeStep, rollout_info,
                               batch_info):
@@ -1192,12 +1281,14 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
 
         state = BafcCriticState(
             critic=critic_state, target_critic=target_critic_state)
-        critic_sample_weight = self._compute_critic_sample_weights(
-            observation, rollout_info.action, rollout_info.sample_age)
+        critic_sample_weight, critic_reweighting_info = (
+            self._compute_critic_sample_weights(
+                observation, rollout_info.action, rollout_info.sample_age))
         info = BafcCriticInfo(
             critic=critics,
             target_critic=target_critics,
-            critic_sample_weight=critic_sample_weight)
+            critic_sample_weight=critic_sample_weight,
+            critic_reweighting_info=critic_reweighting_info)
 
         return state, info
 
@@ -1246,7 +1337,8 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 actor_state, actor_info = self._actor_train_step(
                     inputs.observation, action, 
                     rollout_info.bootstrap_mask, state.actor)
-                critic_info = BafcCriticInfo()
+                critic_info = self._empty_critic_info_for_train_info(
+                    inputs.reward)
                 new_state = BafcState(action=action_state,
                                       actor=actor_state,
                                       critic=state.critic)
@@ -1255,7 +1347,8 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 action = action.reshape(-1, action.shape[-1])  # [T*B * n_actor, d_a]
                 critic_state, critic_info = self._critic_train_step(
                     inputs.observation, state.critic, rollout_info, action)
-                actor_info = LossInfo(extra=BafcActorInfo())
+                actor_info = self._empty_actor_info_for_train_info(
+                    inputs.reward)
                 new_state = BafcState(action=action_state,
                                       actor=state.actor,
                                       critic=critic_state)
@@ -1271,6 +1364,10 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 self._actor_eval_samples.std(dim=0, unbiased=False))
             safe_mean_hist_summary('eval_samples/per_sample_l2_norm',
                                    self._actor_eval_samples.norm(dim=-1))
+            self._record_critic_reweighting_info_summaries(
+                critic_info.critic_reweighting_info)
+
+        critic_info = self._sanitize_critic_info_for_train_info(critic_info)
 
         info = BafcInfo(
             reward=inputs.reward,

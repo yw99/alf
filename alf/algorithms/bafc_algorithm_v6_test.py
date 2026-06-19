@@ -22,8 +22,11 @@ import torch
 import alf
 from alf.algorithms.bafc_algorithm_v6 import (BafcActorInfo,
                                               BafcAlgorithmV6,
-                                              BafcCriticInfo, BafcInfo)
+                                              BafcCriticInfo,
+                                              BafcCriticReweightingInfo,
+                                              BafcInfo, BafcState)
 from alf.algorithms.config import TrainerConfig
+from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import LossInfo, StepType, TimeStep
 from alf.experience_replayers.replay_buffer import BatchInfo
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
@@ -120,6 +123,7 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
             self.assertNotIn("grad_trust_metric", fields)
 
         self.assertIn("critic_sample_weight", BafcCriticInfo._fields)
+        self.assertIn("critic_reweighting_info", BafcCriticInfo._fields)
         self.assertIn("sample_age", BafcInfo._fields)
 
     def test_preprocess_experience_computes_sample_age(self):
@@ -163,10 +167,11 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
         alg = self._make_alg()
         with mock.patch.object(
                 alg, "_record_critic_reweighting_summaries") as summary_mock:
-            weight = alg._compute_critic_sample_weights(
+            weight, reweighting_info = alg._compute_critic_sample_weights(
                 torch.randn(4, 4), torch.randn(4, 2))
 
         self.assertEqual(weight, ())
+        self.assertEqual(reweighting_info, ())
         summary_mock.assert_not_called()
 
 
@@ -298,12 +303,23 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
 
         with mock.patch(
                 "alf.summary.should_record_summaries",
+                return_value=True), mock.patch.object(
+                    alg,
+                    "_record_critic_reweighting_summaries") as record_mock:
+            weight, reweighting_info = alg._compute_critic_sample_weights(
+                obs, action)
+
+        self.assertTensorClose(weight, torch.ones(4))
+        self.assertIsInstance(reweighting_info, BafcCriticReweightingInfo)
+        record_mock.assert_not_called()
+
+        with mock.patch(
+                "alf.summary.should_record_summaries",
                 return_value=True), mock.patch(
                     "alf.summary.scalar") as scalar_mock, mock.patch(
                         "alf.summary.histogram") as histogram_mock:
-            weight = alg._compute_critic_sample_weights(obs, action)
+            alg._record_critic_reweighting_info_summaries(reweighting_info)
 
-        self.assertTensorClose(weight, torch.ones(4))
         histogram_values = {
             call.args[0]: call.args[1]
             for call in histogram_mock.call_args_list
@@ -336,13 +352,21 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
                 alg,
                 "_compute_reweighting_feature_maps",
                 return_value=(phi_target, phi_behavior)) as feature_mock:
-            weight = alg._compute_critic_sample_weights(obs, action)
+            weight, reweighting_info = alg._compute_critic_sample_weights(
+                obs, action)
 
         feature_mock.assert_called_once()
         self.assertEqual(tuple(weight.shape), (2, 3))
         self.assertTrue(torch.isfinite(weight).all().item())
         self.assertTrue((weight >= 0).all().item())
         self.assertAlmostEqual(weight.mean().item(), 1.0, places=5)
+        self.assertIsInstance(reweighting_info, BafcCriticReweightingInfo)
+        self.assertTensorClose(reweighting_info.final_weight, weight)
+        self.assertTrue(torch.isfinite(reweighting_info.raw_weight).all().item())
+        self.assertTrue(
+            torch.isfinite(reweighting_info.clipped_weight).all().item())
+        self.assertAlmostEqual(
+            float(reweighting_info.fallback_to_uniform), 0.0, places=6)
 
     def test_critic_reweighting_degenerate_features_fall_back_to_uniform(self):
         alg = self._make_alg(enable_critic_reweighting=True)
@@ -355,9 +379,13 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
                 alg,
                 "_compute_reweighting_feature_maps",
                 return_value=(phi_target, phi_behavior)):
-            weight = alg._compute_critic_sample_weights(obs, action)
+            weight, reweighting_info = alg._compute_critic_sample_weights(
+                obs, action)
 
         self.assertTensorClose(weight, torch.ones(4))
+        self.assertIsInstance(reweighting_info, BafcCriticReweightingInfo)
+        self.assertAlmostEqual(
+            float(reweighting_info.fallback_to_uniform), 1.0, places=6)
 
     def test_critic_reweighting_solver_returns_simplex_distribution(self):
         torch.manual_seed(1234)
@@ -416,6 +444,131 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
         loss = alg._calc_critic_loss(info)
 
         self.assertTensorClose(loss.loss, sample_weight * float(n))
+
+    def test_train_step_records_reweighting_summary_in_summary_phase(self):
+        alg = self._make_alg(
+            enable_critic_reweighting=True, debug_summaries=True)
+        length, batch_size = 2, 64
+        num_samples = length * batch_size
+        obs = torch.randn(num_samples, 4)
+        inputs = self._make_rollout_time_step(obs)
+        action = torch.zeros(num_samples, alg._num_actor_critic, 2)
+        actor_info = LossInfo(
+            loss=torch.zeros(num_samples),
+            extra=BafcActorInfo(eval_action_loss=torch.zeros(num_samples)))
+        reweighting_info = BafcCriticReweightingInfo(
+            final_weight=torch.ones(num_samples),
+            raw_weight=torch.ones(num_samples),
+            clipped_weight=torch.ones(num_samples),
+            sample_age=torch.zeros(num_samples),
+            fallback_to_uniform=torch.tensor(0.0),
+            solver_objective_initial=torch.tensor(1.0),
+            solver_objective_final=torch.tensor(0.5))
+        critic_info = BafcCriticInfo(
+            critic_reweighting_info=reweighting_info)
+        rollout_info = BafcInfo(
+            action=action,
+            bootstrap_mask=torch.ones(num_samples, alg._num_actor_critic),
+            discounted_return=torch.zeros(num_samples),
+            sample_age=torch.zeros(num_samples))
+
+        with mock.patch.object(
+                alg,
+                "_predict_action",
+                return_value=(action, ())), mock.patch.object(
+                    alg,
+                    "_actor_train_step",
+                    return_value=((), actor_info)), mock.patch.object(
+                        alg,
+                        "_critic_train_step",
+                        return_value=((), critic_info)), mock.patch.object(
+                            alg,
+                            "_record_critic_reweighting_summaries"
+                        ) as record_mock, mock.patch(
+                            "alf.summary.should_record_summaries",
+                            return_value=True):
+            alg_step = alg.train_step(inputs, BafcState(), rollout_info)
+
+        record_mock.assert_called_once()
+        self.assertIs(record_mock.call_args.args[0],
+                      reweighting_info.final_weight)
+        self.assertIs(record_mock.call_args.kwargs["fallback_to_uniform"],
+                      reweighting_info.fallback_to_uniform)
+        self.assertIs(record_mock.call_args.kwargs["solver_objective_initial"],
+                      reweighting_info.solver_objective_initial)
+        self.assertIs(record_mock.call_args.kwargs["solver_objective_final"],
+                      reweighting_info.solver_objective_final)
+
+        returned_info = alg_step.info.critic.critic_reweighting_info
+        self.assertEqual(returned_info, ())
+
+        alf.nest.map_structure(
+            lambda x: x.reshape(length, batch_size, *x.shape[1:])
+            if isinstance(x, torch.Tensor) else x,
+            alg_step.info)
+
+    def test_actor_only_and_critic_only_train_info_structures_match(self):
+        alg = self._make_alg(enable_critic_reweighting=True)
+        length, batch_size = 2, 64
+        num_samples = length * batch_size
+        n = alg._num_actor_critic
+        obs = torch.randn(num_samples, 4)
+        inputs = self._make_rollout_time_step(obs)
+        action = torch.zeros(num_samples, n, 2)
+        rollout_info = BafcInfo(
+            action=action,
+            bootstrap_mask=torch.ones(num_samples, n),
+            discounted_return=torch.zeros(num_samples),
+            sample_age=torch.zeros(num_samples))
+        actor_info = LossInfo(
+            loss=torch.ones(num_samples),
+            extra=BafcActorInfo(eval_action_loss=torch.ones(num_samples)))
+        reweighting_info = BafcCriticReweightingInfo(
+            final_weight=torch.ones(num_samples),
+            raw_weight=torch.ones(num_samples),
+            clipped_weight=torch.ones(num_samples),
+            sample_age=torch.zeros(num_samples),
+            fallback_to_uniform=torch.tensor(0.0),
+            solver_objective_initial=torch.tensor(1.0),
+            solver_objective_final=torch.tensor(0.5))
+        critic_info = BafcCriticInfo(
+            critic=torch.ones(num_samples, n, n),
+            target_critic=torch.ones(num_samples, n, n),
+            critic_sample_weight=torch.ones(num_samples),
+            critic_reweighting_info=reweighting_info)
+
+        def _run_train_step(mode):
+            alg._train_mode = mode
+            alg._actor_update_counter = 1
+            alg._critic_update_counter = 1
+            with mock.patch.object(
+                    alg,
+                    "_predict_action",
+                    return_value=(action, ())), mock.patch.object(
+                        alg,
+                        "_actor_train_step",
+                        return_value=((), actor_info)), mock.patch.object(
+                            alg,
+                            "_critic_train_step",
+                            return_value=((), critic_info)):
+                return alg.train_step(inputs, BafcState(), rollout_info).info
+
+        actor_only_info = _run_train_step(TrainMode.actor)
+        critic_only_info = _run_train_step(TrainMode.critic)
+
+        alf.nest.assert_same_structure(actor_only_info, critic_only_info)
+        self.assertEqual(actor_only_info.critic.critic_reweighting_info, ())
+        self.assertEqual(critic_only_info.critic.critic_reweighting_info, ())
+        self.assertTensorClose(actor_only_info.critic.critic_sample_weight,
+                               torch.ones(num_samples))
+        self.assertTensorClose(critic_only_info.actor.loss,
+                               torch.zeros(num_samples))
+
+        for info in (actor_only_info, critic_only_info):
+            alf.nest.map_structure(
+                lambda x: x.reshape(length, batch_size, *x.shape[1:])
+                if isinstance(x, torch.Tensor) else x,
+                info)
 
     def test_rollout_updates_reweighting_target_observation_cache(self):
         alg = self._make_alg(

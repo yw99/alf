@@ -10,6 +10,7 @@
 #       --seeds CSV                 Four comma-separated seeds (default: 1,2,3,4)
 #       --critic-utds CSV           Comma-separated critic_utd values (default: 2,3)
 #       --gpus CSV                  Comma-separated GPU ids (default: 0,1,2,3)
+#       --lbfgs-steps N             LBFGS solver steps for reweighting (default: 5)
 #       --checkpoints N             Number of checkpoints (default: 10)
 #   -h, --help                      Show this help message
 #
@@ -30,6 +31,7 @@ NUM_CHECKPOINTS=10
 SEEDS=(1 2 3 4)
 CRITIC_UTDS=(2 3)
 GPUS="0,1,2,3"
+LBFGS_STEPS=1
 
 parse_csv_array() {
     local input="$1"
@@ -38,7 +40,7 @@ parse_csv_array() {
 }
 
 print_help() {
-    sed -n '4,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '4,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpus)
             GPUS="$2"
+            shift 2
+            ;;
+        --lbfgs-steps)
+            LBFGS_STEPS="$2"
             shift 2
             ;;
         --checkpoints)
@@ -116,6 +122,7 @@ echo "  Seeds: ${SEEDS[*]}"
 echo "  critic_utd values: ${CRITIC_UTDS[*]}"
 echo "  GPUs: ${GPUS}"
 echo "  Critic reweighting: enabled"
+echo "  LBFGS solver steps: ${LBFGS_STEPS}"
 echo "  Python: ${PYTHON_BIN}"
 echo ""
 
@@ -143,6 +150,7 @@ for utd_i in "${!CRITIC_UTDS[@]}"; do
             --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
             --conf_param "BafcAlgorithmV6.critic_utd=${CRITIC_UTD}" \
             --conf_param "BafcAlgorithmV6.enable_critic_reweighting=True" \
+            --conf_param "BafcAlgorithmV6.critic_reweighting_solver_iters=${LBFGS_STEPS}" \
             --conf_param "create_environment.env_name='${ENV_NAME}'" \
             --distributed multi-gpu \
             > "${RUN_DIR}/out.log" 2>&1 &
