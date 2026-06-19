@@ -17,8 +17,8 @@
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="${SCRIPT_DIR}/bafcv3_tr2_dmc_conf.py"
-# ENV_NAME="hopper:hop"
-ENV_NAME="cheetah:run"
+ENV_NAME="hopper:hop"
+# ENV_NAME="cheetah:run"
 BASE_DIR="/root/numeric_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
@@ -29,7 +29,7 @@ ROLLOUT_SKIP_CAP=3
 ROLLOUT_SKIP_EVAL_INTERVAL=60
 FREEZE_EVAL_SAMPLES=False
 ACTOR_USE_LN=False
-SEEDS=(1 2 3 4)
+SEEDS=(0 1 2 3)
 ENABLE_CRITIC_REWEIGHTING=False
 CRITIC_REWEIGHTING_BETA=None
 CRITIC_REWEIGHTING_RIDGE=None

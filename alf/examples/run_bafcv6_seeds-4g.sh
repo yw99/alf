@@ -24,14 +24,16 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONF_FILE="${SCRIPT_DIR}/bafcv6_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
-ENV_NAME="cheetah:run"
+# ENV_NAME="cheetah:run"
+ENV_NAME="hopper:hop"
 BASE_DIR="/root/numeric_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
-SEEDS=(1 2 3 4)
+SEEDS=(0 1 2 3)
 CRITIC_UTDS=(2 3)
 GPUS="0,1,2,3"
-LBFGS_STEPS=1
+LBFGS_STEPS=3
+REWEIGHTING_FEATURE_DIMENSION=32
 
 parse_csv_array() {
     local input="$1"
@@ -123,6 +125,7 @@ echo "  critic_utd values: ${CRITIC_UTDS[*]}"
 echo "  GPUs: ${GPUS}"
 echo "  Critic reweighting: enabled"
 echo "  LBFGS solver steps: ${LBFGS_STEPS}"
+echo "  Reweighting feature dimension: ${REWEIGHTING_FEATURE_DIMENSION}"
 echo "  Python: ${PYTHON_BIN}"
 echo ""
 
@@ -151,6 +154,7 @@ for utd_i in "${!CRITIC_UTDS[@]}"; do
             --conf_param "BafcAlgorithmV6.critic_utd=${CRITIC_UTD}" \
             --conf_param "BafcAlgorithmV6.enable_critic_reweighting=True" \
             --conf_param "BafcAlgorithmV6.critic_reweighting_solver_iters=${LBFGS_STEPS}" \
+            --conf_param "BafcAlgorithmV6.critic_reweighting_num_feature_coords=${REWEIGHTING_FEATURE_DIMENSION}" \
             --conf_param "create_environment.env_name='${ENV_NAME}'" \
             --distributed multi-gpu \
             > "${RUN_DIR}/out.log" 2>&1 &
