@@ -350,6 +350,7 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         self._dqda_clipping = dqda_clipping
         self._training_started = False
         self._do_critic_summary = False
+        self._last_critic_reweighting_info = ()
 
         def _filter(x):
             return list(filter(lambda x: x is not None, x))
@@ -1354,6 +1355,12 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                                       critic=critic_state)
                 self._critic_update_counter += 1
 
+        reweighting_info_for_summary = critic_info.critic_reweighting_info
+        if isinstance(reweighting_info_for_summary, BafcCriticReweightingInfo):
+            self._last_critic_reweighting_info = reweighting_info_for_summary
+        else:
+            reweighting_info_for_summary = self._last_critic_reweighting_info
+
         if self._debug_summaries and alf.summary.should_record_summaries():
             self._do_critic_summary = True
             safe_mean_hist_summary('eval_samples', self._actor_eval_samples)
@@ -1365,7 +1372,7 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             safe_mean_hist_summary('eval_samples/per_sample_l2_norm',
                                    self._actor_eval_samples.norm(dim=-1))
             self._record_critic_reweighting_info_summaries(
-                critic_info.critic_reweighting_info)
+                reweighting_info_for_summary)
 
         critic_info = self._sanitize_critic_info_for_train_info(critic_info)
 

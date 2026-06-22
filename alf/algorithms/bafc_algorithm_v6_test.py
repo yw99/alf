@@ -507,6 +507,52 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
             if isinstance(x, torch.Tensor) else x,
             alg_step.info)
 
+    def test_actor_only_summary_uses_cached_reweighting_info(self):
+        alg = self._make_alg(
+            enable_critic_reweighting=True, debug_summaries=True)
+        num_samples = 8
+        obs = torch.randn(num_samples, 4)
+        inputs = self._make_rollout_time_step(obs)
+        action = torch.zeros(num_samples, alg._num_actor_critic, 2)
+        actor_info = LossInfo(
+            loss=torch.zeros(num_samples),
+            extra=BafcActorInfo(eval_action_loss=torch.zeros(num_samples)))
+        cached_info = BafcCriticReweightingInfo(
+            final_weight=torch.ones(num_samples),
+            raw_weight=torch.ones(num_samples),
+            clipped_weight=torch.ones(num_samples),
+            sample_age=torch.zeros(num_samples),
+            fallback_to_uniform=torch.tensor(0.0),
+            solver_objective_initial=torch.tensor(1.0),
+            solver_objective_final=torch.tensor(0.5))
+        rollout_info = BafcInfo(
+            action=action,
+            bootstrap_mask=torch.ones(num_samples, alg._num_actor_critic),
+            discounted_return=torch.zeros(num_samples),
+            sample_age=torch.zeros(num_samples))
+        alg._train_mode = TrainMode.actor
+        alg._actor_update_counter = 1
+        alg._critic_update_counter = 1
+        alg._last_critic_reweighting_info = cached_info
+
+        with mock.patch.object(
+                alg,
+                "_predict_action",
+                return_value=(action, ())), mock.patch.object(
+                    alg,
+                    "_actor_train_step",
+                    return_value=((), actor_info)), mock.patch.object(
+                        alg,
+                        "_record_critic_reweighting_summaries"
+                    ) as record_mock, mock.patch(
+                        "alf.summary.should_record_summaries",
+                        return_value=True):
+            alg_step = alg.train_step(inputs, BafcState(), rollout_info)
+
+        record_mock.assert_called_once()
+        self.assertIs(record_mock.call_args.args[0], cached_info.final_weight)
+        self.assertEqual(alg_step.info.critic.critic_reweighting_info, ())
+
     def test_actor_only_and_critic_only_train_info_structures_match(self):
         alg = self._make_alg(enable_critic_reweighting=True)
         length, batch_size = 2, 64

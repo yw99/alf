@@ -24,12 +24,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONF_FILE="${SCRIPT_DIR}/bafcv6_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
-# ENV_NAME="cheetah:run"
-ENV_NAME="hopper:hop"
+ENV_NAME="cheetah:run"
+# ENV_NAME="hopper:hop"
 BASE_DIR="/root/numeric_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
-SEEDS=(0 1 2 3)
+SEEDS=(1 2 3 4)
 CRITIC_UTDS=(2 3)
 GPUS="0,1,2,3"
 LBFGS_STEPS=3
