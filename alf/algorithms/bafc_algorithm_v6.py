@@ -36,7 +36,7 @@ import alf.nest.utils as nest_utils
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.networks.network import Network
 from alf.tensor_specs import TensorSpec, BoundedTensorSpec
-from alf.utils import losses, common, dist_utils, math_ops
+from alf.utils import losses, common, dist_utils, math_ops, checkpoint_utils
 from alf.utils.normalizers import ScalarAdaptiveNormalizer
 from alf.utils.schedulers import Scheduler
 from alf.utils.summary_utils import safe_mean_hist_summary
@@ -141,6 +141,7 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                  target_critic_use_ema=False,
                  parameter_reset_period: Union[int, Scheduler] = -1,
                  dqda_clipping=None,
+                 checkpoint_replay_buffer=False,
                  actor_optimizer=None,
                  critic_optimizer=None,
                  actor_encoder_optimizer=None,
@@ -228,6 +229,7 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         self._use_bootstrap_critics = use_bootstrap_critics
         self._bootstrap_mask_prob = bootstrap_mask_prob
         self._bootstrap_mask_type = bootstrap_mask_type
+        self._checkpoint_replay_buffer = checkpoint_replay_buffer
         self._enable_critic_reweighting = enable_critic_reweighting
         self._critic_reweighting_beta = critic_reweighting_beta
         self._critic_reweighting_ridge = critic_reweighting_ridge
@@ -377,6 +379,150 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
     def _sync_snapshot_critic_from_current(self):
         self._snapshot_critic_networks.load_state_dict(
             self._critic_networks.state_dict())
+
+    def _bafc_runtime_key(self, prefix, name):
+        return prefix + "_bafc_runtime." + name
+
+    def _bafc_scalar_tensor(self, value, dtype=torch.int64):
+        if isinstance(value, torch.Tensor):
+            return value.detach().reshape(()).to(dtype=dtype).clone()
+        return torch.tensor(value, dtype=dtype)
+
+    def _bafc_runtime_tensor(self, value):
+        return torch.as_tensor(value).detach().clone()
+
+    def _bafc_scalar_int(self, value):
+        return int(torch.as_tensor(value).reshape(()).item())
+
+    def _save_bafc_runtime_state(self, destination, prefix):
+        scalar_fields = dict(
+            training_started=(self._training_started, torch.bool),
+            train_mode=(self._train_mode.value, torch.int64),
+            rollout_actor_id=(self._rollout_actor_id, torch.int64),
+            actor_update_counter=(self._actor_update_counter, torch.int64),
+            critic_update_counter=(self._critic_update_counter, torch.int64))
+        for name, (value, dtype) in scalar_fields.items():
+            destination[self._bafc_runtime_key(
+                prefix, name)] = self._bafc_scalar_tensor(value, dtype=dtype)
+        if isinstance(self._reweighting_target_observation_cache, torch.Tensor):
+            destination[self._bafc_runtime_key(
+                prefix, "reweighting_target_observation_cache")] = (
+                    self._reweighting_target_observation_cache.detach().clone())
+
+    def _pop_bafc_runtime_state(self, state_dict, prefix):
+        runtime_prefix = self._bafc_runtime_key(prefix, "")
+        runtime_state = {}
+        for key in list(state_dict.keys()):
+            if key.startswith(runtime_prefix):
+                runtime_state[key[len(runtime_prefix):]] = state_dict.pop(key)
+        return runtime_state
+
+    def _has_legacy_actor_checkpoint(self, state_dict, prefix):
+        return any(key.startswith(prefix + "_actor_networks.")
+                   for key in state_dict.keys())
+
+    def _restore_bafc_runtime_state(self, runtime_state):
+        if "training_started" in runtime_state:
+            self._training_started = bool(
+                torch.as_tensor(
+                    runtime_state["training_started"]).reshape(()).item())
+        if "train_mode" in runtime_state:
+            self._train_mode = TrainMode(
+                self._bafc_scalar_int(runtime_state["train_mode"]))
+        if "rollout_actor_id" in runtime_state:
+            self._rollout_actor_id = self._bafc_scalar_int(
+                runtime_state["rollout_actor_id"])
+        if "actor_update_counter" in runtime_state:
+            self._actor_update_counter = self._bafc_scalar_int(
+                runtime_state["actor_update_counter"])
+        if "critic_update_counter" in runtime_state:
+            self._critic_update_counter = self._bafc_scalar_int(
+                runtime_state["critic_update_counter"])
+        if "reweighting_target_observation_cache" in runtime_state:
+            self._reweighting_target_observation_cache = (
+                self._bafc_runtime_tensor(
+                    runtime_state["reweighting_target_observation_cache"]))
+        self._apply_train_mode_grad_flags()
+
+    def _apply_train_mode_grad_flags(self):
+        standard_or_initial = (
+            self._train_mode == TrainMode.standard or
+            (self._actor_update_counter == 0
+             and self._critic_update_counter == 0))
+        actor_requires_grad = (standard_or_initial
+                               or self._train_mode == TrainMode.actor)
+        eval_samples_requires_grad = (
+            standard_or_initial or self._train_mode == TrainMode.critic)
+        for p in self._actor_networks.parameters():
+            p.requires_grad_(actor_requires_grad)
+        self._actor_eval_samples.requires_grad_(eval_samples_requires_grad)
+
+    def checkpoint_replay_buffer_enabled(self):
+        return self._checkpoint_replay_buffer
+
+    def _set_replay_buffer_checkpoint_enabled(self, enabled):
+        if not self._checkpoint_replay_buffer or self._replay_buffer is None:
+            return None
+        old_enabled = checkpoint_utils.is_checkpoint_enabled(self._replay_buffer)
+        checkpoint_utils.enable_checkpoint(self._replay_buffer, enabled)
+
+        def _restore():
+            checkpoint_utils.enable_checkpoint(self._replay_buffer, old_enabled)
+
+        return _restore
+
+    def _has_replay_buffer_checkpoint(self, state_dict):
+        return any(key.startswith("_replay_buffer.")
+                   or "._replay_buffer." in key for key in state_dict.keys())
+
+    def _alf_prepare_checkpoint_save(self):
+        return self._set_replay_buffer_checkpoint_enabled(True)
+
+    def _alf_prepare_checkpoint_load(self, state_dict):
+        return self._set_replay_buffer_checkpoint_enabled(
+            self._has_replay_buffer_checkpoint(state_dict))
+
+    def _copy_state_prefix_if_missing(self, state_dict, prefix, source, target):
+        source_prefix = prefix + source + "."
+        target_prefix = prefix + target + "."
+        if any(key.startswith(target_prefix) for key in state_dict.keys()):
+            return
+        for key, value in list(state_dict.items()):
+            if key.startswith(source_prefix):
+                state_dict[target_prefix + key[len(source_prefix):]] = value
+
+    def _synthesize_v3_missing_network_state(self, state_dict, prefix):
+        self._copy_state_prefix_if_missing(
+            state_dict, prefix, "_actor_networks", "_reference_actor_networks")
+        self._copy_state_prefix_if_missing(
+            state_dict, prefix, "_critic_networks", "_snapshot_critic_networks")
+
+    def _save_to_state_dict(self, destination, prefix, visited=None):
+        super()._save_to_state_dict(destination, prefix, visited)
+        self._save_bafc_runtime_state(destination, prefix)
+
+    def _load_from_state_dict(self,
+                              state_dict,
+                              prefix,
+                              local_metadata,
+                              strict,
+                              missing_keys,
+                              unexpected_keys,
+                              error_msgs,
+                              visited=None):
+        self._synthesize_v3_missing_network_state(state_dict, prefix)
+        runtime_state = self._pop_bafc_runtime_state(state_dict, prefix)
+        legacy_actor_checkpoint = (
+            not runtime_state and self._has_legacy_actor_checkpoint(
+                state_dict, prefix))
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs, visited)
+        if runtime_state:
+            self._restore_bafc_runtime_state(runtime_state)
+        elif legacy_actor_checkpoint:
+            self._training_started = True
+            self._apply_train_mode_grad_flags()
 
     def _flatten_reweighting_observations(self, observation):
         if not isinstance(observation, torch.Tensor):

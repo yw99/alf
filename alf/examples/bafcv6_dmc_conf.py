@@ -86,6 +86,7 @@ alf.config(
     actor_eval_type='last_two',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,
+    checkpoint_replay_buffer=True,
     enable_critic_reweighting=True,
     critic_reweighting_beta=None,
     critic_reweighting_ridge=1e-4,

@@ -86,6 +86,8 @@ alf.config(
     actor_eval_type='last_two',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,
+    checkpoint_replay_buffer=True,
+    track_reweighting_target_observation_cache=True,
     actor_utd=1,
     critic_utd=3,
     # actor_encoder_optimizer=Adam(lr=4e-5),

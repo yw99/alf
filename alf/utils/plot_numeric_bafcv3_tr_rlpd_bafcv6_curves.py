@@ -54,7 +54,7 @@ except ModuleNotFoundError:
 DEFAULT_BASE_DIR = "/root/numeric_results"
 DEFAULT_ENV = "cheetah"
 DEFAULT_SEEDS = "1,2,3,4"
-DEFAULT_RLPD_CRITIC_UTD = 3
+DEFAULT_RLPD_CRITIC_UTD = 10
 DEFAULT_BAFCV6_CRITIC_UTDS = "2,3"
 
 RETURN_TAG = "Metrics_vs_EnvironmentSteps/AverageReturn"

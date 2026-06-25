@@ -382,7 +382,7 @@ class Trainer(object):
                 ps.print_callees()
 
                 logging.info(s.getvalue())
-            self._save_checkpoint()
+            self._save_checkpoint(sync_ddp=True)
             checkpoint_saved = True
         finally:
             if (self._config.confirm_checkpoint_upon_crash
@@ -392,7 +392,7 @@ class Trainer(object):
                 # is 0).
                 ans = input("Do you want to save checkpoint? (y/n): ")
                 if ans.lower().startswith('y'):
-                    self._save_checkpoint()
+                    self._save_checkpoint(sync_ddp=False)
             self._close()
 
     @staticmethod
@@ -516,12 +516,11 @@ class Trainer(object):
         self._evaluation_requested = True
         request.send_text("Evaluation requested")
 
-    def _save_checkpoint(self):
-        # Saving checkpoint is only enabled when running single process training
-        # (rank is -1) or master process of DDP training (rank is 0).
-        if self._rank <= 0:
-            global_step = alf.summary.get_global_counter()
-            self._checkpointer.save(global_step=global_step)
+    def _save_checkpoint(self, sync_ddp=True):
+        global_step = alf.summary.get_global_counter()
+        self._checkpointer.save(global_step=global_step, ddp_rank=self._rank)
+        if sync_ddp and self._rank >= 0:
+            torch.distributed.barrier()
 
     def _save_video_clip(self, name: str = "video_clip"):
         # Saving video clip is only enabled when running single process training
@@ -555,7 +554,7 @@ class Trainer(object):
             # train_iter() once before loading the checkpoint
             self._algorithm.train_iter()
         try:
-            recovered_global_step = checkpointer.load()
+            recovered_global_step = checkpointer.load(ddp_rank=self._rank)
             self._trainer_progress.update()
         except RuntimeError as e:
             raise RuntimeError(
@@ -841,11 +840,11 @@ class RLTrainer(Trainer):
             if ((self._num_iterations and iter_num >= time_to_checkpoint)
                     or (not self._num_iterations and self._num_env_steps
                         and total_time_steps >= time_to_checkpoint)):
-                self._save_checkpoint()
+                self._save_checkpoint(sync_ddp=True)
                 time_to_checkpoint += checkpoint_interval
             elif self._checkpoint_requested:
                 logging.info("Saving checkpoint upon request...")
-                self._save_checkpoint()
+                self._save_checkpoint(sync_ddp=False)
                 self._checkpoint_requested = False
 
             if self._video_clip_requested:
@@ -1037,11 +1036,11 @@ class SLTrainer(Trainer):
                 break
 
             if self._num_epochs and epoch_num >= time_to_checkpoint:
-                self._save_checkpoint()
+                self._save_checkpoint(sync_ddp=True)
                 time_to_checkpoint += checkpoint_interval
             elif self._checkpoint_requested:
                 logging.info("Saving checkpoint upon request...")
-                self._save_checkpoint()
+                self._save_checkpoint(sync_ddp=False)
                 self._checkpoint_requested = False
 
     def _restore_checkpoint(self):

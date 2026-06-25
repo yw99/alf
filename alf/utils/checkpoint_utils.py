@@ -50,6 +50,15 @@ def enable_checkpoint(module, flag=True):
     module._alf_checkpoint_enabled = flag
 
 
+def _is_replay_buffer_key(key):
+    return key.startswith('_replay_buffer.') or '._replay_buffer.' in key
+
+
+def _is_offline_replay_buffer_key(key):
+    return (key.startswith('_offline_replay_buffer.')
+            or '._offline_replay_buffer.' in key)
+
+
 def extract_sub_state_dict_from_checkpoint(checkpoint_prefix, checkpoint_path):
     """Extract a (sub-)state-dictionary from a checkpoint file. The state
     dictionary can be a sub-dictionary specified by the ``checkpoint_prefix``.
@@ -128,6 +137,54 @@ class Checkpointer(object):
 
         os.makedirs(self._ckpt_dir, exist_ok=True)
 
+    def _call_module_checkpoint_hooks(self, module, hook_name, *args):
+        callbacks = []
+        if type(module) == torch.nn.DataParallel:
+            module = module.module
+        modules = module.modules() if isinstance(module, nn.Module) else [module]
+        visited = set()
+        for sub_module in modules:
+            if id(sub_module) in visited:
+                continue
+            visited.add(id(sub_module))
+            hook = getattr(sub_module, hook_name, None)
+            if hook is None:
+                continue
+            callback = hook(*args)
+            if callback is not None:
+                callbacks.append(callback)
+        return callbacks
+
+    def _run_checkpoint_cleanup(self, callbacks):
+        for callback in reversed(callbacks):
+            callback()
+
+    def _load_replay_buffer_checkpoint(self, f_path, ddp_rank, map_location):
+        legacy_path = f_path + '-replay_buffer'
+        rank_path = None
+        if ddp_rank is not None and ddp_rank >= 0:
+            rank_path = f_path + f'-replay_buffer-rank{ddp_rank}'
+            if os.path.exists(rank_path):
+                return torch.load(rank_path, map_location=map_location)
+            if ddp_rank > 0:
+                logging.warning(
+                    "Replay buffer checkpoint %s is missing. Rank %s will "
+                    "resume without replay buffer state.", rank_path, ddp_rank)
+                return {k: {} for k in self._modules.keys()}
+
+        if os.path.exists(legacy_path):
+            return torch.load(legacy_path, map_location=map_location)
+
+        if rank_path is not None:
+            logging.warning(
+                "Replay buffer checkpoints %s and %s are missing. Resume "
+                "without replay buffer state.", rank_path, legacy_path)
+        else:
+            logging.warning(
+                "Replay buffer checkpoint %s is missing. Resume without replay "
+                "buffer state.", legacy_path)
+        return {k: {} for k in self._modules.keys()}
+
     @alf.configurable
     def load(self,
              global_step="latest",
@@ -135,7 +192,8 @@ class Checkpointer(object):
              including_optimizer=True,
              including_replay_buffer=True,
              including_data_transformers=True,
-             strict=True):
+             strict=True,
+             ddp_rank=None):
         """Load checkpoint
         Args:
             global_step (int|str): the number of training steps which is used to
@@ -159,6 +217,8 @@ class Checkpointer(object):
                 any of the lists is non-empty; if ``strict=False``, missing/unexpected
                 keys will be omitted and no error will be raised.
                 (Default: ``True``)
+            ddp_rank (None|int): if not None and >=0, load the replay buffer
+                sidecar for this DDP rank when it exists.
         Returns:
             current_step_num (int): the current step number for the loaded
                 checkpoint. current_step_num is set to - 1 if the specified
@@ -202,6 +262,8 @@ class Checkpointer(object):
                     checkpoint[k] = v
 
         def _load_one(module, checkpoint):
+            has_replay_buffer_checkpoint = any(
+                _is_replay_buffer_key(k) for k in checkpoint.keys())
             if isinstance(module, nn.Module):
                 missing_keys, unexpected_keys = module.load_state_dict(
                     checkpoint, strict=strict)
@@ -212,10 +274,9 @@ class Checkpointer(object):
             if not including_optimizer:
                 missing_keys = list(
                     filter(lambda k: k.find('_optimizers.') < 0, missing_keys))
-            if not including_replay_buffer:
+            if not including_replay_buffer or not has_replay_buffer_checkpoint:
                 missing_keys = list(
-                    filter(lambda k: not k.startswith('_replay_buffer.'),
-                           missing_keys))
+                    filter(lambda k: not _is_replay_buffer_key(k), missing_keys))
             if strict:
                 error_msgs = []
                 if len(unexpected_keys) > 0:
@@ -264,8 +325,8 @@ class Checkpointer(object):
                                         map_location=map_location)
             _merge_checkpoint(checkpoint, opt_checkpoint)
         if including_replay_buffer:
-            replay_buffer_checkpoint = torch.load(f_path + '-replay_buffer',
-                                                  map_location=map_location)
+            replay_buffer_checkpoint = self._load_replay_buffer_checkpoint(
+                f_path, ddp_rank, map_location)
             _merge_checkpoint(checkpoint, replay_buffer_checkpoint)
 
         self._global_step = checkpoint["global_step"]
@@ -282,7 +343,13 @@ class Checkpointer(object):
                         "or metrics different from the previous trining. "
                         "Error: %s" % e)
             else:
-                _load_one(self._modules[k], checkpoint[k])
+                callbacks = self._call_module_checkpoint_hooks(
+                    self._modules[k], "_alf_prepare_checkpoint_load",
+                    checkpoint[k])
+                try:
+                    _load_one(self._modules[k], checkpoint[k])
+                finally:
+                    self._run_checkpoint_cleanup(callbacks)
 
         logging.info(
             "Checkpoint 'ckpt-{}' is loaded successfully.".format(global_step))
@@ -330,14 +397,17 @@ class Checkpointer(object):
             if k.find('_optimizers.') >= 0 and isinstance(
                     v, dict) and 'param_groups' in v:
                 optimizer_state[k] = v
-            elif k.startswith('_replay_buffer.'):
+            elif _is_replay_buffer_key(k):
                 replay_buffer_state[k] = v
-            elif not k.startswith('_offline_replay_buffer.'):
+            elif not _is_offline_replay_buffer_key(k):
                 model_state[k] = v
 
         return model_state, optimizer_state, replay_buffer_state
 
-    def save(self, global_step, suffix: Optional[str] = None):
+    def save(self,
+             global_step,
+             suffix: Optional[str] = None,
+             ddp_rank: Optional[int] = None):
         """Save states of all modules to checkpoint
 
         Args:
@@ -346,16 +416,28 @@ class Checkpointer(object):
                 the checkpoint as a suffix.
             suffix (str): the suffix to be appended to the checkpoint file name.
                 If provided, it will be used as the suffix instead of ``global_step``.
+            ddp_rank (None|int): if not None and >=0, save the replay buffer
+                into a rank-specific sidecar. Only rank 0 saves model,
+                optimizer, and structure files.
         """
         suffix = suffix or str(global_step)
+        save_model_state = ddp_rank is None or ddp_rank <= 0
 
         f_path = os.path.join(self._ckpt_dir, f"ckpt-{suffix}")
-        state = {
-            k:
-                v.module.state_dict()
-                if type(v) == torch.nn.DataParallel else v.state_dict()
-            for k, v in self._modules.items()
-        }
+        callbacks = []
+        for v in self._modules.values():
+            callbacks.extend(
+                self._call_module_checkpoint_hooks(
+                    v, "_alf_prepare_checkpoint_save"))
+        try:
+            state = {
+                k:
+                    v.module.state_dict()
+                    if type(v) == torch.nn.DataParallel else v.state_dict()
+                for k, v in self._modules.items()
+            }
+        finally:
+            self._run_checkpoint_cleanup(callbacks)
         model_state = {}
         optimizer_state = {}
         replay_buffer_state = {}
@@ -367,11 +449,19 @@ class Checkpointer(object):
 
         model_state['global_step'] = torch.tensor(global_step)
 
-        torch.save(model_state, f_path)
-        torch.save(optimizer_state, f_path + '-optimizer')
-        torch.save(replay_buffer_state, f_path + '-replay_buffer')
+        if save_model_state:
+            torch.save(model_state, f_path)
+            torch.save(optimizer_state, f_path + '-optimizer')
 
-        if self._global_step == -1:
+        if ddp_rank is not None and ddp_rank >= 0:
+            torch.save(replay_buffer_state,
+                       f_path + f'-replay_buffer-rank{ddp_rank}')
+            if ddp_rank == 0:
+                torch.save(replay_buffer_state, f_path + '-replay_buffer')
+        else:
+            torch.save(replay_buffer_state, f_path + '-replay_buffer')
+
+        if save_model_state and self._global_step == -1:
             # we only need to save the checkpoint structure once.``global_step``
             # is initialized as -1, therefore we can use it for this purpose.
 

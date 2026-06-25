@@ -438,6 +438,147 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._snapshot_critic_networks.load_state_dict(
             self._critic_networks.state_dict())
 
+    def _bafc_runtime_key(self, prefix, name):
+        return prefix + "_bafc_runtime." + name
+
+    def _bafc_scalar_tensor(self, value, dtype=torch.int64):
+        if isinstance(value, torch.Tensor):
+            return value.detach().reshape(()).to(dtype=dtype).clone()
+        return torch.tensor(value, dtype=dtype)
+
+    def _bafc_runtime_tensor(self, value):
+        return torch.as_tensor(value).detach().clone()
+
+    def _bafc_scalar_int(self, value):
+        return int(torch.as_tensor(value).reshape(()).item())
+
+    def _save_bafc_runtime_state(self, destination, prefix):
+        scalar_fields = dict(
+            training_started=(self._training_started, torch.bool),
+            train_mode=(self._train_mode.value, torch.int64),
+            rollout_actor_id=(self._rollout_actor_id, torch.int64),
+            actor_update_counter=(self._actor_update_counter, torch.int64),
+            critic_update_counter=(self._critic_update_counter, torch.int64),
+            completed_cycles_since_rollout=(
+                self._completed_cycles_since_rollout, torch.int64),
+            real_rollouts_since_reference_sync=(
+                self._real_rollouts_since_reference_sync, torch.int64),
+            trust_metric_update_counter=(
+                self._trust_metric_update_counter, torch.int64),
+            eval_gate_consecutive_rollout_skips=(
+                self._eval_gate_consecutive_rollout_skips, torch.int64),
+            rollout_skip_due_eval_gate_count=(
+                self._rollout_skip_due_eval_gate_count, torch.int64),
+            rollout_opportunity_count=(
+                self._rollout_opportunity_count, torch.int64),
+            grad_gate_actor_extension_count=(
+                self._grad_gate_actor_extension_count, torch.int64),
+            grad_gate_consecutive_actor_extensions=(
+                self._grad_gate_consecutive_actor_extensions, torch.int64))
+        for name, (value, dtype) in scalar_fields.items():
+            destination[self._bafc_runtime_key(
+                prefix, name)] = self._bafc_scalar_tensor(value, dtype=dtype)
+        destination[self._bafc_runtime_key(
+            prefix, "last_eval_trust")] = self._bafc_runtime_tensor(
+                self._last_eval_trust)
+        destination[self._bafc_runtime_key(
+            prefix, "last_grad_trust")] = self._bafc_runtime_tensor(
+                self._last_grad_trust)
+        if isinstance(self._target_metric_observation_cache, torch.Tensor):
+            destination[self._bafc_runtime_key(
+                prefix, "target_metric_observation_cache")] = (
+                    self._target_metric_observation_cache.detach().clone())
+
+    def _pop_bafc_runtime_state(self, state_dict, prefix):
+        runtime_prefix = self._bafc_runtime_key(prefix, "")
+        runtime_state = {}
+        for key in list(state_dict.keys()):
+            if key.startswith(runtime_prefix):
+                runtime_state[key[len(runtime_prefix):]] = state_dict.pop(key)
+        return runtime_state
+
+    def _has_legacy_actor_checkpoint(self, state_dict, prefix):
+        return any(key.startswith(prefix + "_actor_networks.")
+                   for key in state_dict.keys())
+
+    def _restore_bafc_runtime_state(self, runtime_state):
+        if "training_started" in runtime_state:
+            self._training_started = bool(
+                torch.as_tensor(
+                    runtime_state["training_started"]).reshape(()).item())
+        if "train_mode" in runtime_state:
+            self._train_mode = TrainMode(
+                self._bafc_scalar_int(runtime_state["train_mode"]))
+        int_fields = (
+            "rollout_actor_id", "actor_update_counter",
+            "critic_update_counter", "completed_cycles_since_rollout",
+            "real_rollouts_since_reference_sync",
+            "trust_metric_update_counter",
+            "eval_gate_consecutive_rollout_skips",
+            "rollout_skip_due_eval_gate_count",
+            "rollout_opportunity_count", "grad_gate_actor_extension_count",
+            "grad_gate_consecutive_actor_extensions")
+        for name in int_fields:
+            if name in runtime_state:
+                setattr(self, "_" + name,
+                        self._bafc_scalar_int(runtime_state[name]))
+        if "last_eval_trust" in runtime_state:
+            self._last_eval_trust = self._bafc_runtime_tensor(
+                runtime_state["last_eval_trust"])
+        if "last_grad_trust" in runtime_state:
+            self._last_grad_trust = self._bafc_runtime_tensor(
+                runtime_state["last_grad_trust"])
+        if "target_metric_observation_cache" in runtime_state:
+            self._target_metric_observation_cache = self._bafc_runtime_tensor(
+                runtime_state["target_metric_observation_cache"])
+        self._apply_train_mode_grad_flags()
+
+    def _set_actor_eval_samples_requires_grad(self, requires_grad):
+        if self._freeze_eval_samples:
+            if hasattr(self._actor_eval_samples, "requires_grad_"):
+                self._actor_eval_samples.requires_grad_(False)
+        else:
+            self._actor_eval_samples.requires_grad_(requires_grad)
+
+    def _apply_train_mode_grad_flags(self):
+        standard_or_initial = (
+            self._train_mode == TrainMode.standard or
+            (self._actor_update_counter == 0
+             and self._critic_update_counter == 0))
+        actor_requires_grad = (standard_or_initial
+                               or self._train_mode == TrainMode.actor)
+        eval_samples_requires_grad = (
+            standard_or_initial or self._train_mode == TrainMode.critic)
+        for p in self._actor_networks.parameters():
+            p.requires_grad_(actor_requires_grad)
+        self._set_actor_eval_samples_requires_grad(eval_samples_requires_grad)
+
+    def _save_to_state_dict(self, destination, prefix, visited=None):
+        super()._save_to_state_dict(destination, prefix, visited)
+        self._save_bafc_runtime_state(destination, prefix)
+
+    def _load_from_state_dict(self,
+                              state_dict,
+                              prefix,
+                              local_metadata,
+                              strict,
+                              missing_keys,
+                              unexpected_keys,
+                              error_msgs,
+                              visited=None):
+        runtime_state = self._pop_bafc_runtime_state(state_dict, prefix)
+        legacy_actor_checkpoint = (
+            not runtime_state and self._has_legacy_actor_checkpoint(
+                state_dict, prefix))
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs, visited)
+        if runtime_state:
+            self._restore_bafc_runtime_state(runtime_state)
+        elif legacy_actor_checkpoint:
+            self._training_started = True
+            self._apply_train_mode_grad_flags()
+
     def _record_debug_scalar(self, name: str, value):
         if not (self._debug_summaries and alf.summary.should_record_summaries()):
             return

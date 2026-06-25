@@ -30,6 +30,7 @@ from alf.algorithms.rl_algorithm import RLAlgorithm
 from alf.data_structures import AlgStep, Experience
 from alf.data_structures import TimeStep, namedtuple
 from alf.tensor_specs import TensorSpec
+from alf.utils import checkpoint_utils
 AgentState = namedtuple("AgentState",
                         ["rl", "irm", "goal_generator", "repr", "rw"],
                         default_value=())
@@ -241,6 +242,39 @@ class Agent(RLAlgorithm):
                             "set_policy_boundary_eval_state", None)
         if set_state is not None:
             set_state(state)
+
+    def _rl_algorithm_checkpoints_replay_buffer(self):
+        enabled = getattr(self._rl_algorithm,
+                          "checkpoint_replay_buffer_enabled", None)
+        if enabled is not None:
+            return bool(enabled())
+        return bool(getattr(self._rl_algorithm, "_checkpoint_replay_buffer",
+                            False))
+
+    def _set_replay_buffer_checkpoint_enabled(self, enabled):
+        if (not self._rl_algorithm_checkpoints_replay_buffer()
+                or self._replay_buffer is None):
+            return None
+        old_enabled = checkpoint_utils.is_checkpoint_enabled(
+            self._replay_buffer)
+        checkpoint_utils.enable_checkpoint(self._replay_buffer, enabled)
+
+        def _restore():
+            checkpoint_utils.enable_checkpoint(self._replay_buffer,
+                                               old_enabled)
+
+        return _restore
+
+    def _has_root_replay_buffer_checkpoint(self, state_dict):
+        return any(key.startswith("_replay_buffer.")
+                   for key in state_dict.keys())
+
+    def _alf_prepare_checkpoint_save(self):
+        return self._set_replay_buffer_checkpoint_enabled(True)
+
+    def _alf_prepare_checkpoint_load(self, state_dict):
+        return self._set_replay_buffer_checkpoint_enabled(
+            self._has_root_replay_buffer_checkpoint(state_dict))
 
     def _maybe_emit_policy_eval_events(self):
         if self._rollout_skip_eval_callback is None:

@@ -533,6 +533,66 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self._assert_state_dict_equal(alg._reference_actor_networks,
                                       self._clone_state_dict(alg._actor_networks))
 
+    def _without_runtime_state(self, state_dict):
+        state_dict = state_dict.copy()
+        for key in list(state_dict.keys()):
+            if "_bafc_runtime." in key:
+                del state_dict[key]
+        return state_dict
+
+    def test_runtime_checkpoint_round_trip_and_legacy_fallback(self):
+        alg = self._make_alg()
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._rollout_actor_id = torch.tensor(2)
+        alg._actor_update_counter = 5
+        alg._critic_update_counter = 7
+        alg._completed_cycles_since_rollout = 3
+        alg._real_rollouts_since_reference_sync = 4
+        alg._last_eval_trust = torch.tensor(0.25)
+        alg._last_grad_trust = torch.tensor(0.5)
+        alg._trust_metric_update_counter = 6
+        alg._eval_gate_consecutive_rollout_skips = 2
+        alg._rollout_skip_due_eval_gate_count = 8
+        alg._rollout_opportunity_count = 9
+        alg._grad_gate_actor_extension_count = 10
+        alg._grad_gate_consecutive_actor_extensions = 11
+        alg._target_metric_observation_cache = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        alg._apply_train_mode_grad_flags()
+
+        state = alg.state_dict()
+        self.assertIn("_bafc_runtime.training_started", state)
+        self.assertIn("_bafc_runtime.target_metric_observation_cache", state)
+
+        restored = self._make_alg()
+        restored.load_state_dict(state)
+
+        self.assertTrue(restored._training_started)
+        self.assertEqual(restored._train_mode, TrainMode.critic)
+        self.assertEqual(restored._rollout_actor_id, 2)
+        self.assertEqual(restored._actor_update_counter, 5)
+        self.assertEqual(restored._critic_update_counter, 7)
+        self.assertEqual(restored._completed_cycles_since_rollout, 3)
+        self.assertEqual(restored._real_rollouts_since_reference_sync, 4)
+        self.assertTensorClose(restored._last_eval_trust, torch.tensor(0.25))
+        self.assertTensorClose(restored._last_grad_trust, torch.tensor(0.5))
+        self.assertEqual(restored._trust_metric_update_counter, 6)
+        self.assertEqual(restored._eval_gate_consecutive_rollout_skips, 2)
+        self.assertEqual(restored._rollout_skip_due_eval_gate_count, 8)
+        self.assertEqual(restored._rollout_opportunity_count, 9)
+        self.assertEqual(restored._grad_gate_actor_extension_count, 10)
+        self.assertEqual(restored._grad_gate_consecutive_actor_extensions, 11)
+        self.assertTensorClose(restored._target_metric_observation_cache,
+                               torch.arange(12, dtype=torch.float32).reshape(3, 4))
+        self.assertTrue(all(not p.requires_grad
+                            for p in restored._actor_networks.parameters()))
+        self.assertTrue(restored._actor_eval_samples.requires_grad)
+
+        legacy_restored = self._make_alg()
+        legacy_restored.load_state_dict(self._without_runtime_state(state))
+        self.assertTrue(legacy_restored._training_started)
+
+
 
 if __name__ == "__main__":
     alf.test.main()

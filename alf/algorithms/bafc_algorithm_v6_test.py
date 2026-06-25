@@ -20,6 +20,8 @@ from unittest import mock
 import torch
 
 import alf
+from alf.algorithms.agent import Agent
+from alf.algorithms.bafc_algorithm_v3 import BafcAlgorithmV3
 from alf.algorithms.bafc_algorithm_v6 import (BafcActorInfo,
                                               BafcAlgorithmV6,
                                               BafcCriticInfo,
@@ -28,9 +30,10 @@ from alf.algorithms.bafc_algorithm_v6 import (BafcActorInfo,
 from alf.algorithms.config import TrainerConfig
 from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import LossInfo, StepType, TimeStep
-from alf.experience_replayers.replay_buffer import BatchInfo
+from alf.experience_replayers.replay_buffer import BatchInfo, ReplayBuffer
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
+from alf.utils.checkpoint_utils import Checkpointer
 
 
 class _DummyProcess:
@@ -90,6 +93,88 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
             num_actor_critic=3,
             num_actor_eval_samples=16,
             **kwargs)
+
+    def _make_v3_alg(self, **kwargs):
+        config = TrainerConfig(
+            root_dir=tempfile.mkdtemp(prefix="bafc_v3_for_v6_test_"),
+            unroll_length=2,
+            mini_batch_length=2,
+            mini_batch_size=4,
+            initial_collect_steps=0,
+            num_updates_per_train_iter=3)
+        return BafcAlgorithmV3(
+            observation_spec=TensorSpec((4, )),
+            action_spec=BoundedTensorSpec((2, ), minimum=-1.0, maximum=1.0),
+            config=config,
+            actor_network_cls=partial(ActorFCNetwork, fc_layer_params=(32, 32)),
+            critic_network_cls=partial(
+                FuncCriticNetwork,
+                obs_action_joint_fc_layer_params=(32, 32),
+                actor_obs_action_joint_fc_layer_params=(32, 32)),
+            actor_encoder_cls=partial(
+                TransformerEncoder, num_layers=2, num_attention_heads=1),
+            num_actor_critic=3,
+            num_actor_eval_samples=16,
+            **kwargs)
+
+    def _make_agent(self, rl_algorithm_cls, **kwargs):
+        config = TrainerConfig(
+            root_dir=tempfile.mkdtemp(prefix="bafc_agent_v6_test_"),
+            unroll_length=2,
+            mini_batch_length=2,
+            mini_batch_size=4,
+            initial_collect_steps=0,
+            num_updates_per_train_iter=3)
+        return Agent(
+            observation_spec=TensorSpec((4, )),
+            action_spec=BoundedTensorSpec((2, ), minimum=-1.0, maximum=1.0),
+            config=config,
+            rl_algorithm_cls=partial(
+                rl_algorithm_cls,
+                actor_network_cls=partial(
+                    ActorFCNetwork, fc_layer_params=(32, 32)),
+                critic_network_cls=partial(
+                    FuncCriticNetwork,
+                    obs_action_joint_fc_layer_params=(32, 32),
+                    actor_obs_action_joint_fc_layer_params=(32, 32)),
+                actor_encoder_cls=partial(
+                    TransformerEncoder, num_layers=2, num_attention_heads=1),
+                num_actor_critic=3,
+                num_actor_eval_samples=16,
+                **kwargs))
+
+    def _assert_module_state_equal(self, left, right):
+        left_state = left.state_dict()
+        right_state = right.state_dict()
+        self.assertEqual(set(left_state.keys()), set(right_state.keys()))
+        for key, left_value in left_state.items():
+            self.assertTrue(
+                torch.equal(left_value.cpu(), right_state[key].cpu()),
+                msg=key)
+
+    def _attach_replay_buffer(self, alg, num_items=0):
+        replay_buffer = ReplayBuffer(
+            data_spec=TimeStep(
+                step_type=TensorSpec((), dtype=torch.int64),
+                reward=TensorSpec(()),
+                discount=TensorSpec(()),
+                observation=TensorSpec((4, )),
+                prev_action=TensorSpec((2, )),
+                env_id=TensorSpec((), dtype=torch.int64)),
+            num_environments=1,
+            max_length=8)
+        for value in range(num_items):
+            replay_buffer.add_batch(
+                TimeStep(
+                    step_type=torch.tensor([StepType.MID], dtype=torch.int64),
+                    reward=torch.tensor([float(value)], dtype=torch.float32),
+                    discount=torch.ones(1),
+                    observation=torch.full((1, 4), float(value)),
+                    prev_action=torch.zeros(1, 2),
+                    env_id=torch.tensor([0], dtype=torch.int64)),
+                env_ids=torch.tensor([0]))
+        alg._replay_buffer = replay_buffer
+        return replay_buffer
 
     def _make_rollout_time_step(self, observation):
         batch_size = observation.shape[0]
@@ -642,6 +727,136 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
         ])
         self.assertTensorClose(alg._reweighting_target_observation_cache,
                                expected)
+
+    def _without_runtime_state(self, state_dict):
+        state_dict = state_dict.copy()
+        for key in list(state_dict.keys()):
+            if "_bafc_runtime." in key:
+                del state_dict[key]
+        return state_dict
+
+    def test_runtime_checkpoint_round_trip_and_legacy_fallback(self):
+        alg = self._make_alg()
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._rollout_actor_id = torch.tensor(2)
+        alg._actor_update_counter = 5
+        alg._critic_update_counter = 7
+        alg._reweighting_target_observation_cache = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        alg._apply_train_mode_grad_flags()
+
+        state = alg.state_dict()
+        self.assertIn("_bafc_runtime.training_started", state)
+        self.assertIn("_bafc_runtime.reweighting_target_observation_cache",
+                      state)
+
+        restored = self._make_alg()
+        restored.load_state_dict(state)
+
+        self.assertTrue(restored._training_started)
+        self.assertEqual(restored._train_mode, TrainMode.critic)
+        self.assertEqual(restored._rollout_actor_id, 2)
+        self.assertEqual(restored._actor_update_counter, 5)
+        self.assertEqual(restored._critic_update_counter, 7)
+        self.assertTensorClose(restored._reweighting_target_observation_cache,
+                               torch.arange(12, dtype=torch.float32).reshape(3, 4))
+        self.assertTrue(all(not p.requires_grad
+                            for p in restored._actor_networks.parameters()))
+        self.assertTrue(restored._actor_eval_samples.requires_grad)
+
+        legacy_restored = self._make_alg()
+        legacy_restored.load_state_dict(self._without_runtime_state(state))
+        self.assertTrue(legacy_restored._training_started)
+
+    def test_load_v3_checkpoint_state_strictly(self):
+        v3_alg = self._make_v3_alg(
+            track_reweighting_target_observation_cache=True)
+        v3_alg._training_started = True
+        v3_alg._train_mode = TrainMode.actor
+        v3_alg._rollout_actor_id = 1
+        v3_alg._actor_update_counter = 2
+        v3_alg._critic_update_counter = 3
+        cache = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        v3_alg._reweighting_target_observation_cache = cache
+        v3_state = v3_alg.state_dict()
+
+        self.assertFalse(
+            any(key.startswith("_reference_actor_networks.")
+                for key in v3_state.keys()))
+        self.assertFalse(
+            any(key.startswith("_snapshot_critic_networks.")
+                for key in v3_state.keys()))
+        self.assertIn("_bafc_runtime.reweighting_target_observation_cache",
+                      v3_state)
+
+        v6_alg = self._make_alg()
+        v6_alg.load_state_dict(v3_state, strict=True)
+
+        self.assertTrue(v6_alg._training_started)
+        self.assertEqual(v6_alg._train_mode, TrainMode.actor)
+        self.assertEqual(v6_alg._rollout_actor_id, 1)
+        self.assertEqual(v6_alg._actor_update_counter, 2)
+        self.assertEqual(v6_alg._critic_update_counter, 3)
+        self.assertTensorClose(v6_alg._reweighting_target_observation_cache,
+                               cache)
+        self._assert_module_state_equal(v6_alg._reference_actor_networks,
+                                        v6_alg._actor_networks)
+        self._assert_module_state_equal(v6_alg._snapshot_critic_networks,
+                                        v6_alg._critic_networks)
+
+    def test_checkpointer_loads_v3_agent_checkpoint_with_rank_replay_into_v6(self):
+        cache = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        v3_agent = self._make_agent(
+            BafcAlgorithmV3,
+            checkpoint_replay_buffer=True,
+            track_reweighting_target_observation_cache=True)
+        v3_alg = v3_agent._rl_algorithm
+        v3_alg._training_started = True
+        v3_alg._train_mode = TrainMode.actor
+        v3_alg._rollout_actor_id = 1
+        v3_alg._actor_update_counter = 2
+        v3_alg._critic_update_counter = 3
+        v3_alg._reweighting_target_observation_cache = cache
+        self._attach_replay_buffer(v3_agent, num_items=2)
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            v3_checkpointer = Checkpointer(ckpt_dir, algorithm=v3_agent)
+            v3_checkpointer.save(123, ddp_rank=0)
+            rank0_replay = torch.load(
+                f"{ckpt_dir}/ckpt-123-replay_buffer-rank0")["algorithm"]
+            self.assertTrue(
+                any(key.startswith("_replay_buffer.")
+                    for key in rank0_replay.keys()))
+
+            self._attach_replay_buffer(v3_agent, num_items=5)
+            v3_checkpointer.save(123, ddp_rank=1)
+
+            v6_agent = self._make_agent(
+                BafcAlgorithmV6, checkpoint_replay_buffer=True)
+            self._attach_replay_buffer(v6_agent, num_items=0)
+            self.assertFalse(
+                any("_replay_buffer." in key
+                    for key in v6_agent.state_dict().keys()))
+            v6_checkpointer = Checkpointer(ckpt_dir, algorithm=v6_agent)
+            self.assertEqual(v6_checkpointer.load(123, ddp_rank=1), 123)
+
+        v6_alg = v6_agent._rl_algorithm
+        self.assertTrue(v6_alg._training_started)
+        self.assertEqual(v6_alg._train_mode, TrainMode.actor)
+        self.assertEqual(v6_alg._rollout_actor_id, 1)
+        self.assertEqual(v6_alg._actor_update_counter, 2)
+        self.assertEqual(v6_alg._critic_update_counter, 3)
+        self.assertTensorClose(v6_alg._reweighting_target_observation_cache,
+                               cache)
+        self.assertTensorEqual(v6_agent._replay_buffer._current_pos,
+                               torch.tensor([5]))
+        self.assertFalse(
+            any("_replay_buffer." in key
+                for key in v6_agent.state_dict().keys()))
+        self._assert_module_state_equal(v6_alg._reference_actor_networks,
+                                        v6_alg._actor_networks)
+        self._assert_module_state_equal(v6_alg._snapshot_critic_networks,
+                                        v6_alg._critic_networks)
 
 
 if __name__ == "__main__":
