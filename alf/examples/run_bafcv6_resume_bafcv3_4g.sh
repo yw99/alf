@@ -1,9 +1,10 @@
 #!/bin/bash
 # Launcher for BAFCv6 runs resumed from BAFCv3 4-GPU checkpoints.
 # It stages the selected BAFCv3 checkpoint into each BAFCv6 run directory,
-# then launches all requested jobs in parallel.
+# then launches all requested jobs for one selected environment in parallel.
 #
 # Usage: bash run_bafcv6_resume_bafcv3_4g.sh [options]
+#   Set ENV_DIR=hopper|cheetah to select the environment (default: hopper)
 #   -d, --dir BASE_DIR              Base results directory (default: /root/numeric_results)
 #   -n, --steps NUM_STEPS           Total environment steps (default: 600000)
 #       --checkpoint-env-step N     BAFCv3 checkpoint suffix to stage (default: CHECKPOINT_ENV_STEP or 50050)
@@ -14,13 +15,14 @@
 #       --feature-dim N             Reweighting feature dimension (default: 32)
 #       --checkpoints N             Number of checkpoints (default: 10)
 #       --base-port N               First DDP master port (default: BASE_PORT or 29500)
-#       --hopper-seeds CSV          Hopper seeds (default: HOPPER_SEEDS or 0,1,2,3)
-#       --cheetah-seeds CSV         Cheetah seeds (default: CHEETAH_SEEDS or 1,2,3,4)
+#       --hopper-seeds CSV          Hopper seeds used with ENV_DIR=hopper (default: HOPPER_SEEDS or 0,1,2,3)
+#       --cheetah-seeds CSV         Cheetah seeds used with ENV_DIR=cheetah (default: CHEETAH_SEEDS or 1,2,3,4)
 #       --dry-run                   Validate and print planned jobs without staging or launching
 #   -h, --help                      Show this help message
 #
 # Examples:
 #   bash run_bafcv6_resume_bafcv3_4g.sh --dry-run
+#   ENV_DIR=cheetah bash run_bafcv6_resume_bafcv3_4g.sh --dry-run
 #   bash run_bafcv6_resume_bafcv3_4g.sh --v3-critic-utd 2 --v6-critic-utd 3 --dry-run
 #   V3_CRITIC_UTD=3 V6_CRITIC_UTD=2 bash run_bafcv6_resume_bafcv3_4g.sh --dry-run
 
@@ -32,9 +34,10 @@ CONF_FILE="${SCRIPT_DIR}/bafcv6_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 BASE_DIR="${BASE_DIR:-/root/numeric_results}"
+ENV_DIR="${ENV_DIR:-hopper}"
 NUM_ENV_STEPS="${NUM_ENV_STEPS:-600000}"
 NUM_CHECKPOINTS="${NUM_CHECKPOINTS:-10}"
-CHECKPOINT_ENV_STEP="${CHECKPOINT_ENV_STEP:-50050}"
+CHECKPOINT_ENV_STEP="${CHECKPOINT_ENV_STEP:-75075}"
 DEFAULT_V3_CRITIC_UTD="${V3_CRITIC_UTD:-3}"
 DEFAULT_V6_CRITIC_UTD="${V6_CRITIC_UTD:-2}"
 V3_CRITIC_UTD="${V3_CRITIC_UTD:-${DEFAULT_V3_CRITIC_UTD}}"
@@ -274,15 +277,32 @@ if [[ "${DRY_RUN}" == false && ! -x "${PYTHON_BIN}" ]]; then
     exit 1
 fi
 
+ENV_NAME="$(env_name_for_dir "${ENV_DIR}")"
+parse_csv_array "$(seed_csv_for_env "${ENV_DIR}")" SEEDS
+if [[ "${V3_CRITIC_UTD}" == "${V6_CRITIC_UTD}" ]]; then
+    ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv6_resume_bafcv3_ckpt${CHECKPOINT_ENV_STEP}_4g"
+else
+    ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv6_resume_bafcv3_critic_utd${V3_CRITIC_UTD}_ckpt${CHECKPOINT_ENV_STEP}_4g"
+fi
+
+if [[ ${#SEEDS[@]} -eq 0 ]]; then
+    echo "No seeds configured for ${ENV_DIR}." >&2
+    exit 1
+fi
+
 cat <<EOF
 Starting BAFCv6 resume sweep from BAFCv3
   Config: ${CONF_FILE}
+  Environment: ${ENV_NAME}
+  Environment dir: ${ENV_DIR}
   Base dir: ${BASE_DIR}
+  Root dir: ${ROOT_DIR}
   Source checkpoint: ckpt-${CHECKPOINT_ENV_STEP}
   Num env steps target: ${NUM_ENV_STEPS}
   Num checkpoints: ${NUM_CHECKPOINTS}
   v3 critic_utd source: ${V3_CRITIC_UTD}
   v6 critic_utd target: ${V6_CRITIC_UTD}
+  Seeds: ${SEEDS[*]}
   GPUs: ${GPUS}
   DDP ranks expected: ${#GPU_IDS[@]}
   Base port: ${BASE_PORT}
@@ -300,85 +320,64 @@ cd "${REPO_ROOT}"
 
 PIDS=()
 JOB_INDEX=0
-ENV_DIRS=(hopper cheetah)
 
-for env_dir in "${ENV_DIRS[@]}"; do
-    ENV_NAME="$(env_name_for_dir "${env_dir}")"
-    parse_csv_array "$(seed_csv_for_env "${env_dir}")" SEEDS
-    if [[ "${V3_CRITIC_UTD}" == "${V6_CRITIC_UTD}" ]]; then
-        ROOT_DIR="${BASE_DIR}/${env_dir}/bafcv6_resume_bafcv3_ckpt${CHECKPOINT_ENV_STEP}_4g"
-    else
-        ROOT_DIR="${BASE_DIR}/${env_dir}/bafcv6_resume_bafcv3_critic_utd${V3_CRITIC_UTD}_ckpt${CHECKPOINT_ENV_STEP}_4g"
-    fi
+for i in "${!SEEDS[@]}"; do
+    SEED="${SEEDS[$i]}"
+    MASTER_PORT=$((BASE_PORT + JOB_INDEX))
+    SOURCE_CKPT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_dmc_4g/critic_utd${V3_CRITIC_UTD}/seed_${SEED}/train/algorithm"
+    RUN_DIR="${ROOT_DIR}/critic_utd${V6_CRITIC_UTD}/seed_${SEED}"
+    DST_CKPT_DIR="${RUN_DIR}/train/algorithm"
+    OUT_LOG="${RUN_DIR}/out.log"
 
-    if [[ ${#SEEDS[@]} -eq 0 ]]; then
-        echo "No seeds configured for ${env_dir}." >&2
+    validate_source_bundle "${SOURCE_CKPT_DIR}" \
+        "${CHECKPOINT_ENV_STEP}" "${#GPU_IDS[@]}"
+    if [[ -d "${DST_CKPT_DIR}" ]] && has_model_checkpoint "${DST_CKPT_DIR}"; then
+        echo "Destination already has a checkpoint: ${DST_CKPT_DIR}" >&2
+        echo "Move or remove it before starting a fresh resume." >&2
         exit 1
     fi
 
-    echo "Environment: ${ENV_NAME}"
-    echo "  Seeds: ${SEEDS[*]}"
-    echo "  Root dir: ${ROOT_DIR}"
-
-    for i in "${!SEEDS[@]}"; do
-        SEED="${SEEDS[$i]}"
-        MASTER_PORT=$((BASE_PORT + JOB_INDEX))
-        SOURCE_CKPT_DIR="${BASE_DIR}/${env_dir}/bafcv3_dmc_4g/critic_utd${V3_CRITIC_UTD}/seed_${SEED}/train/algorithm"
-        RUN_DIR="${ROOT_DIR}/critic_utd${V6_CRITIC_UTD}/seed_${SEED}"
-        DST_CKPT_DIR="${RUN_DIR}/train/algorithm"
-        OUT_LOG="${RUN_DIR}/out.log"
-
-        validate_source_bundle "${SOURCE_CKPT_DIR}" \
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo "  Plan job ${JOB_INDEX}: ${ENV_DIR} v3_critic_utd=${V3_CRITIC_UTD} v6_critic_utd=${V6_CRITIC_UTD} seed=${SEED}"
+        echo "    Source: ${SOURCE_CKPT_DIR}/ckpt-${CHECKPOINT_ENV_STEP}"
+        echo "    Destination: ${RUN_DIR}"
+        echo "    Port: ${MASTER_PORT}"
+    else
+        mkdir -p "${RUN_DIR}"
+        stage_checkpoint "${SOURCE_CKPT_DIR}" "${DST_CKPT_DIR}" \
             "${CHECKPOINT_ENV_STEP}" "${#GPU_IDS[@]}"
-        if [[ -d "${DST_CKPT_DIR}" ]] && has_model_checkpoint "${DST_CKPT_DIR}"; then
-            echo "Destination already has a checkpoint: ${DST_CKPT_DIR}" >&2
-            echo "Move or remove it before starting a fresh resume." >&2
-            exit 1
-        fi
 
-        if [[ "${DRY_RUN}" == true ]]; then
-            echo "  Plan job ${JOB_INDEX}: ${env_dir} v3_critic_utd=${V3_CRITIC_UTD} v6_critic_utd=${V6_CRITIC_UTD} seed=${SEED}"
-            echo "    Source: ${SOURCE_CKPT_DIR}/ckpt-${CHECKPOINT_ENV_STEP}"
-            echo "    Destination: ${RUN_DIR}"
-            echo "    Port: ${MASTER_PORT}"
-        else
-            mkdir -p "${RUN_DIR}"
-            stage_checkpoint "${SOURCE_CKPT_DIR}" "${DST_CKPT_DIR}" \
-                "${CHECKPOINT_ENV_STEP}" "${#GPU_IDS[@]}"
+        CUDA_VISIBLE_DEVICES="${GPUS}" MASTER_PORT="${MASTER_PORT}" \
+            "${PYTHON_BIN}" -m alf.bin.train \
+            --conf "${CONF_FILE}" \
+            --root_dir "${RUN_DIR}" \
+            --conf_param "TrainerConfig.random_seed=${SEED}" \
+            --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
+            --conf_param "TrainerConfig.num_checkpoints=${NUM_CHECKPOINTS}" \
+            --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
+            --conf_param "BafcAlgorithmV6.critic_utd=${V6_CRITIC_UTD}" \
+            --conf_param "BafcAlgorithmV6.enable_critic_reweighting=True" \
+            --conf_param "BafcAlgorithmV6.critic_reweighting_solver_iters=${LBFGS_STEPS}" \
+            --conf_param "BafcAlgorithmV6.critic_reweighting_num_feature_coords=${REWEIGHTING_FEATURE_DIMENSION}" \
+            --conf_param "create_environment.env_name='${ENV_NAME}'" \
+            --distributed multi-gpu \
+            > "${OUT_LOG}" 2>&1 &
 
-            CUDA_VISIBLE_DEVICES="${GPUS}" MASTER_PORT="${MASTER_PORT}" \
-                "${PYTHON_BIN}" -m alf.bin.train \
-                --conf "${CONF_FILE}" \
-                --root_dir "${RUN_DIR}" \
-                --conf_param "TrainerConfig.random_seed=${SEED}" \
-                --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False" \
-                --conf_param "TrainerConfig.num_checkpoints=${NUM_CHECKPOINTS}" \
-                --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}" \
-                --conf_param "BafcAlgorithmV6.critic_utd=${V6_CRITIC_UTD}" \
-                --conf_param "BafcAlgorithmV6.enable_critic_reweighting=True" \
-                --conf_param "BafcAlgorithmV6.critic_reweighting_solver_iters=${LBFGS_STEPS}" \
-                --conf_param "BafcAlgorithmV6.critic_reweighting_num_feature_coords=${REWEIGHTING_FEATURE_DIMENSION}" \
-                --conf_param "create_environment.env_name='${ENV_NAME}'" \
-                --distributed multi-gpu \
-                > "${OUT_LOG}" 2>&1 &
+        PID=$!
+        PIDS+=("${PID}")
+        echo "  Launched job ${JOB_INDEX}: ${ENV_DIR} v3_critic_utd=${V3_CRITIC_UTD} v6_critic_utd=${V6_CRITIC_UTD} seed=${SEED}"
+        echo "    Source: ${SOURCE_CKPT_DIR}/ckpt-${CHECKPOINT_ENV_STEP}"
+        echo "    Log: ${OUT_LOG}"
+        echo "    Port: ${MASTER_PORT}, PID: ${PID}"
+    fi
 
-            PID=$!
-            PIDS+=("${PID}")
-            echo "  Launched job ${JOB_INDEX}: v3_critic_utd=${V3_CRITIC_UTD} v6_critic_utd=${V6_CRITIC_UTD} seed=${SEED}"
-            echo "    Source: ${SOURCE_CKPT_DIR}/ckpt-${CHECKPOINT_ENV_STEP}"
-            echo "    Log: ${OUT_LOG}"
-            echo "    Port: ${MASTER_PORT}, PID: ${PID}"
-        fi
-
-        JOB_INDEX=$((JOB_INDEX + 1))
-    done
-    echo ""
+    JOB_INDEX=$((JOB_INDEX + 1))
 done
-
+echo ""
 if [[ "${DRY_RUN}" == true ]]; then
     echo "Dry run complete. Total planned jobs: ${JOB_INDEX}"
 else
     echo "Launched BAFCv6 resume jobs: ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
-    echo "To monitor: tail -f ${BASE_DIR}/{hopper,cheetah}/$(basename "${ROOT_DIR}")/critic_utd${V6_CRITIC_UTD}/seed_*/out.log"
+    echo "To monitor: tail -f ${ROOT_DIR}/critic_utd${V6_CRITIC_UTD}/seed_*/out.log"
 fi
