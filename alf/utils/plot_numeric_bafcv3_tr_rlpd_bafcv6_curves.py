@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Plot numeric-result BAFCv3-TR, RLPD, and BAFCv6 TensorBoard curves.
+"""Plot numeric-result BAFCv3-TR, BAFCv3, RLPD, and BAFCv6 curves.
 
 Run from the repo root:
 
@@ -20,15 +20,16 @@ Run from the repo root:
 
 The script writes three PNG figures:
 
-* BAFCv3-TR vs RLPD vs BAFCv6 AverageReturn over environment steps.
+* BAFCv3-TR vs BAFCv3 vs RLPD vs BAFCv6 AverageReturn over environment steps.
 * BAFCv3-TR rollout-skip signed absolute AverageReturn change.
 * BAFCv3-TR rollout-skip relative AverageReturn change.
 
 Each figure plots the across-seed mean and shades +/-1 std. This script is
-4-GPU focused and defaults to seeds 1,2,3,4. BAFCv6 numeric runs currently
-provide train logs but no rollout-skip eval logs, so BAFCv6 curves are included
-only in the AverageReturn figure. Curves are aligned on the overlapping step
-range and interpolated using the same logic as ``aggregate_tb_mean_std.py``.
+4-GPU focused and defaults to seeds 1,2,3,4. Additional BAFCv3 and BAFCv6
+numeric runs currently provide train logs but no rollout-skip eval logs, so
+those curves are included only in the AverageReturn figure. Curves are aligned
+on the overlapping step range and interpolated using the same logic as
+``aggregate_tb_mean_std.py``.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ except ModuleNotFoundError:
 DEFAULT_BASE_DIR = "/root/numeric_results"
 DEFAULT_ENV = "cheetah"
 DEFAULT_SEEDS = "1,2,3,4"
+DEFAULT_BAFCV3_CRITIC_UTDS = "2,3"
 DEFAULT_RLPD_CRITIC_UTD = 10
 DEFAULT_BAFCV6_CRITIC_UTDS = "2,3"
 
@@ -112,10 +114,21 @@ def _build_seed_dirs(root: str, seeds: list[int]) -> list[str]:
     return [os.path.join(root, "seed_%d" % seed) for seed in seeds]
 
 
-def _build_bafcv3_dirs(base_dir: str, env: str,
-                       seeds: list[int]) -> list[str]:
+def _build_bafcv3_tr_dirs(base_dir: str, env: str,
+                          seeds: list[int]) -> list[str]:
     root = os.path.join(base_dir, _env_dir(env), "bafcv3_tr_dmc_4g")
     return _build_seed_dirs(root, seeds)
+
+
+def _build_bafcv3_dirs_by_critic_utd(
+        base_dir: str, env: str, seeds: list[int],
+        critic_utds: list[int]) -> dict[int, list[str]]:
+    root = os.path.join(base_dir, _env_dir(env), "bafcv3_dmc_4g")
+    return {
+        critic_utd: _build_seed_dirs(
+            os.path.join(root, "critic_utd%d" % critic_utd), seeds)
+        for critic_utd in critic_utds
+    }
 
 
 def _build_rlpd_dirs(base_dir: str, env: str, seeds: list[int],
@@ -274,14 +287,19 @@ def _print_aggregate_summary(label: str, tag: str,
 
 
 def _plot_average_return(
-        env: str, bafcv3_dirs: list[str], rlpd_dirs: list[str],
+        env: str, bafcv3_tr_dirs: list[str],
+        bafcv3_dirs_by_critic_utd: dict[int, list[str]],
+        rlpd_dirs: list[str],
         bafcv6_dirs_by_critic_utd: dict[int, list[str]], output_root: str,
         rlpd_critic_utd: int) -> str:
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
     series = [
-        ("BAFCv3-TR", bafcv3_dirs),
+        ("BAFCv3-TR", bafcv3_tr_dirs),
         ("RLPD critic_utd%d" % rlpd_critic_utd, rlpd_dirs),
     ]
+    series.extend(
+        ("BAFCv3 critic_utd%d" % critic_utd, run_dirs)
+        for critic_utd, run_dirs in sorted(bafcv3_dirs_by_critic_utd.items()))
     series.extend(
         ("BAFCv6 critic_utd%d" % critic_utd, run_dirs)
         for critic_utd, run_dirs in sorted(bafcv6_dirs_by_critic_utd.items()))
@@ -350,7 +368,7 @@ def _plot_relative_return_change(env: str, bafcv3_dirs: list[str],
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=("Plot numeric-result BAFCv3-TR, RLPD, and BAFCv6 "
+        description=("Plot numeric-result BAFCv3-TR, BAFCv3, RLPD, and BAFCv6 "
                      "4-GPU curves."))
     parser.add_argument("--env", default=DEFAULT_ENV,
                         help="Environment directory/name (default: %(default)s).")
@@ -359,6 +377,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", type=_parse_seeds,
                         default=_parse_seeds(DEFAULT_SEEDS),
                         help="Comma-separated seed IDs (default: %(default)s).")
+    parser.add_argument("--bafcv3-critic-utds", type=_parse_critic_utds,
+                        default=_parse_critic_utds(
+                            DEFAULT_BAFCV3_CRITIC_UTDS),
+                        help=("Comma-separated BAFCv3 critic UTD directory "
+                              "suffixes (default: %(default)s)."))
     parser.add_argument("--rlpd-critic-utd", type=int,
                         default=DEFAULT_RLPD_CRITIC_UTD,
                         help=("RLPD critic UTD directory suffix "
@@ -379,21 +402,32 @@ def main() -> None:
     args = _parse_args()
     output_root = args.output_root or _default_output_root(args.base_dir,
                                                            args.env)
-    bafcv3_dirs = _build_bafcv3_dirs(args.base_dir, args.env, args.seeds)
+    bafcv3_tr_dirs = _build_bafcv3_tr_dirs(args.base_dir, args.env,
+                                           args.seeds)
+    bafcv3_dirs_by_critic_utd = _build_bafcv3_dirs_by_critic_utd(
+        args.base_dir, args.env, args.seeds, args.bafcv3_critic_utds)
     rlpd_dirs = _build_rlpd_dirs(args.base_dir, args.env, args.seeds,
                                  args.rlpd_critic_utd)
     bafcv6_dirs_by_critic_utd = _build_bafcv6_dirs_by_critic_utd(
         args.base_dir, args.env, args.seeds, args.bafcv6_critic_utds)
 
-    _check_dirs(bafcv3_dirs, "BAFCv3-TR run directories")
+    _check_dirs(bafcv3_tr_dirs, "BAFCv3-TR run directories")
+    for critic_utd, bafcv3_dirs in sorted(
+            bafcv3_dirs_by_critic_utd.items()):
+        _check_dirs(bafcv3_dirs,
+                    "BAFCv3 critic_utd%d run directories" % critic_utd)
     _check_dirs(rlpd_dirs, "RLPD run directories")
     for critic_utd, bafcv6_dirs in sorted(
             bafcv6_dirs_by_critic_utd.items()):
         _check_dirs(bafcv6_dirs,
                     "BAFCv6 critic_utd%d run directories" % critic_utd)
 
-    _check_dirs(_source_logdirs(bafcv3_dirs, "train"),
+    _check_dirs(_source_logdirs(bafcv3_tr_dirs, "train"),
                 "BAFCv3-TR train log directories")
+    for critic_utd, bafcv3_dirs in sorted(
+            bafcv3_dirs_by_critic_utd.items()):
+        _check_dirs(_source_logdirs(bafcv3_dirs, "train"),
+                    "BAFCv3 critic_utd%d train log directories" % critic_utd)
     _check_dirs(_source_logdirs(rlpd_dirs, "train"),
                 "RLPD train log directories")
     for critic_utd, bafcv6_dirs in sorted(
@@ -401,23 +435,27 @@ def main() -> None:
         _check_dirs(_source_logdirs(bafcv6_dirs, "train"),
                     "BAFCv6 critic_utd%d train log directories" % critic_utd)
 
-    _check_dirs(_source_logdirs(bafcv3_dirs, "eval"),
+    _check_dirs(_source_logdirs(bafcv3_tr_dirs, "eval"),
                 "BAFCv3-TR eval log directories")
 
     print("env: %s" % args.env)
     print("run_set: 4g")
     print("seeds: %s" % ",".join(str(seed) for seed in args.seeds))
+    print("bafcv3_critic_utds: %s" %
+          ",".join(str(utd) for utd in args.bafcv3_critic_utds))
     print("rlpd_critic_utd: %d" % args.rlpd_critic_utd)
     print("bafcv6_critic_utds: %s" %
           ",".join(str(utd) for utd in args.bafcv6_critic_utds))
     print("output: %s" % output_root)
-    print("rollout_skip: BAFCv3-TR only; BAFCv6 numeric runs have no eval logs")
+    print("rollout_skip: BAFCv3-TR only; additional BAFCv3/BAFCv6 "
+          "numeric runs have no eval logs")
 
-    _plot_average_return(args.env, bafcv3_dirs, rlpd_dirs,
+    _plot_average_return(args.env, bafcv3_tr_dirs,
+                         bafcv3_dirs_by_critic_utd, rlpd_dirs,
                          bafcv6_dirs_by_critic_utd, output_root,
                          args.rlpd_critic_utd)
-    _plot_absolute_return_change(args.env, bafcv3_dirs, output_root)
-    _plot_relative_return_change(args.env, bafcv3_dirs, output_root)
+    _plot_absolute_return_change(args.env, bafcv3_tr_dirs, output_root)
+    _plot_relative_return_change(args.env, bafcv3_tr_dirs, output_root)
 
 
 if __name__ == "__main__":
