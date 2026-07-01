@@ -13,9 +13,11 @@
 # limitations under the License.
 
 from absl import logging
-from contextlib import redirect_stderr
+from contextlib import ExitStack, nullcontext, redirect_stderr
 from io import StringIO
 import multiprocessing as mp
+from unittest import mock
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -49,6 +51,68 @@ class WraningOnceTest(alf.test.TestCase):
         assert len(warning_messages) == len(generated_warning_messages)
         for msg, gen_msg in zip(warning_messages, generated_warning_messages):
             assert msg in gen_msg
+
+
+class RunUnderRecordContextTest(alf.test.TestCase):
+
+    def test_ddp_summary_uses_rank_zero(self):
+        class _Context:
+
+            def __init__(self, rank):
+                self._rank = rank
+
+            @property
+            def is_distributed(self):
+                return True
+
+            @property
+            def ddp_rank(self):
+                return self._rank
+
+        for rank, should_write in ((0, True), (1, False), (2, False)):
+            with self.subTest(rank=rank):
+                func = mock.Mock()
+                writer = mock.Mock()
+
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            common,
+                            "PerProcessContext",
+                            return_value=_Context(rank)))
+                    create_writer = stack.enter_context(
+                        mock.patch.object(
+                            alf.summary,
+                            "create_summary_writer",
+                            return_value=writer))
+                    stack.enter_context(
+                        mock.patch.object(
+                            alf.summary,
+                            "get_global_counter",
+                            return_value=0))
+                    stack.enter_context(
+                        mock.patch.object(
+                            alf.summary,
+                            "push_summary_writer",
+                            return_value=nullcontext()))
+                    stack.enter_context(
+                        mock.patch.object(
+                            alf.summary,
+                            "record_if",
+                            return_value=nullcontext()))
+                    common.run_under_record_context(
+                        func,
+                        summary_dir="/tmp/common_test",
+                        summary_interval=1,
+                        flush_secs=1)
+
+                func.assert_called_once()
+                if should_write:
+                    create_writer.assert_called_once()
+                    writer.close.assert_called_once()
+                else:
+                    create_writer.assert_not_called()
+                    writer.close.assert_not_called()
 
 
 class MyObject(object):

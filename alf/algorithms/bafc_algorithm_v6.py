@@ -56,7 +56,14 @@ BafcCriticReweightingInfo = namedtuple(
     "BafcCriticReweightingInfo", [
         "final_weight", "raw_weight", "clipped_weight", "sample_age",
         "fallback_to_uniform", "solver_objective_initial",
-        "solver_objective_final"
+        "solver_objective_final", "solver_distribution_half_final_tv",
+        "solver_objective_half",
+        "solver_objective_half_to_final_improvement",
+        "solver_distribution_uniform_tv",
+        "solver_distribution_ess_ratio",
+        "solver_objective_initial_to_half_improvement",
+        "frac_clipped_at_max_half",
+        "frac_clipped_at_max_half_to_final_delta"
     ],
     default_value=())
 
@@ -761,8 +768,14 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         fw_gap = -beta * h_obj.mean() - grad.min()
         return objective, grad, fw_gap
 
+    def _critic_reweighting_half_solver_iters(self):
+        return (self._critic_reweighting_solver_iters + 1) // 2
+
     def _solve_critic_reweighting_distribution_lbfgs_logits(
-            self, features, target_cov, beta, ridge):
+            self, features, target_cov, beta, ridge, solver_iters=None):
+        if solver_iters is None:
+            solver_iters = self._critic_reweighting_solver_iters
+        solver_iters = max(1, int(solver_iters))
         num_samples = features.shape[0]
         if num_samples <= 1:
             return torch.full(
@@ -782,8 +795,8 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         optimizer = torch.optim.LBFGS(
             [logits],
             lr=1.0,
-            max_iter=self._critic_reweighting_solver_iters,
-            max_eval=2 * self._critic_reweighting_solver_iters,
+            max_iter=solver_iters,
+            max_eval=2 * solver_iters,
             history_size=10,
             line_search_fn='strong_wolfe')
 
@@ -809,18 +822,14 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
     def _solve_critic_reweighting_distribution_projected_gradient_fw(
             self, features, target_cov, beta, ridge):
         num_samples = features.shape[0]
-        if num_samples <= 1:
-            return torch.full(
-                (num_samples, ),
-                1.0 / max(1, num_samples),
-                dtype=features.dtype,
-                device=features.device)
-
         uniform = torch.full(
             (num_samples, ),
-            1.0 / num_samples,
+            1.0 / max(1, num_samples),
             dtype=features.dtype,
             device=features.device)
+        if num_samples <= 1:
+            return uniform, uniform
+
         starts = [uniform]
         try:
             _, uniform_grad, _ = self._critic_reweighting_objective_and_grad(
@@ -831,16 +840,19 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         except RuntimeError:
             starts.append(uniform)
 
+        half_iters = self._critic_reweighting_half_solver_iters()
         best_p = uniform
+        best_half_p = uniform
         best_obj = None
         for start in starts:
             p = self._project_simplex(start)
+            p_half = None
             try:
                 obj, grad, fw_gap = self._critic_reweighting_objective_and_grad(
                     p, features, target_cov, beta, ridge)
                 if not torch.isfinite(obj):
                     continue
-                for _ in range(self._critic_reweighting_solver_iters):
+                for iter_idx in range(self._critic_reweighting_solver_iters):
                     candidates = []
                     step = 1.0
                     for _ in range(8):
@@ -867,26 +879,54 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                             alpha *= 0.5
 
                     if not candidates:
+                        if p_half is None:
+                            p_half = p
                         break
                     obj, p = min(candidates, key=lambda item: float(item[0]))
+                    if iter_idx + 1 >= half_iters and p_half is None:
+                        p_half = p
                     obj, grad, fw_gap = self._critic_reweighting_objective_and_grad(
                         p, features, target_cov, beta, ridge)
 
+                if p_half is None:
+                    p_half = p
                 if best_obj is None or obj < best_obj:
                     best_obj = obj
                     best_p = p
+                    best_half_p = p_half
             except RuntimeError:
                 continue
 
         if best_obj is None or not torch.isfinite(best_p).all():
-            return uniform
-        return self._project_simplex(best_p)
+            return uniform, uniform
+        if not torch.isfinite(best_half_p).all():
+            best_half_p = best_p
+        return self._project_simplex(best_p), self._project_simplex(best_half_p)
 
     def _solve_critic_reweighting_distribution(self, features, target_cov, beta,
                                                ridge):
+        num_samples = features.shape[0]
+        if num_samples <= 1:
+            uniform = torch.full(
+                (num_samples, ),
+                1.0 / max(1, num_samples),
+                dtype=features.dtype,
+                device=features.device)
+            return uniform, uniform
         if self._critic_reweighting_solver == "lbfgs_logits":
-            return self._solve_critic_reweighting_distribution_lbfgs_logits(
-                features, target_cov, beta, ridge)
+            p_final = self._solve_critic_reweighting_distribution_lbfgs_logits(
+                features, target_cov, beta, ridge,
+                self._critic_reweighting_solver_iters)
+            half_iters = self._critic_reweighting_half_solver_iters()
+            if half_iters == self._critic_reweighting_solver_iters:
+                p_half = p_final
+            else:
+                try:
+                    p_half = self._solve_critic_reweighting_distribution_lbfgs_logits(
+                        features, target_cov, beta, ridge, half_iters)
+                except RuntimeError:
+                    p_half = p_final
+            return p_final, p_half
         return (
             self._solve_critic_reweighting_distribution_projected_gradient_fw(
                 features, target_cov, beta, ridge))
@@ -898,7 +938,15 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                                              sample_age=(),
                                              fallback_to_uniform=False,
                                              solver_objective_initial=None,
-                                             solver_objective_final=None):
+                                             solver_objective_final=None,
+                                             solver_distribution_half_final_tv=None,
+                                             solver_objective_half=None,
+                                             solver_objective_half_to_final_improvement=None,
+                                             solver_distribution_uniform_tv=None,
+                                             solver_distribution_ess_ratio=None,
+                                             solver_objective_initial_to_half_improvement=None,
+                                             frac_clipped_at_max_half=None,
+                                             frac_clipped_at_max_half_to_final_delta=None):
         if not (self._debug_summaries and self._enable_critic_reweighting
                 and alf.summary.should_record_summaries()):
             return
@@ -939,8 +987,9 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                            final_weights.max())
         alf.summary.scalar('critic_reweighting/num_clipped_at_max',
                            num_clipped)
+        frac_clipped = num_clipped / num_samples.clamp_min(1.0)
         alf.summary.scalar('critic_reweighting/frac_clipped_at_max',
-                           num_clipped / num_samples.clamp_min(1.0))
+                           frac_clipped)
         alf.summary.scalar('critic_reweighting/ess', ess)
         alf.summary.scalar('critic_reweighting/ess_ratio',
                            ess / num_samples.clamp_min(1.0))
@@ -971,6 +1020,38 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 alf.summary.scalar(
                     'critic_reweighting/solver_objective_improvement',
                     solver_objective_initial - solver_objective_final)
+
+        def _record_finite_scalar(name, value):
+            if value is None:
+                return
+            value = torch.as_tensor(
+                value, dtype=final_weights.dtype, device=final_weights.device)
+            if value.numel() == 0 or not torch.isfinite(value).all().item():
+                return
+            alf.summary.scalar(name, value.reshape(()))
+
+        _record_finite_scalar(
+            'critic_reweighting/solver_distribution_half_final_tv',
+            solver_distribution_half_final_tv)
+        _record_finite_scalar('critic_reweighting/solver_objective_half',
+                              solver_objective_half)
+        _record_finite_scalar(
+            'critic_reweighting/solver_objective_half_to_final_improvement',
+            solver_objective_half_to_final_improvement)
+        _record_finite_scalar(
+            'critic_reweighting/solver_distribution_uniform_tv',
+            solver_distribution_uniform_tv)
+        _record_finite_scalar(
+            'critic_reweighting/solver_distribution_ess_ratio',
+            solver_distribution_ess_ratio)
+        _record_finite_scalar(
+            'critic_reweighting/solver_objective_initial_to_half_improvement',
+            solver_objective_initial_to_half_improvement)
+        _record_finite_scalar('critic_reweighting/frac_clipped_at_max_half',
+                              frac_clipped_at_max_half)
+        _record_finite_scalar(
+            'critic_reweighting/frac_clipped_at_max_half_to_final_delta',
+            frac_clipped_at_max_half_to_final_delta)
 
         if isinstance(sample_age, torch.Tensor):
             sample_age = sample_age.detach().reshape(-1).to(
@@ -1026,7 +1107,15 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                                       sample_age=(),
                                       fallback_to_uniform=False,
                                       solver_objective_initial=(),
-                                      solver_objective_final=()):
+                                      solver_objective_final=(),
+                                      solver_distribution_half_final_tv=(),
+                                      solver_objective_half=(),
+                                      solver_objective_half_to_final_improvement=(),
+                                      solver_distribution_uniform_tv=(),
+                                      solver_distribution_ess_ratio=(),
+                                      solver_objective_initial_to_half_improvement=(),
+                                      frac_clipped_at_max_half=(),
+                                      frac_clipped_at_max_half_to_final_delta=()):
         if raw_weight is None:
             raw_weight = final_weight
         if clipped_weight is None:
@@ -1036,6 +1125,32 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 float(fallback_to_uniform),
                 dtype=final_weight.dtype,
                 device=final_weight.device)
+
+            def _diagnostic_scalar(value):
+                if value is None or (isinstance(value, tuple) and len(value) == 0):
+                    value = 0.0
+                return torch.as_tensor(
+                    value, dtype=final_weight.dtype,
+                    device=final_weight.device).reshape(())
+
+            solver_distribution_half_final_tv = _diagnostic_scalar(
+                solver_distribution_half_final_tv)
+            solver_objective_half = _diagnostic_scalar(solver_objective_half)
+            solver_objective_half_to_final_improvement = _diagnostic_scalar(
+                solver_objective_half_to_final_improvement)
+            solver_distribution_uniform_tv = _diagnostic_scalar(
+                solver_distribution_uniform_tv)
+            if (isinstance(solver_distribution_ess_ratio, tuple)
+                    and len(solver_distribution_ess_ratio) == 0):
+                solver_distribution_ess_ratio = 1.0
+            solver_distribution_ess_ratio = _diagnostic_scalar(
+                solver_distribution_ess_ratio)
+            solver_objective_initial_to_half_improvement = _diagnostic_scalar(
+                solver_objective_initial_to_half_improvement)
+            frac_clipped_at_max_half = _diagnostic_scalar(
+                frac_clipped_at_max_half)
+            frac_clipped_at_max_half_to_final_delta = _diagnostic_scalar(
+                frac_clipped_at_max_half_to_final_delta)
         return BafcCriticReweightingInfo(
             final_weight=final_weight,
             raw_weight=raw_weight,
@@ -1043,7 +1158,18 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             sample_age=sample_age,
             fallback_to_uniform=fallback_to_uniform,
             solver_objective_initial=solver_objective_initial,
-            solver_objective_final=solver_objective_final)
+            solver_objective_final=solver_objective_final,
+            solver_distribution_half_final_tv=solver_distribution_half_final_tv,
+            solver_objective_half=solver_objective_half,
+            solver_objective_half_to_final_improvement=(
+                solver_objective_half_to_final_improvement),
+            solver_distribution_uniform_tv=solver_distribution_uniform_tv,
+            solver_distribution_ess_ratio=solver_distribution_ess_ratio,
+            solver_objective_initial_to_half_improvement=(
+                solver_objective_initial_to_half_improvement),
+            frac_clipped_at_max_half=frac_clipped_at_max_half,
+            frac_clipped_at_max_half_to_final_delta=(
+                frac_clipped_at_max_half_to_final_delta))
 
     def _record_critic_reweighting_info_summaries(self, reweighting_info):
         if not isinstance(reweighting_info, BafcCriticReweightingInfo):
@@ -1055,7 +1181,22 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             sample_age=reweighting_info.sample_age,
             fallback_to_uniform=reweighting_info.fallback_to_uniform,
             solver_objective_initial=reweighting_info.solver_objective_initial,
-            solver_objective_final=reweighting_info.solver_objective_final)
+            solver_objective_final=reweighting_info.solver_objective_final,
+            solver_distribution_half_final_tv=(
+                reweighting_info.solver_distribution_half_final_tv),
+            solver_objective_half=reweighting_info.solver_objective_half,
+            solver_objective_half_to_final_improvement=(
+                reweighting_info.solver_objective_half_to_final_improvement),
+            solver_distribution_uniform_tv=(
+                reweighting_info.solver_distribution_uniform_tv),
+            solver_distribution_ess_ratio=(
+                reweighting_info.solver_distribution_ess_ratio),
+            solver_objective_initial_to_half_improvement=(
+                reweighting_info.solver_objective_initial_to_half_improvement),
+            frac_clipped_at_max_half=(
+                reweighting_info.frac_clipped_at_max_half),
+            frac_clipped_at_max_half_to_final_delta=(
+                reweighting_info.frac_clipped_at_max_half_to_final_delta))
 
     def _sanitize_critic_reweighting_info_for_train_info(self, reweighting_info):
         del reweighting_info
@@ -1144,14 +1285,40 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             if not torch.isfinite(solver_objective_initial):
                 raise RuntimeError(
                     "non-finite initial critic reweighting objective")
-            p = self._solve_critic_reweighting_distribution(
+            p, p_half = self._solve_critic_reweighting_distribution(
                 phi_behavior, target_cov, beta, ridge)
             solver_objective_final = self._critic_reweighting_objective(
                 p, phi_behavior, target_cov, beta, ridge).detach()
             if not torch.isfinite(solver_objective_final):
                 raise RuntimeError(
                     "non-finite final critic reweighting objective")
+            if not torch.isfinite(p_half).all():
+                p_half = p
+            solver_objective_half = self._critic_reweighting_objective(
+                p_half, phi_behavior, target_cov, beta, ridge).detach()
+            if not torch.isfinite(solver_objective_half):
+                p_half = p
+                solver_objective_half = solver_objective_final
+            solver_distribution_half_final_tv = 0.5 * (p_half - p).abs().sum()
+            solver_objective_half_to_final_improvement = (
+                solver_objective_half - solver_objective_final)
+            solver_distribution_uniform_tv = 0.5 * (p - uniform).abs().sum()
+            solver_distribution_ess_ratio = 1.0 / (
+                float(num_samples) * p.square().sum().clamp_min(1e-12))
+            solver_objective_initial_to_half_improvement = (
+                solver_objective_initial - solver_objective_half)
             raw_weights = p * float(num_samples)
+            raw_weights_half = p_half * float(num_samples)
+            max_weight = torch.as_tensor(
+                self._critic_reweighting_max_weight,
+                dtype=raw_weights.dtype,
+                device=raw_weights.device)
+            frac_clipped_at_max_final = (raw_weights >= max_weight).to(
+                raw_weights.dtype).mean()
+            frac_clipped_at_max_half = (raw_weights_half >= max_weight).to(
+                raw_weights.dtype).mean()
+            frac_clipped_at_max_half_to_final_delta = (
+                frac_clipped_at_max_final - frac_clipped_at_max_half)
             clipped_weights = raw_weights.clamp(
                 min=0., max=float(self._critic_reweighting_max_weight))
             mean = clipped_weights.mean().clamp_min(1e-12)
@@ -1168,7 +1335,19 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 sample_age=sample_age,
                 fallback_to_uniform=False,
                 solver_objective_initial=solver_objective_initial,
-                solver_objective_final=solver_objective_final)
+                solver_objective_final=solver_objective_final,
+                solver_distribution_half_final_tv=(
+                    solver_distribution_half_final_tv),
+                solver_objective_half=solver_objective_half,
+                solver_objective_half_to_final_improvement=(
+                    solver_objective_half_to_final_improvement),
+                solver_distribution_uniform_tv=solver_distribution_uniform_tv,
+                solver_distribution_ess_ratio=solver_distribution_ess_ratio,
+                solver_objective_initial_to_half_improvement=(
+                    solver_objective_initial_to_half_improvement),
+                frac_clipped_at_max_half=frac_clipped_at_max_half,
+                frac_clipped_at_max_half_to_final_delta=(
+                    frac_clipped_at_max_half_to_final_delta))
             return weights, reweighting_info
         except RuntimeError:
             return ones, fallback_info

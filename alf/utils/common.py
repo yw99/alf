@@ -491,11 +491,11 @@ def run_under_record_context(func,
         summary_max_queue (int): the largest number of summaries to keep in a queue;
             will flush once the queue gets bigger than this. Defaults to 10.
     """
-    # For DDP training, we only do summary on one of the ranks.
-    # Since rank-0 does more work than other rank (e.g. Evaluation),
-    # we do summary on rank-1 to reduce the load of rank-0
+    # For DDP training, we only do summary on one of the ranks. Use rank-0
+    # because ALF checkpoints the main model state, including metrics, from
+    # rank-0. This keeps TensorBoard metric curves continuous across resume.
     if PerProcessContext().is_distributed and PerProcessContext(
-    ).ddp_rank != 1:
+    ).ddp_rank != 0:
         func()
         return
 

@@ -280,7 +280,15 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
                 clipped_weights=clipped_weights,
                 fallback_to_uniform=False,
                 solver_objective_initial=torch.tensor(5.0),
-                solver_objective_final=torch.tensor(3.0))
+                solver_objective_final=torch.tensor(3.0),
+                solver_distribution_half_final_tv=torch.tensor(0.25),
+                solver_objective_half=torch.tensor(4.0),
+                solver_objective_half_to_final_improvement=torch.tensor(1.0),
+                solver_distribution_uniform_tv=torch.tensor(0.4),
+                solver_distribution_ess_ratio=torch.tensor(0.7),
+                solver_objective_initial_to_half_improvement=torch.tensor(1.0),
+                frac_clipped_at_max_half=torch.tensor(1.0 / 3.0),
+                frac_clipped_at_max_half_to_final_delta=torch.tensor(1.0 / 3.0))
 
         histogram_names = [call.args[0] for call in histogram_mock.call_args_list]
         self.assertIn("critic_reweighting/raw_weight/value", histogram_names)
@@ -322,6 +330,42 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
         self.assertAlmostEqual(
             float(scalars["critic_reweighting/solver_objective_improvement"]),
             2.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars[
+                "critic_reweighting/solver_distribution_half_final_tv"]),
+            0.25,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars["critic_reweighting/solver_objective_half"]),
+            4.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars[
+                "critic_reweighting/solver_objective_half_to_final_improvement"]),
+            1.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars["critic_reweighting/solver_distribution_uniform_tv"]),
+            0.4,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars["critic_reweighting/solver_distribution_ess_ratio"]),
+            0.7,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars[
+                "critic_reweighting/solver_objective_initial_to_half_improvement"]),
+            1.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars["critic_reweighting/frac_clipped_at_max_half"]),
+            1.0 / 3.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(scalars[
+                "critic_reweighting/frac_clipped_at_max_half_to_final_delta"]),
+            1.0 / 3.0,
             places=6)
 
     def test_critic_reweighting_recency_summary_metrics(self):
@@ -421,6 +465,17 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
             float(scalars["critic_reweighting/ess_ratio"]),
             1.0,
             places=6)
+        for name in (
+                "critic_reweighting/solver_distribution_half_final_tv",
+                "critic_reweighting/solver_objective_half_to_final_improvement",
+                "critic_reweighting/solver_distribution_uniform_tv",
+                "critic_reweighting/solver_objective_initial_to_half_improvement",
+                "critic_reweighting/frac_clipped_at_max_half_to_final_delta"):
+            self.assertAlmostEqual(float(scalars[name]), 0.0, places=6)
+        self.assertAlmostEqual(
+            float(scalars["critic_reweighting/solver_distribution_ess_ratio"]),
+            1.0,
+            places=6)
 
     def test_critic_reweighting_weights_are_normalized(self):
         alg = self._make_alg(
@@ -452,6 +507,32 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
             torch.isfinite(reweighting_info.clipped_weight).all().item())
         self.assertAlmostEqual(
             float(reweighting_info.fallback_to_uniform), 0.0, places=6)
+        for value in (
+                reweighting_info.solver_distribution_half_final_tv,
+                reweighting_info.solver_objective_half,
+                reweighting_info.solver_objective_half_to_final_improvement,
+                reweighting_info.solver_distribution_uniform_tv,
+                reweighting_info.solver_distribution_ess_ratio,
+                reweighting_info.solver_objective_initial_to_half_improvement,
+                reweighting_info.frac_clipped_at_max_half,
+                reweighting_info.frac_clipped_at_max_half_to_final_delta):
+            self.assertTrue(torch.isfinite(value).all().item())
+        self.assertGreaterEqual(
+            float(reweighting_info.solver_distribution_half_final_tv), 0.0)
+        self.assertLessEqual(
+            float(reweighting_info.solver_distribution_half_final_tv), 1.0)
+        self.assertGreaterEqual(
+            float(reweighting_info.solver_distribution_uniform_tv), 0.0)
+        self.assertLessEqual(
+            float(reweighting_info.solver_distribution_uniform_tv), 1.0)
+        self.assertGreater(
+            float(reweighting_info.solver_distribution_ess_ratio), 0.0)
+        self.assertLessEqual(
+            float(reweighting_info.solver_distribution_ess_ratio), 1.0)
+        self.assertGreaterEqual(
+            float(reweighting_info.frac_clipped_at_max_half), 0.0)
+        self.assertLessEqual(
+            float(reweighting_info.frac_clipped_at_max_half), 1.0)
 
     def test_critic_reweighting_degenerate_features_fall_back_to_uniform(self):
         alg = self._make_alg(enable_critic_reweighting=True)
@@ -471,6 +552,30 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
         self.assertIsInstance(reweighting_info, BafcCriticReweightingInfo)
         self.assertAlmostEqual(
             float(reweighting_info.fallback_to_uniform), 1.0, places=6)
+        self.assertAlmostEqual(
+            float(reweighting_info.solver_distribution_half_final_tv),
+            0.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(reweighting_info.solver_objective_half_to_final_improvement),
+            0.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(reweighting_info.solver_distribution_uniform_tv),
+            0.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(reweighting_info.solver_distribution_ess_ratio),
+            1.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(reweighting_info.solver_objective_initial_to_half_improvement),
+            0.0,
+            places=6)
+        self.assertAlmostEqual(
+            float(reweighting_info.frac_clipped_at_max_half_to_final_delta),
+            0.0,
+            places=6)
 
     def test_critic_reweighting_solver_returns_simplex_distribution(self):
         torch.manual_seed(1234)
@@ -491,13 +596,18 @@ class BafcAlgorithmV6Test(alf.test.TestCase):
                 enable_critic_reweighting=True,
                 critic_reweighting_solver=solver,
                 critic_reweighting_solver_iters=2)
-            p = alg._solve_critic_reweighting_distribution(
+            p, p_half = alg._solve_critic_reweighting_distribution(
                 features, target_cov, beta, ridge)
 
-            self.assertEqual(tuple(p.shape), (5, ))
-            self.assertTrue(torch.isfinite(p).all().item())
-            self.assertTrue((p >= 0).all().item())
-            self.assertAlmostEqual(p.sum().item(), 1.0, places=5)
+            for dist in (p, p_half):
+                self.assertEqual(tuple(dist.shape), (5, ))
+                self.assertTrue(torch.isfinite(dist).all().item())
+                self.assertTrue((dist >= 0).all().item())
+                self.assertAlmostEqual(dist.sum().item(), 1.0, places=5)
+
+            tv = 0.5 * (p_half - p).abs().sum()
+            self.assertGreaterEqual(float(tv), 0.0)
+            self.assertLessEqual(float(tv), 1.0)
 
             uniform = torch.full_like(p, 1.0 / p.numel())
             uniform_obj = alg._critic_reweighting_objective(
