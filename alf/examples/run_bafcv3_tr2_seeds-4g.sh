@@ -8,12 +8,15 @@
 #   -d, --dir BASE_DIR        Base results directory (default: /root/numeric_results)
 #   -n, --steps NUM_STEPS     Total environment steps (default: 400000)
 #       --critic-utd N        Critic update-to-data ratio (default: 3)
+#       --eval-trust-max X    Eval trust threshold (default: 40.0)
 #   -h, --help                Show this help message
 #
 # Examples:
 #   bash run_bafcv3_tr2_seeds-4g.sh -e walker:walk
 #   bash run_bafcv3_tr2_seeds-4g.sh -e walker:walk -n 500000
 #   bash run_bafcv3_tr2_seeds-4g.sh --env hopper:hop --steps 2000000 --dir /my/results
+#   EVAL_TRUST_MAX=30.0 bash run_bafcv3_tr2_seeds-4g.sh --critic-utd 3
+#   bash run_bafcv3_tr2_seeds-4g.sh --critic-utd 3 --eval-trust-max 30.0
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,7 +26,7 @@ ENV_NAME="hopper:hop"
 BASE_DIR="/root/numeric_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
-EVAL_TRUST_MAX=40.0
+EVAL_TRUST_MAX="${EVAL_TRUST_MAX:-40.0}"
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
 ROLLOUT_SKIP_CAP=4
@@ -61,6 +64,10 @@ while [[ $# -gt 0 ]]; do
             CRITIC_UTD="$2"
             shift 2
             ;;
+        --eval-trust-max)
+            EVAL_TRUST_MAX="$2"
+            shift 2
+            ;;
         -h|--help)
             print_help
             exit 0
@@ -78,10 +85,15 @@ if [[ ! "${CRITIC_UTD}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
+if [[ ! "${EVAL_TRUST_MAX}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "--eval-trust-max must be a non-negative number, got: ${EVAL_TRUST_MAX}" >&2
+    exit 1
+fi
+
 # Extract domain name for directory (e.g., hopper:hop -> hopper)
 ENV_DIR=$(echo "$ENV_NAME" | cut -d':' -f1)
 ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_tr2_dmc_4g"
-ROOT_DIR="${ROOT_BASE}/critic_utd${CRITIC_UTD}"
+ROOT_DIR="${ROOT_BASE}/critic_utd${CRITIC_UTD}/eval${EVAL_TRUST_MAX}"
 
 echo "Starting BAFCv3-TR2 training with 4 seeds on shared GPUs 0,1,2,3"
 echo "  Config: $CONF_FILE"
