@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Plot numeric-result BAFCv3-TR, BAFCv3, RLPD, and BAFCv6 curves.
+"""Plot numeric-result BAFCv3-TR, BAFCv3, RLPD, BAFCv6, and BAFCv3-TR2 curves.
 
 Run from the repo root:
 
@@ -20,16 +20,22 @@ Run from the repo root:
 
 The script writes three PNG figures:
 
-* BAFCv3-TR vs BAFCv3 vs RLPD vs BAFCv6 AverageReturn over environment steps.
-* BAFCv3-TR rollout-skip signed absolute AverageReturn change.
-* BAFCv3-TR rollout-skip relative AverageReturn change.
+* BAFCv3-TR vs BAFCv3 cu3 vs RLPD vs BAFCv6 cu2 AverageReturn over
+  environment steps, plus BAFCv3-TR2 and BAFCv6 resume when available.
+* BAFCv3-TR rollout-skip signed absolute AverageReturn change, plus
+  BAFCv3-TR2 when available.
+* BAFCv3-TR rollout-skip relative AverageReturn change, plus BAFCv3-TR2 when
+  available.
 
 Each figure plots the across-seed mean and shades +/-1 std. This script is
 4-GPU focused and defaults to seeds 1,2,3,4. Additional BAFCv3 and BAFCv6
-numeric runs currently provide train logs but no rollout-skip eval logs, so
-those curves are included only in the AverageReturn figure. Curves are aligned
-on the overlapping step range and interpolated using the same logic as
-``aggregate_tb_mean_std.py``.
+numeric runs are included only in the AverageReturn figure. The BAFCv3-TR2
+AverageReturn curve is optional and is plotted when all selected seed train
+logs are available. BAFCv3-TR2 rollout-skip curves are optional and are plotted
+when all selected seed eval logs and rollout-skip scalar tags are available.
+BAFCv6 resume curves are optional and are included only in the AverageReturn
+figure. Curves are aligned on the overlapping step range and interpolated using
+the same logic as ``aggregate_tb_mean_std.py``.
 """
 
 from __future__ import annotations
@@ -55,15 +61,17 @@ except ModuleNotFoundError:
 DEFAULT_BASE_DIR = "/root/numeric_results"
 DEFAULT_ENV = "cheetah"
 DEFAULT_SEEDS = "1,2,3,4"
-DEFAULT_BAFCV3_CRITIC_UTDS = "2,3"
+DEFAULT_BAFCV3_CRITIC_UTDS = "3"
+DEFAULT_BAFCV3_TR2_CRITIC_UTD = 3
 DEFAULT_RLPD_CRITIC_UTD = 10
-DEFAULT_BAFCV6_CRITIC_UTDS = "2,3"
+DEFAULT_BAFCV6_CRITIC_UTDS = "2"
 
 RETURN_TAG = "Metrics_vs_EnvironmentSteps/AverageReturn"
 START_RETURN_TAG = "rollout_skip_eval/start_average_return"
 END_RETURN_TAG = "rollout_skip_eval/end_average_return"
 ABS_CHANGE_TAG = "rollout_skip_eval/absolute_average_return_change"
 REL_CHANGE_TAG = "rollout_skip_eval/relative_average_return_change"
+ROLLOUT_SKIP_EVAL_TAGS = (START_RETURN_TAG, END_RETURN_TAG, REL_CHANGE_TAG)
 
 
 def _display_list(items: Iterable[str], limit: int = 12) -> str:
@@ -120,6 +128,13 @@ def _build_bafcv3_tr_dirs(base_dir: str, env: str,
     return _build_seed_dirs(root, seeds)
 
 
+def _build_bafcv3_tr2_dirs(base_dir: str, env: str, seeds: list[int],
+                           critic_utd: int) -> list[str]:
+    root = os.path.join(base_dir, _env_dir(env), "bafcv3_tr2_dmc_4g",
+                        "critic_utd%d" % critic_utd)
+    return _build_seed_dirs(root, seeds)
+
+
 def _build_bafcv3_dirs_by_critic_utd(
         base_dir: str, env: str, seeds: list[int],
         critic_utds: list[int]) -> dict[int, list[str]]:
@@ -149,6 +164,15 @@ def _build_bafcv6_dirs_by_critic_utd(
     }
 
 
+def _build_bafcv6_resume_dirs(base_dir: str, env: str,
+                              seeds: list[int]) -> list[str]:
+    root = os.path.join(
+        base_dir, _env_dir(env),
+        "bafcv6_resume_bafcv3_critic_utd3_ckpt37538_4g",
+        "critic_utd2")
+    return _build_seed_dirs(root, seeds)
+
+
 def _source_logdirs(run_dirs: list[str], subdir: str) -> list[str]:
     return [os.path.join(run_dir, subdir) for run_dir in run_dirs]
 
@@ -158,6 +182,20 @@ def _check_dirs(paths: Iterable[str], description: str) -> None:
     if missing:
         raise ValueError("Missing %s:%s" %
                          (description, _display_list(missing)))
+
+
+def _has_dirs(paths: Iterable[str]) -> bool:
+    return all(os.path.isdir(path) for path in paths)
+
+
+def _has_scalar_tags(logdirs: Iterable[str], tags: Iterable[str]) -> bool:
+    for logdir in logdirs:
+        event_acc = EventAccumulator(logdir)
+        event_acc.Reload()
+        scalar_tags = set(event_acc.Tags().get("scalars", []))
+        if any(tag not in scalar_tags for tag in tags):
+            return False
+    return True
 
 
 def _read_scalar_curve(logdir: str, tag: str) -> tb_agg.ScalarCurve:
@@ -288,21 +326,26 @@ def _print_aggregate_summary(label: str, tag: str,
 
 def _plot_average_return(
         env: str, bafcv3_tr_dirs: list[str],
+        optional_bafcv3_tr2_dirs: list[str] | None,
+        optional_bafcv6_resume_dirs: list[str] | None,
         bafcv3_dirs_by_critic_utd: dict[int, list[str]],
         rlpd_dirs: list[str],
         bafcv6_dirs_by_critic_utd: dict[int, list[str]], output_root: str,
         rlpd_critic_utd: int) -> str:
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
-    series = [
-        ("BAFCv3-TR", bafcv3_tr_dirs),
-        ("RLPD critic_utd%d" % rlpd_critic_utd, rlpd_dirs),
-    ]
+    series = [("BAFCv3-TR", bafcv3_tr_dirs)]
     series.extend(
-        ("BAFCv3 critic_utd%d" % critic_utd, run_dirs)
+        ("BAFCv3 cu%d" % critic_utd, run_dirs)
         for critic_utd, run_dirs in sorted(bafcv3_dirs_by_critic_utd.items()))
+    series.append(("RLPD cu%d" % rlpd_critic_utd, rlpd_dirs))
     series.extend(
-        ("BAFCv6 critic_utd%d" % critic_utd, run_dirs)
+        ("BAFCv6 cu%d" % critic_utd, run_dirs)
         for critic_utd, run_dirs in sorted(bafcv6_dirs_by_critic_utd.items()))
+    if optional_bafcv6_resume_dirs is not None:
+        series.append(("BAFCv6 resume ckpt37k cu2",
+                       optional_bafcv6_resume_dirs))
+    if optional_bafcv3_tr2_dirs is not None:
+        series.append(("BAFCv3-TR2", optional_bafcv3_tr2_dirs))
 
     for label, run_dirs in series:
         logdirs = _source_logdirs(run_dirs, "train")
@@ -321,15 +364,22 @@ def _plot_average_return(
     )
 
 
-def _plot_absolute_return_change(env: str, bafcv3_dirs: list[str],
-                                 output_root: str) -> str:
-    eval_logdirs = _source_logdirs(bafcv3_dirs, "eval")
-    curves = [_read_absolute_change_curve(logdir) for logdir in eval_logdirs]
-    aggregate = _aggregate_curves(curves, eval_logdirs, ABS_CHANGE_TAG)
-
+def _plot_absolute_return_change(
+        env: str, bafcv3_dirs: list[str],
+        optional_bafcv3_tr2_dirs: list[str] | None,
+        output_root: str) -> str:
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
-    _plot_aggregate(ax, aggregate, "BAFCv3-TR")
-    _print_aggregate_summary("BAFCv3-TR", ABS_CHANGE_TAG, aggregate)
+    series = [("BAFCv3-TR", bafcv3_dirs)]
+    if optional_bafcv3_tr2_dirs is not None:
+        series.append(("BAFCv3-TR2", optional_bafcv3_tr2_dirs))
+
+    for label, run_dirs in series:
+        eval_logdirs = _source_logdirs(run_dirs, "eval")
+        curves = [_read_absolute_change_curve(logdir)
+                  for logdir in eval_logdirs]
+        aggregate = _aggregate_curves(curves, eval_logdirs, ABS_CHANGE_TAG)
+        _plot_aggregate(ax, aggregate, label)
+        _print_aggregate_summary(label, ABS_CHANGE_TAG, aggregate)
 
     return _finish_plot(
         fig=fig,
@@ -343,16 +393,22 @@ def _plot_absolute_return_change(env: str, bafcv3_dirs: list[str],
     )
 
 
-def _plot_relative_return_change(env: str, bafcv3_dirs: list[str],
-                                 output_root: str) -> str:
-    eval_logdirs = _source_logdirs(bafcv3_dirs, "eval")
-    curves = [_read_scalar_curve(logdir, REL_CHANGE_TAG)
-              for logdir in eval_logdirs]
-    aggregate = _aggregate_curves(curves, eval_logdirs, REL_CHANGE_TAG)
-
+def _plot_relative_return_change(
+        env: str, bafcv3_dirs: list[str],
+        optional_bafcv3_tr2_dirs: list[str] | None,
+        output_root: str) -> str:
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
-    _plot_aggregate(ax, aggregate, "BAFCv3-TR")
-    _print_aggregate_summary("BAFCv3-TR", REL_CHANGE_TAG, aggregate)
+    series = [("BAFCv3-TR", bafcv3_dirs)]
+    if optional_bafcv3_tr2_dirs is not None:
+        series.append(("BAFCv3-TR2", optional_bafcv3_tr2_dirs))
+
+    for label, run_dirs in series:
+        eval_logdirs = _source_logdirs(run_dirs, "eval")
+        curves = [_read_scalar_curve(logdir, REL_CHANGE_TAG)
+                  for logdir in eval_logdirs]
+        aggregate = _aggregate_curves(curves, eval_logdirs, REL_CHANGE_TAG)
+        _plot_aggregate(ax, aggregate, label)
+        _print_aggregate_summary(label, REL_CHANGE_TAG, aggregate)
 
     return _finish_plot(
         fig=fig,
@@ -368,8 +424,8 @@ def _plot_relative_return_change(env: str, bafcv3_dirs: list[str],
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=("Plot numeric-result BAFCv3-TR, BAFCv3, RLPD, and BAFCv6 "
-                     "4-GPU curves."))
+        description=("Plot numeric-result BAFCv3-TR, BAFCv3, RLPD, BAFCv6, "
+                     "and optional BAFCv3-TR2 4-GPU curves."))
     parser.add_argument("--env", default=DEFAULT_ENV,
                         help="Environment directory/name (default: %(default)s).")
     parser.add_argument("--base-dir", default=DEFAULT_BASE_DIR,
@@ -382,6 +438,10 @@ def _parse_args() -> argparse.Namespace:
                             DEFAULT_BAFCV3_CRITIC_UTDS),
                         help=("Comma-separated BAFCv3 critic UTD directory "
                               "suffixes (default: %(default)s)."))
+    parser.add_argument("--bafcv3-tr2-critic-utd", type=int,
+                        default=DEFAULT_BAFCV3_TR2_CRITIC_UTD,
+                        help=("BAFCv3-TR2 critic UTD directory suffix "
+                              "(default: %(default)s)."))
     parser.add_argument("--rlpd-critic-utd", type=int,
                         default=DEFAULT_RLPD_CRITIC_UTD,
                         help=("RLPD critic UTD directory suffix "
@@ -404,6 +464,10 @@ def main() -> None:
                                                            args.env)
     bafcv3_tr_dirs = _build_bafcv3_tr_dirs(args.base_dir, args.env,
                                            args.seeds)
+    bafcv3_tr2_dirs = _build_bafcv3_tr2_dirs(
+        args.base_dir, args.env, args.seeds, args.bafcv3_tr2_critic_utd)
+    bafcv6_resume_dirs = _build_bafcv6_resume_dirs(args.base_dir, args.env,
+                                                   args.seeds)
     bafcv3_dirs_by_critic_utd = _build_bafcv3_dirs_by_critic_utd(
         args.base_dir, args.env, args.seeds, args.bafcv3_critic_utds)
     rlpd_dirs = _build_rlpd_dirs(args.base_dir, args.env, args.seeds,
@@ -435,27 +499,76 @@ def main() -> None:
         _check_dirs(_source_logdirs(bafcv6_dirs, "train"),
                     "BAFCv6 critic_utd%d train log directories" % critic_utd)
 
+    optional_bafcv3_tr2_dirs = None
+    if _has_dirs(bafcv3_tr2_dirs):
+        bafcv3_tr2_train_dirs = _source_logdirs(bafcv3_tr2_dirs, "train")
+        if _has_dirs(bafcv3_tr2_train_dirs):
+            optional_bafcv3_tr2_dirs = bafcv3_tr2_dirs
+        else:
+            print("skip BAFCv3-TR2: incomplete selected seed train log "
+                  "directories")
+    else:
+        print("skip BAFCv3-TR2: incomplete selected seed run directories")
+
+    optional_bafcv6_resume_dirs = None
+    if _has_dirs(bafcv6_resume_dirs):
+        bafcv6_resume_train_dirs = _source_logdirs(bafcv6_resume_dirs,
+                                                   "train")
+        if _has_dirs(bafcv6_resume_train_dirs):
+            optional_bafcv6_resume_dirs = bafcv6_resume_dirs
+        else:
+            print("skip BAFCv6 resume ckpt37k cu2: incomplete selected seed "
+                  "train log directories")
+    else:
+        print("skip BAFCv6 resume ckpt37k cu2: incomplete selected seed run "
+              "directories")
+
     _check_dirs(_source_logdirs(bafcv3_tr_dirs, "eval"),
                 "BAFCv3-TR eval log directories")
+
+    optional_bafcv3_tr2_rollout_dirs = None
+    bafcv3_tr2_eval_dirs = _source_logdirs(bafcv3_tr2_dirs, "eval")
+    if _has_dirs(bafcv3_tr2_eval_dirs):
+        if _has_scalar_tags(bafcv3_tr2_eval_dirs, ROLLOUT_SKIP_EVAL_TAGS):
+            optional_bafcv3_tr2_rollout_dirs = bafcv3_tr2_dirs
+        else:
+            print("skip BAFCv3-TR2 rollout-skip: incomplete selected seed "
+                  "eval scalar tags")
+    else:
+        print("skip BAFCv3-TR2 rollout-skip: incomplete selected seed eval "
+              "directories")
 
     print("env: %s" % args.env)
     print("run_set: 4g")
     print("seeds: %s" % ",".join(str(seed) for seed in args.seeds))
     print("bafcv3_critic_utds: %s" %
           ",".join(str(utd) for utd in args.bafcv3_critic_utds))
+    print("bafcv3_tr2_critic_utd: %d" % args.bafcv3_tr2_critic_utd)
     print("rlpd_critic_utd: %d" % args.rlpd_critic_utd)
     print("bafcv6_critic_utds: %s" %
           ",".join(str(utd) for utd in args.bafcv6_critic_utds))
+    print("bafcv3_tr2: %s" %
+          ("included" if optional_bafcv3_tr2_dirs is not None else "skipped"))
+    print("bafcv6_resume_ckpt37k_cu2: %s" %
+          ("included"
+           if optional_bafcv6_resume_dirs is not None else "skipped"))
+    print("bafcv3_tr2_rollout_skip: %s" %
+          ("included"
+           if optional_bafcv3_tr2_rollout_dirs is not None else "skipped"))
     print("output: %s" % output_root)
-    print("rollout_skip: BAFCv3-TR only; additional BAFCv3/BAFCv6 "
-          "numeric runs have no eval logs")
+    print("rollout_skip: BAFCv3-TR plus BAFCv3-TR2 when available")
 
-    _plot_average_return(args.env, bafcv3_tr_dirs,
+    _plot_average_return(args.env, bafcv3_tr_dirs, optional_bafcv3_tr2_dirs,
+                         optional_bafcv6_resume_dirs,
                          bafcv3_dirs_by_critic_utd, rlpd_dirs,
                          bafcv6_dirs_by_critic_utd, output_root,
                          args.rlpd_critic_utd)
-    _plot_absolute_return_change(args.env, bafcv3_tr_dirs, output_root)
-    _plot_relative_return_change(args.env, bafcv3_tr_dirs, output_root)
+    _plot_absolute_return_change(args.env, bafcv3_tr_dirs,
+                                 optional_bafcv3_tr2_rollout_dirs,
+                                 output_root)
+    _plot_relative_return_change(args.env, bafcv3_tr_dirs,
+                                 optional_bafcv3_tr2_rollout_dirs,
+                                 output_root)
 
 
 if __name__ == "__main__":
