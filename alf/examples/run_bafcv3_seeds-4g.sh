@@ -25,12 +25,13 @@ CONF_FILE="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 # ENV_NAME="cheetah:run"
-ENV_NAME="hopper:hop"
+# ENV_NAME="hopper:hop"
+ENV_NAME="humanoid:walk"
 BASE_DIR="/root/numeric_results"
-NUM_ENV_STEPS=1000000
+NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=20
 SEEDS=(0 1 2 3)
-CRITIC_UTDS=(3 2)
+CRITIC_UTDS=(3)
 GPUS="0,1,2,3"
 BASE_PORT=29500
 
