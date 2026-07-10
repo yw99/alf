@@ -23,20 +23,21 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="${SCRIPT_DIR}/bafcv3_tr2_dmc_conf.py"
 # ENV_NAME="hopper:hop"
-ENV_NAME="cheetah:run"
+# ENV_NAME="cheetah:run"
+ENV_NAME="humanoid:walk"
 BASE_DIR="/root/numeric_results"
-NUM_ENV_STEPS=600000
+NUM_ENV_STEPS=480000
 # Avoid intermediate DDP checkpoints in this launcher; checkpointing can race
 # with per-rank rollout progress and hang at the checkpoint barrier.
 NUM_CHECKPOINTS=1
-EVAL_TRUST_MAX="${EVAL_TRUST_MAX:-40.0}"
+EVAL_TRUST_MAX="${EVAL_TRUST_MAX:-30.0}"
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
-ROLLOUT_SKIP_CAP=4
+ROLLOUT_SKIP_CAP=3
 ROLLOUT_SKIP_EVAL_INTERVAL=60
 FREEZE_EVAL_SAMPLES=False
 ACTOR_USE_LN=False
-SEEDS=(1 2 3 4)
+SEEDS=(0 1 2 3)
 CRITIC_UTD=3
 ENABLE_CRITIC_REWEIGHTING=False
 CRITIC_REWEIGHTING_BETA=None
