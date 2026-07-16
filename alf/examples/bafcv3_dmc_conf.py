@@ -28,6 +28,16 @@ alf.define_config('bafcv3_actor_use_ln', False)
 actor_use_ln = alf.get_config_value('bafcv3_actor_use_ln')
 alf.define_config('bafcv3_learning_rate', 3e-4)
 learning_rate = alf.get_config_value('bafcv3_learning_rate')
+alf.define_config('bafcv3_actor_critic_pairing', True)
+actor_critic_pairing = alf.get_config_value('bafcv3_actor_critic_pairing')
+alf.define_config('bafcv3_num_actor_critic', 10)
+num_actor_critic = alf.get_config_value('bafcv3_num_actor_critic')
+alf.define_config('bafcv3_use_bootstrap_actors', False)
+use_bootstrap_actors = alf.get_config_value('bafcv3_use_bootstrap_actors')
+alf.define_config('bafcv3_use_bootstrap_critics', False)
+use_bootstrap_critics = alf.get_config_value('bafcv3_use_bootstrap_critics')
+alf.define_config('bafcv3_num_attention_heads', 1)
+num_attention_heads = alf.get_config_value('bafcv3_num_attention_heads')
 
 # Enable find_unused_parameters for DDP (needed for multi-GPU training)
 alf.config('make_ddp_performer', find_unused_parameters=True)
@@ -73,10 +83,10 @@ alf.config(
     'BafcAlgorithmV3',
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
-    num_actor_critic=10,
-    actor_critic_pairing=True,
-    use_bootstrap_actors=False,
-    use_bootstrap_critics=False,
+    num_actor_critic=num_actor_critic,
+    actor_critic_pairing=actor_critic_pairing,
+    use_bootstrap_actors=use_bootstrap_actors,
+    use_bootstrap_critics=use_bootstrap_critics,
     actor_use_ln=actor_use_ln,
     bootstrap_mask_prob=0.9,
     bootstrap_mask_type='episode',
@@ -99,7 +109,7 @@ alf.config(
 alf.config(
     'TransformerEncoder',
     num_layers=4,
-    num_attention_heads=1,
+    num_attention_heads=num_attention_heads,
     dropout=0.0)
 
 alf.config(
