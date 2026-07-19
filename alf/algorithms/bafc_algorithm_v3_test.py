@@ -27,6 +27,7 @@ from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import StepType, TimeStep
 from alf.experience_replayers.replay_buffer import ReplayBuffer
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
+from alf.nest import utils as nest_utils
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
 from alf.utils.checkpoint_utils import Checkpointer
 
@@ -41,6 +42,20 @@ class _DummyProcess:
         return []
 
 
+class _LinearParallelCritic(torch.nn.Module):
+
+    def __init__(self, slopes):
+        super().__init__()
+        self.register_buffer("_slopes", torch.as_tensor(slopes))
+
+    def forward(self, inputs, state=()):
+        actor_encoding, (_, action) = inputs
+        q_value = (action * self._slopes.unsqueeze(0)).sum(dim=-1)
+        # Preserve the functional-policy input in the graph so dQ/de is defined.
+        q_value = q_value + 0. * actor_encoding.sum(dim=-1)
+        return q_value, state
+
+
 class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
 
     def setUp(self):
@@ -52,6 +67,7 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
         self.addCleanup(self._psutil_patcher.stop)
 
     def _make_alg(self, **kwargs):
+        num_actor_critic = kwargs.pop("num_actor_critic", 3)
         config = TrainerConfig(
             root_dir=tempfile.mkdtemp(prefix="bafc_v3_test_"),
             unroll_length=2,
@@ -70,11 +86,12 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
                 actor_obs_action_joint_fc_layer_params=(32, 32)),
             actor_encoder_cls=partial(
                 TransformerEncoder, num_layers=2, num_attention_heads=1),
-            num_actor_critic=3,
+            num_actor_critic=num_actor_critic,
             num_actor_eval_samples=16,
             **kwargs)
 
     def _make_agent(self, **kwargs):
+        num_actor_critic = kwargs.pop("num_actor_critic", 3)
         config = TrainerConfig(
             root_dir=tempfile.mkdtemp(prefix="bafc_v3_agent_test_"),
             unroll_length=2,
@@ -96,7 +113,7 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
                     actor_obs_action_joint_fc_layer_params=(32, 32)),
                 actor_encoder_cls=partial(
                     TransformerEncoder, num_layers=2, num_attention_heads=1),
-                num_actor_critic=3,
+                num_actor_critic=num_actor_critic,
                 num_actor_eval_samples=16,
                 **kwargs))
 
@@ -251,6 +268,230 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
             self.assertFalse(
                 any("_replay_buffer." in key
                     for key in restored.state_dict().keys()))
+
+    def test_num_sampled_critics_validation(self):
+        with self.assertRaisesRegex(AssertionError, "between 1"):
+            self._make_alg(
+                actor_critic_pairing=False,
+                num_sampled_critics_for_actor=0)
+        with self.assertRaisesRegex(AssertionError, "between 1"):
+            self._make_alg(
+                actor_critic_pairing=False,
+                num_sampled_critics_for_actor=4)
+        with self.assertRaisesRegex(AssertionError, "pairing is True"):
+            self._make_alg(num_sampled_critics_for_actor=2)
+
+    def test_balanced_actor_critic_matchings(self):
+        alg = self._make_alg(
+            actor_critic_pairing=False,
+            num_sampled_critics_for_actor=2)
+        matching = alg._sample_actor_critic_matchings()
+        self.assertEqual(matching.shape, (2, 3))
+        for row in matching:
+            self.assertTensorEqual(row.sort().values, torch.arange(3))
+        for actor_id in range(3):
+            critic_ids = torch.nonzero(
+                matching == actor_id, as_tuple=False)[:, 1]
+            self.assertEqual(torch.unique(critic_ids).numel(), 2)
+
+        matched_value = torch.arange(6).reshape(2, 1, 3)
+        actor_order_value = alg._restore_actor_order(matched_value, matching)
+        for k in range(2):
+            for critic_id in range(3):
+                self.assertEqual(
+                    actor_order_value[k, 0, matching[k, critic_id]],
+                    matched_value[k, 0, critic_id])
+
+        all_alg = self._make_alg(
+            actor_critic_pairing=False,
+            num_sampled_critics_for_actor=3)
+        all_matching = all_alg._sample_actor_critic_matchings()
+        pairs = {(int(all_matching[k, critic_id]), critic_id)
+                 for k in range(3) for critic_id in range(3)}
+        self.assertEqual(len(pairs), 9)
+
+        one_alg = self._make_alg(actor_critic_pairing=False)
+        torch.manual_seed(7)
+        expected = torch.randperm(3)
+        torch.manual_seed(7)
+        self.assertTensorEqual(
+            one_alg._sample_actor_critic_matchings(), expected.unsqueeze(0))
+
+    def test_scattered_gradient_matches_direct_gradient(self):
+        alg = self._make_alg(
+            actor_critic_pairing=False,
+            num_sampled_critics_for_actor=2)
+        action = torch.randn(2, 3, 2, requires_grad=True)
+        matching = torch.tensor([[2, 0, 1], [1, 2, 0]])
+        matched_action = torch.gather(
+            action.unsqueeze(0).expand(2, *action.shape), 2,
+            matching[:, None, :, None].expand(2, 2, 3, 2))
+        slopes = torch.tensor([[1., 2.], [3., 5.], [7., 11.]])
+        objective = (matched_action * slopes[None, None]).sum() / 2
+
+        direct_dqda = torch.autograd.grad(
+            objective, action, retain_graph=True)[0]
+        matched_dqda = torch.autograd.grad(objective, matched_action)[0]
+        scattered_dqda = alg._aggregate_matched_action_gradients(
+            matched_dqda, matching, action)
+        self.assertTensorClose(scattered_dqda, direct_dqda)
+
+    def test_all_critics_produce_exact_mean_actor_gradient(self):
+        slopes = torch.tensor([[1., 2.], [3., 5.], [8., 13.]])
+        alg = self._make_alg(
+            actor_critic_pairing=False,
+            num_sampled_critics_for_actor=3,
+            actor_eval_type='output')
+        alg._critic_networks = _LinearParallelCritic(slopes)
+        action = torch.randn(2, 3, 2, requires_grad=True)
+        _, actor_info = alg._actor_train_step(
+            torch.randn(2, 4), action, torch.zeros(2, 2), torch.ones(2, 3), ())
+
+        actor_loss_grad = torch.autograd.grad(actor_info.loss.sum(), action)[0]
+        expected = -slopes.mean(dim=0).reshape(1, 1, 2).expand_as(action)
+        self.assertTensorClose(actor_loss_grad, expected)
+
+    def test_k1_random_pairing_preserves_gradient_and_loss(self):
+        slopes = torch.tensor([[1., 2.], [3., 5.], [8., 13.]])
+        alg = self._make_alg(
+            actor_critic_pairing=False, actor_eval_type='output')
+        alg._critic_networks = _LinearParallelCritic(slopes)
+        matching = torch.tensor([[2, 0, 1]])
+        action = torch.randn(2, 3, 2, requires_grad=True)
+        with mock.patch.object(
+                alg,
+                "_sample_actor_critic_matchings",
+                return_value=matching):
+            _, actor_info = alg._actor_train_step(
+                torch.randn(2, 4), action, torch.zeros(2, 2), torch.ones(2, 3),
+                ())
+
+        actor_slopes = torch.empty_like(slopes)
+        for critic_id, actor_id in enumerate(matching[0]):
+            actor_slopes[actor_id] = slopes[critic_id]
+        actor_loss_grad = torch.autograd.grad(actor_info.loss.sum(), action)[0]
+        self.assertTensorClose(actor_loss_grad,
+                               -actor_slopes.unsqueeze(0).expand_as(action))
+        expected_loss = 0.5 * actor_slopes.square().sum()
+        self.assertTensorClose(actor_info.loss,
+                               expected_loss.expand(action.shape[0]))
+        self.assertTensorClose(actor_info.extra.eval_action_loss,
+                               torch.zeros(action.shape[0]))
+
+    def test_random_pairing_keeps_bootstrap_mask_in_actor_order(self):
+        slopes = torch.tensor([[1., 2.], [3., 5.], [8., 13.]])
+        alg = self._make_alg(
+            actor_critic_pairing=False,
+            use_bootstrap_actors=True,
+            actor_eval_type='output')
+        alg._critic_networks = _LinearParallelCritic(slopes)
+        matching = torch.tensor([[2, 0, 1]])
+        action = torch.randn(2, 3, 2, requires_grad=True)
+        mask = torch.tensor([[1., 0., 1.], [0., 1., 1.]])
+        with mock.patch.object(
+                alg,
+                "_sample_actor_critic_matchings",
+                return_value=matching):
+            _, actor_info = alg._actor_train_step(
+                torch.randn(2, 4), action, torch.zeros(2, 2), mask, ())
+
+        actor_loss_grad = torch.autograd.grad(actor_info.loss.sum(), action)[0]
+        actor_slopes = torch.empty_like(slopes)
+        for critic_id, actor_id in enumerate(matching[0]):
+            actor_slopes[actor_id] = slopes[critic_id]
+        expected = (-actor_slopes.unsqueeze(0) * mask.unsqueeze(-1) /
+                    alg._bootstrap_mask_prob)
+        self.assertTensorClose(actor_loss_grad, expected)
+
+    def test_multi_critic_actor_step_uses_one_forward_and_vjp(self):
+        alg = self._make_alg(
+            actor_critic_pairing=False,
+            num_sampled_critics_for_actor=2,
+            actor_eval_type='last_two',
+            dqda_clipping=0.1,
+            debug_summaries=True)
+        observation = torch.randn(2, 4)
+        action = alg._actor_networks(observation)[0]
+        with mock.patch.object(
+                alf.summary, "should_record_summaries", return_value=True), \
+             mock.patch.object(alf.summary, "scalar") as scalar_mock, \
+             mock.patch.object(alf.summary, "histogram"), \
+             mock.patch(
+                 "alf.algorithms.bafc_algorithm_v3.safe_mean_hist_summary"
+             ) as summary_mock, \
+             mock.patch(
+                 "alf.algorithms.bafc_algorithm_v3.nest_utils.grad",
+                 wraps=nest_utils.grad) as grad_mock, \
+             mock.patch.object(
+                 alg._critic_networks,
+                 "forward",
+                 wraps=alg._critic_networks.forward) as critic_forward_mock:
+            _, actor_info = alg._actor_train_step(
+                observation, action, torch.zeros(2, 2), torch.ones(2, 3), ())
+
+        self.assertEqual(grad_mock.call_count, 1)
+        self.assertEqual(critic_forward_mock.call_count, 1)
+        summary_names = {call.args[0] for call in summary_mock.call_args_list}
+        self.assertIn('actor_gradients/dqda', summary_names)
+        self.assertIn('actor_gradients/clipped_dqda', summary_names)
+        self.assertIn('actor_critic_aggregation/q_mean', summary_names)
+        self.assertIn('actor_critic_aggregation/dqda_pairwise_cosine',
+                      summary_names)
+        scalar_names = {
+            call.args[0] if call.args else call.kwargs['name']
+            for call in scalar_mock.call_args_list
+        }
+        self.assertIn('actor_gradients/dqda_clip_fraction', scalar_names)
+
+        total_loss = actor_info.loss.mean() + actor_info.extra.eval_action_loss.mean()
+        total_loss.backward()
+
+    def test_agreement_summaries_follow_debug_and_k(self):
+        observation = torch.randn(2, 4)
+        with mock.patch.object(
+                alf.summary, "should_record_summaries", return_value=True), \
+             mock.patch.object(alf.summary, "scalar"), \
+             mock.patch.object(alf.summary, "histogram"), \
+             mock.patch(
+                 "alf.algorithms.bafc_algorithm_v3.safe_mean_hist_summary"
+             ) as summary_mock:
+            no_debug_alg = self._make_alg(
+                actor_critic_pairing=False,
+                num_sampled_critics_for_actor=2,
+                actor_eval_type='output')
+            no_debug_action = no_debug_alg._actor_networks(observation)[0]
+            no_debug_alg._actor_train_step(
+                observation, no_debug_action, torch.zeros(2, 2),
+                torch.ones(2, 3), ())
+            summary_mock.assert_not_called()
+
+            k1_alg = self._make_alg(
+                actor_critic_pairing=False,
+                actor_eval_type='output',
+                debug_summaries=True)
+            k1_action = k1_alg._actor_networks(observation)[0]
+            k1_alg._actor_train_step(
+                observation, k1_action, torch.zeros(2, 2), torch.ones(2, 3), ())
+            summary_names = {
+                call.args[0] for call in summary_mock.call_args_list
+            }
+            self.assertIn('actor_gradients/dqda', summary_names)
+            self.assertFalse(
+                any(name.startswith('actor_critic_aggregation/')
+                    for name in summary_names))
+
+    def test_linear_memory_pairwise_cosine(self):
+        individual_dqda = torch.randn(4, 2, 3, 5)
+        normalized = individual_dqda / individual_dqda.norm(
+            dim=-1, keepdim=True).clamp_min(1e-12)
+        expected = torch.zeros(2, 3)
+        for i in range(4):
+            for j in range(4):
+                if i != j:
+                    expected += (normalized[i] * normalized[j]).sum(dim=-1)
+        expected /= 4 * 3
+        actual = BafcAlgorithmV3._mean_pairwise_cosine(individual_dqda)
+        self.assertTensorClose(actual, expected)
 
 
 if __name__ == "__main__":
