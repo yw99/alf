@@ -128,7 +128,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  debug_summaries=False,
                  reproduce_locomotion=False,
                  name="BafcAlgorithm",
-                 num_sampled_critics_for_actor=1):
+                 num_sampled_critics_for_actor=1,
+                 use_random_critic_targets=False,
+                 num_sampled_critic_targets=1):
         """
         Args:
 
@@ -141,6 +143,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             num_sampled_critics_for_actor (int): the number of distinct critics
                 used to update each actor when ``actor_critic_pairing`` is False.
                 Their gradients are averaged. It must be 1 when pairing is fixed.
+            use_random_critic_targets (bool): whether to use an RLPD-style
+                shared TD target sampled from the target critic ensemble. When
+                False, critic ``i`` uses target critic ``i`` as before.
+            num_sampled_critic_targets (int): the number of target critics
+                sampled without replacement when ``use_random_critic_targets``
+                is True. Their elementwise minimum is shared by all online
+                critics. A value of 1 selects one random target critic.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -160,6 +169,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         assert not actor_critic_pairing or num_sampled_critics_for_actor == 1, (
             "num_sampled_critics_for_actor must be 1 when "
             "actor_critic_pairing is True.")
+        assert 1 <= num_sampled_critic_targets <= num_actor_critic, (
+            "num_sampled_critic_targets must be between 1 and "
+            f"num_actor_critic ({num_actor_critic}), got "
+            f"{num_sampled_critic_targets}.")
         assert critic_reweighting_num_target_obs >= 1, (
             "critic_reweighting_num_target_obs must be >= 1")
         if critic_reweighting_target_obs_cache_size is None:
@@ -191,6 +204,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._num_actor_critic = num_actor_critic
         self._actor_critic_pairing = actor_critic_pairing
         self._num_sampled_critics_for_actor = num_sampled_critics_for_actor
+        self._use_random_critic_targets = use_random_critic_targets
+        self._num_sampled_critic_targets = num_sampled_critic_targets
         self._use_bootstrap_actors = use_bootstrap_actors
         self._use_bootstrap_critics = use_bootstrap_critics
         self._bootstrap_mask_prob = bootstrap_mask_prob
@@ -802,7 +817,34 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             extra=BafcActorInfo(eval_action_loss=eval_action_loss)) 
         return critic_state, actor_info
 
-    def _critic_train_step(self, observation, state: BafcCriticState, 
+    def _select_critic_targets(self, target_critics):
+        """Optionally construct one RLPD-style target for all critics.
+
+        Args:
+            target_critics: target values with shape
+                ``[batch, n_actor, n_critic, ...]``.
+
+        Returns:
+            The input unchanged when random targets are disabled. Otherwise,
+            returns the elementwise minimum of a random subset with shape
+            ``[batch, n_actor, ...]``.
+        """
+        if not self._use_random_critic_targets:
+            return target_critics
+
+        if self._num_sampled_critic_targets < self._num_actor_critic:
+            critic_ids = torch.randperm(
+                self._num_actor_critic,
+                device=target_critics.device)[:self._num_sampled_critic_targets]
+            sampled_targets = target_critics.index_select(2, critic_ids)
+        else:
+            sampled_targets = target_critics
+        if self.has_multidim_reward():
+            sign = self.reward_weights.sign()
+            return (sampled_targets * sign).min(dim=2)[0] * sign
+        return sampled_targets.min(dim=2)[0]
+
+    def _critic_train_step(self, observation, state: BafcCriticState,
                            rollout_info: BafcInfo, action): 
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
@@ -850,6 +892,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         target_critics = target_critics.reshape(
             -1, self._num_actor_critic, *target_critics.shape[1:])
         target_critics = target_critics.detach()
+        target_critics = self._select_critic_targets(target_critics)
 
         state = BafcCriticState(
             critic=critic_state, target_critic=target_critic_state)
@@ -963,11 +1006,17 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             critic_info = info.critic
             critic_losses = []
             for i, l in enumerate(self._critic_losses):
-                # critics & target_critics has shape [T, S, n_actor, n_critic]
+                # critics has shape [T, S, n_actor, n_critic, ...].
+                # A random shared target has shape [T, S, n_actor, ...];
+                # otherwise targets retain the critic dimension.
+                if self._use_random_critic_targets:
+                    target_value = critic_info.target_critic
+                else:
+                    target_value = critic_info.target_critic[:, :, :, i, ...]
                 critic_loss = l(
                     info=info,
                     value=critic_info.critic[:, :, :, i, ...],
-                    target_value=critic_info.target_critic[:, :, :, i, ...]).loss
+                    target_value=target_value).loss
                 if self._use_bootstrap_critics:
                     bootstrap_mask = info.bootstrap_mask[:, :,
                                                          i] / self._bootstrap_mask_prob

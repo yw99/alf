@@ -33,6 +33,12 @@ actor_critic_pairing = alf.get_config_value('bafcv3_actor_critic_pairing')
 alf.define_config('bafcv3_num_sampled_critics_for_actor', 1)
 num_sampled_critics_for_actor = alf.get_config_value(
     'bafcv3_num_sampled_critics_for_actor')
+alf.define_config('bafcv3_use_random_critic_targets', False)
+use_random_critic_targets = alf.get_config_value(
+    'bafcv3_use_random_critic_targets')
+alf.define_config('bafcv3_num_sampled_critic_targets', 1)
+num_sampled_critic_targets = alf.get_config_value(
+    'bafcv3_num_sampled_critic_targets')
 alf.define_config('bafcv3_num_actor_critic', 10)
 num_actor_critic = alf.get_config_value('bafcv3_num_actor_critic')
 alf.define_config('bafcv3_use_bootstrap_actors', False)
@@ -89,6 +95,8 @@ alf.config(
     num_actor_critic=num_actor_critic,
     actor_critic_pairing=actor_critic_pairing,
     num_sampled_critics_for_actor=num_sampled_critics_for_actor,
+    use_random_critic_targets=use_random_critic_targets,
+    num_sampled_critic_targets=num_sampled_critic_targets,
     use_bootstrap_actors=use_bootstrap_actors,
     use_bootstrap_critics=use_bootstrap_critics,
     actor_use_ln=actor_use_ln,

@@ -13,6 +13,9 @@
 #       --num-actor-critic N           Number of actor-critic pairs (default: 10)
 #       --num-sampled-critics-for-actor N
 #                                      Critics averaged per actor (default: 1)
+#       --use-random-critic-targets BOOL
+#                                      Use an RLPD-style shared TD target (default: False)
+#       --num-sampled-critic-targets N Target critics reduced by min (default: 1)
 #       --num-attention-heads N        Transformer attention heads (default: 4)
 #       --gpus CSV                     Comma-separated GPU ids (default: 0,1,2,3)
 #       --checkpoints N                Number of checkpoints (default: 10)
@@ -23,6 +26,7 @@
 #   bash run_bafcv3_critic_utd_sweep_seed01-4g.sh --critic-utds 2,3,5
 #   bash run_bafcv3_critic_utd_sweep_seed01-4g.sh --actor-critic-pairing false
 #   bash run_bafcv3_critic_utd_sweep_seed01-4g.sh --actor-critic-pairing false --num-sampled-critics-for-actor 4
+#   bash run_bafcv3_critic_utd_sweep_seed01-4g.sh --use-random-critic-targets true --num-sampled-critic-targets 2
 
 set -euo pipefail
 
@@ -40,6 +44,8 @@ LEARNING_RATE=3e-4
 ACTOR_CRITIC_PAIRING=False
 NUM_ACTOR_CRITIC=10
 NUM_SAMPLED_CRITICS_FOR_ACTOR=1
+USE_RANDOM_CRITIC_TARGETS=False
+NUM_SAMPLED_CRITIC_TARGETS=1
 NUM_ATTENTION_HEADS=1
 DEBUG_SUMMARIES=True
 SEEDS=(0 1)
@@ -107,6 +113,17 @@ while [[ $# -gt 0 ]]; do
             NUM_SAMPLED_CRITICS_FOR_ACTOR="$2"
             shift 2
             ;;
+        --use-random-critic-targets)
+            if ! USE_RANDOM_CRITIC_TARGETS="$(normalize_bool "$2")"; then
+                echo "--use-random-critic-targets must be true or false, got: $2" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        --num-sampled-critic-targets)
+            NUM_SAMPLED_CRITIC_TARGETS="$2"
+            shift 2
+            ;;
         --num-attention-heads)
             NUM_ATTENTION_HEADS="$2"
             shift 2
@@ -166,6 +183,14 @@ if [[ "${ACTOR_CRITIC_PAIRING}" == "True" && "${NUM_SAMPLED_CRITICS_FOR_ACTOR}" 
     echo "--num-sampled-critics-for-actor must be 1 when --actor-critic-pairing is true" >&2
     exit 1
 fi
+if [[ ! "${NUM_SAMPLED_CRITIC_TARGETS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--num-sampled-critic-targets must be a positive integer, got: ${NUM_SAMPLED_CRITIC_TARGETS}" >&2
+    exit 1
+fi
+if (( NUM_SAMPLED_CRITIC_TARGETS > NUM_ACTOR_CRITIC )); then
+    echo "--num-sampled-critic-targets (${NUM_SAMPLED_CRITIC_TARGETS}) cannot exceed --num-actor-critic (${NUM_ACTOR_CRITIC})" >&2
+    exit 1
+fi
 if [[ ! "${NUM_ATTENTION_HEADS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--num-attention-heads must be a positive integer, got: ${NUM_ATTENTION_HEADS}" >&2
     exit 1
@@ -173,6 +198,9 @@ fi
 
 ENV_DIR="${ENV_NAME%%:*}"
 ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_dmc_4g_critic_utd_sweep/lr${LEARNING_RATE}/actor_critic_pairing${ACTOR_CRITIC_PAIRING}_num_actor_critic${NUM_ACTOR_CRITIC}_num_sampled_critics_for_actor${NUM_SAMPLED_CRITICS_FOR_ACTOR}_num_attention_heads${NUM_ATTENTION_HEADS}"
+if [[ "${USE_RANDOM_CRITIC_TARGETS}" == "True" ]]; then
+    ROOT_DIR="${ROOT_DIR}/random_critic_targetsTrue_num_sampled_critic_targets${NUM_SAMPLED_CRITIC_TARGETS}"
+fi
 
 cat <<EOF
 Starting BAFCv3 critic-UTD sweep
@@ -188,6 +216,8 @@ Starting BAFCv3 critic-UTD sweep
   actor_critic_pairing: ${ACTOR_CRITIC_PAIRING}
   num_actor_critic: ${NUM_ACTOR_CRITIC}
   num_sampled_critics_for_actor: ${NUM_SAMPLED_CRITICS_FOR_ACTOR}
+  use_random_critic_targets: ${USE_RANDOM_CRITIC_TARGETS}
+  num_sampled_critic_targets: ${NUM_SAMPLED_CRITIC_TARGETS}
   num_attention_heads: ${NUM_ATTENTION_HEADS}
   debug_summaries: ${DEBUG_SUMMARIES}
   GPUs: ${GPUS}
@@ -222,6 +252,8 @@ for critic_utd_i in "${!CRITIC_UTDS[@]}"; do
             --conf_param "bafcv3_actor_critic_pairing=${ACTOR_CRITIC_PAIRING}" \
             --conf_param "bafcv3_num_actor_critic=${NUM_ACTOR_CRITIC}" \
             --conf_param "bafcv3_num_sampled_critics_for_actor=${NUM_SAMPLED_CRITICS_FOR_ACTOR}" \
+            --conf_param "bafcv3_use_random_critic_targets=${USE_RANDOM_CRITIC_TARGETS}" \
+            --conf_param "bafcv3_num_sampled_critic_targets=${NUM_SAMPLED_CRITIC_TARGETS}" \
             --conf_param "bafcv3_use_bootstrap_actors=False" \
             --conf_param "bafcv3_use_bootstrap_critics=False" \
             --conf_param "bafcv3_num_attention_heads=${NUM_ATTENTION_HEADS}" \

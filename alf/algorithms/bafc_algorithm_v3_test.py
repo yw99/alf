@@ -21,7 +21,8 @@ import torch
 
 import alf
 from alf.algorithms.agent import Agent
-from alf.algorithms.bafc_algorithm_v3 import BafcAlgorithmV3
+from alf.algorithms.bafc_algorithm_v3 import (BafcAlgorithmV3, BafcCriticInfo,
+                                              BafcInfo)
 from alf.algorithms.config import TrainerConfig
 from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import StepType, TimeStep
@@ -68,6 +69,8 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
 
     def _make_alg(self, **kwargs):
         num_actor_critic = kwargs.pop("num_actor_critic", 3)
+        reward_spec = kwargs.pop("reward_spec", TensorSpec(()))
+        reward_weights = kwargs.pop("reward_weights", None)
         config = TrainerConfig(
             root_dir=tempfile.mkdtemp(prefix="bafc_v3_test_"),
             unroll_length=2,
@@ -78,6 +81,8 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
         return BafcAlgorithmV3(
             observation_spec=TensorSpec((4, )),
             action_spec=BoundedTensorSpec((2, ), minimum=-1.0, maximum=1.0),
+            reward_spec=reward_spec,
+            reward_weights=reward_weights,
             config=config,
             actor_network_cls=partial(ActorFCNetwork, fc_layer_params=(32, 32)),
             critic_network_cls=partial(
@@ -280,6 +285,80 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
                 num_sampled_critics_for_actor=4)
         with self.assertRaisesRegex(AssertionError, "pairing is True"):
             self._make_alg(num_sampled_critics_for_actor=2)
+
+    def test_num_sampled_critic_targets_validation(self):
+        with self.assertRaisesRegex(AssertionError, "between 1"):
+            self._make_alg(num_sampled_critic_targets=0)
+        with self.assertRaisesRegex(AssertionError, "between 1"):
+            self._make_alg(num_sampled_critic_targets=4)
+
+    def test_disabled_random_critic_targets_preserve_targets_and_rng(self):
+        alg = self._make_alg()
+        targets = torch.randn(2, 3, 3)
+        with mock.patch("torch.randperm") as randperm:
+            selected = alg._select_critic_targets(targets)
+        self.assertIs(selected, targets)
+        randperm.assert_not_called()
+
+    def test_random_single_critic_target_is_shared_by_all_losses(self):
+        alg = self._make_alg(
+            use_random_critic_targets=True,
+            num_sampled_critic_targets=1)
+        targets = torch.arange(18, dtype=torch.float32).reshape(2, 3, 3)
+        with mock.patch(
+                "torch.randperm", return_value=torch.tensor([2, 0, 1])):
+            selected = alg._select_critic_targets(targets)
+        self.assertTensorEqual(selected, targets[:, :, 2])
+
+        captured_targets = []
+
+        def _loss(**kwargs):
+            captured_targets.append(kwargs["target_value"])
+            return SimpleNamespace(loss=torch.zeros(1, 1, 3))
+
+        alg._critic_losses = [mock.Mock(side_effect=_loss) for _ in range(3)]
+        shared_target = selected[:1].unsqueeze(0)
+        info = BafcInfo(
+            critic=BafcCriticInfo(
+                critic=torch.zeros(1, 1, 3, 3),
+                target_critic=shared_target))
+        alg._calc_critic_loss(info)
+        self.assertEqual(len(captured_targets), 3)
+        for target in captured_targets:
+            self.assertIs(target, shared_target)
+
+    def test_multiple_random_critic_targets_use_subset_min(self):
+        alg = self._make_alg(
+            use_random_critic_targets=True,
+            num_sampled_critic_targets=2)
+        targets = torch.tensor([[[3., 1., 2.], [6., 5., 4.]]])
+        with mock.patch(
+                "torch.randperm", return_value=torch.tensor([0, 2, 1])):
+            selected = alg._select_critic_targets(targets)
+        self.assertTensorEqual(selected, torch.tensor([[2., 4.]]))
+
+    def test_all_random_critic_targets_use_full_min(self):
+        alg = self._make_alg(
+            use_random_critic_targets=True,
+            num_sampled_critic_targets=3)
+        targets = torch.tensor([[[3., 1., 2.], [6., 5., 4.]]])
+        with mock.patch("torch.randperm") as randperm:
+            selected = alg._select_critic_targets(targets)
+        self.assertTensorEqual(selected, torch.tensor([[1., 4.]]))
+        randperm.assert_not_called()
+
+    def test_random_critic_targets_preserve_signed_reward_dimensions(self):
+        alg = self._make_alg(
+            reward_spec=TensorSpec((2, )),
+            reward_weights=[1., -1.],
+            use_random_critic_targets=True,
+            num_sampled_critic_targets=2)
+        targets = torch.tensor([[[[1., 10.], [2., 5.], [0., 7.]]]])
+        with mock.patch(
+                "torch.randperm", return_value=torch.tensor([0, 1, 2])):
+            selected = alg._select_critic_targets(targets)
+        self.assertEqual(selected.shape, (1, 1, 2))
+        self.assertTensorEqual(selected, torch.tensor([[[1., 10.]]]))
 
     def test_balanced_actor_critic_matchings(self):
         alg = self._make_alg(
