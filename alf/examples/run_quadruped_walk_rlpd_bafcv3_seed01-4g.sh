@@ -30,7 +30,7 @@ PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 ENV_NAME="quadruped:walk"
 BASE_DIR="/root/numeric_results"
-NUM_ENV_STEPS=1000000
+NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
 GPUS="0,1,2,3"
 BASE_PORT=29500
