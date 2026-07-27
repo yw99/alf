@@ -1,12 +1,14 @@
 #!/bin/bash
-# Launch BAFCv3_TR and BAFCv6 random-target conditions on seeds 0 and 1.
+# Launch BAFCv3_TR2 and BAFCv6 random-target conditions on seeds 0 and 1.
 # Each job uses all configured GPUs through DDP; all six jobs run in parallel.
 #
 # Conditions (all use pairing=False, K_actor=8, and critic_utd=11):
-#   1. BAFCv3_TR, random critic TD targets enabled
-#   2. BAFCv3_TR, random critic TD targets disabled
+#   1. BAFCv3_TR2, random critic TD targets enabled
+#   2. BAFCv3_TR2, random critic TD targets disabled
 #   3. BAFCv6,    random critic TD targets enabled
 # Random-target conditions use M_target=1 by default.
+# TR2 uses eval trust threshold 30 without decay. Its eval metric and
+# rollout-skip gate are enabled; its grad metric/actor-extend gate is disabled.
 #
 # Usage: bash run_bafcv3_tr_v6_random_target_sweep_seed01-4g.sh [options]
 #   -e, --env ENV_NAME              DMC environment (default: humanoid:walk)
@@ -27,7 +29,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-TR_CONF_FILE="${SCRIPT_DIR}/bafcv3_tr_dmc_conf.py"
+TR2_CONF_FILE="${SCRIPT_DIR}/bafcv3_tr2_dmc_conf.py"
 V6_CONF_FILE="${SCRIPT_DIR}/bafcv6_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
@@ -41,29 +43,42 @@ NUM_SAMPLED_CRITIC_TARGETS=1
 CRITIC_UTD=11
 NUM_UPDATES_PER_TRAIN_ITER=12
 DEBUG_SUMMARIES=True
+EVAL_TRUST_MAX=30.0
+EVAL_TRUST_MAX_DECAY=False
+NUM_FEATURE_COORDS=4
+METRIC_INTERVAL=8
+ROLLOUT_SKIP_CAP=3
+ROLLOUT_SKIP_EVAL_INTERVAL=60
+FREEZE_EVAL_SAMPLES=False
+TR2_ACTOR_USE_LN=False
+ENABLE_CRITIC_REWEIGHTING=False
+CRITIC_REWEIGHTING_BETA=None
+CRITIC_REWEIGHTING_RIDGE=None
+CRITIC_REWEIGHTING_SOLVER_ITERS=5
+CRITIC_REWEIGHTING_MAX_WEIGHT=20.0
 GPUS="0,1,2,3"
 BASE_PORT=29500
 DRY_RUN=False
 SEEDS=(0 1)
 
 CONDITION_NAMES=(
-    "bafcv3_tr_random_target"
-    "bafcv3_tr_no_random_target"
+    "bafcv3_tr2_random_target"
+    "bafcv3_tr2_no_random_target"
     "bafcv6_random_target"
 )
 CONF_FILES=(
-    "${TR_CONF_FILE}"
-    "${TR_CONF_FILE}"
+    "${TR2_CONF_FILE}"
+    "${TR2_CONF_FILE}"
     "${V6_CONF_FILE}"
 )
 ALGORITHM_CONFIGS=(
-    "BafcAlgorithmV3"
-    "BafcAlgorithmV3"
+    "BafcAlgorithmV3TR2"
+    "BafcAlgorithmV3TR2"
     "BafcAlgorithmV6"
 )
 CONFIG_PREFIXES=(
-    "bafcv3_tr"
-    "bafcv3_tr"
+    "bafcv3_tr2"
+    "bafcv3_tr2"
     "bafcv6"
 )
 USE_RANDOM_CRITIC_TARGETS=(True False True)
@@ -127,7 +142,7 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Set PYTHON_BIN to a working interpreter, or create ${REPO_ROOT}/.venv." >&2
     exit 1
 fi
-for conf_file in "${TR_CONF_FILE}" "${V6_CONF_FILE}"; do
+for conf_file in "${TR2_CONF_FILE}" "${V6_CONF_FILE}"; do
     if [[ ! -f "${conf_file}" ]]; then
         echo "Config file not found: ${conf_file}" >&2
         exit 1
@@ -160,11 +175,11 @@ if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + 5 > 65535 )); then
 fi
 
 ENV_DIR="${ENV_NAME%%:*}"
-ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_tr_v6_random_target_sweep_4g/num_actor_critic${NUM_ACTOR_CRITIC}_num_sampled_critics_for_actor${NUM_SAMPLED_CRITICS_FOR_ACTOR}_num_sampled_critic_targets${NUM_SAMPLED_CRITIC_TARGETS}/critic_utd${CRITIC_UTD}"
+ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_tr2_v6_random_target_sweep_4g/num_actor_critic${NUM_ACTOR_CRITIC}_num_sampled_critics_for_actor${NUM_SAMPLED_CRITICS_FOR_ACTOR}_num_sampled_critic_targets${NUM_SAMPLED_CRITIC_TARGETS}/critic_utd${CRITIC_UTD}"
 
 cat <<EOF
-Starting BAFCv3_TR/BAFCv6 random-target sweep
-  TR config: ${TR_CONF_FILE}
+Starting BAFCv3_TR2/BAFCv6 random-target sweep
+  TR2 config: ${TR2_CONF_FILE}
   v6 config: ${V6_CONF_FILE}
   Environment: ${ENV_NAME}
   Root dir: ${ROOT_DIR}
@@ -176,6 +191,16 @@ Starting BAFCv3_TR/BAFCv6 random-target sweep
   num_sampled_critics_for_actor: ${NUM_SAMPLED_CRITICS_FOR_ACTOR}
   num_sampled_critic_targets: ${NUM_SAMPLED_CRITIC_TARGETS}
   critic_utd: ${CRITIC_UTD}
+  TR2 eval threshold: ${EVAL_TRUST_MAX}
+  TR2 eval threshold decay: ${EVAL_TRUST_MAX_DECAY}
+  TR2 eval metric/rollout-skip gate: enabled
+  TR2 grad metric/actor-extend gate: disabled
+  TR2 trust feature coordinates: ${NUM_FEATURE_COORDS}
+  TR2 trust metric interval: ${METRIC_INTERVAL}
+  TR2 rollout skip cap: ${ROLLOUT_SKIP_CAP}
+  TR2 rollout-skip eval interval: ${ROLLOUT_SKIP_EVAL_INTERVAL}
+  TR2 actor layer norm: ${TR2_ACTOR_USE_LN}
+  TR2 critic reweighting: ${ENABLE_CRITIC_REWEIGHTING}
   debug_summaries: ${DEBUG_SUMMARIES}
   GPUs per job: ${GPUS}
   Dry run: ${DRY_RUN}
@@ -214,8 +239,29 @@ for condition_index in "${!CONDITION_NAMES[@]}"; do
             --conf_param "${CONFIG_PREFIX}_use_random_critic_targets=${RANDOM_TARGETS}"
             --conf_param "${CONFIG_PREFIX}_num_sampled_critic_targets=${NUM_SAMPLED_CRITIC_TARGETS}"
             --conf_param "create_environment.env_name='${ENV_NAME}'"
-            --distributed multi-gpu
         )
+        if [[ "${ALGORITHM_CONFIG}" == "BafcAlgorithmV3TR2" ]]; then
+            COMMAND+=(
+                --conf_param "bafcv3_tr2_actor_use_ln=${TR2_ACTOR_USE_LN}"
+                --conf_param "TrainerConfig.rollout_skip_eval=True"
+                --conf_param "TrainerConfig.rollout_skip_eval_interval=${ROLLOUT_SKIP_EVAL_INTERVAL}"
+                --conf_param "BafcAlgorithmV3TR2.monitor_trust_metrics=True"
+                --conf_param "BafcAlgorithmV3TR2.eval_trust_max=${EVAL_TRUST_MAX}"
+                --conf_param "BafcAlgorithmV3TR2.enable_eval_trust_max_decay=${EVAL_TRUST_MAX_DECAY}"
+                --conf_param "BafcAlgorithmV3TR2.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}"
+                --conf_param "BafcAlgorithmV3TR2.trust_metric_update_interval=${METRIC_INTERVAL}"
+                --conf_param "BafcAlgorithmV3TR2.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}"
+                --conf_param "BafcAlgorithmV3TR2.freeze_eval_samples=${FREEZE_EVAL_SAMPLES}"
+                --conf_param "BafcAlgorithmV3TR2.enable_eval_rollout_skip_gate=True"
+                --conf_param "BafcAlgorithmV3TR2.enable_grad_actor_extend_gate=False"
+                --conf_param "BafcAlgorithmV3TR2.enable_critic_reweighting=${ENABLE_CRITIC_REWEIGHTING}"
+                --conf_param "BafcAlgorithmV3TR2.critic_reweighting_beta=${CRITIC_REWEIGHTING_BETA}"
+                --conf_param "BafcAlgorithmV3TR2.critic_reweighting_ridge=${CRITIC_REWEIGHTING_RIDGE}"
+                --conf_param "BafcAlgorithmV3TR2.critic_reweighting_solver_iters=${CRITIC_REWEIGHTING_SOLVER_ITERS}"
+                --conf_param "BafcAlgorithmV3TR2.critic_reweighting_max_weight=${CRITIC_REWEIGHTING_MAX_WEIGHT}"
+            )
+        fi
+        COMMAND+=(--distributed multi-gpu)
 
         if [[ "${DRY_RUN}" == "True" ]]; then
             printf 'CUDA_VISIBLE_DEVICES=%q MASTER_PORT=%q ' "${GPUS}" "${MASTER_PORT}"
@@ -237,7 +283,7 @@ done
 if [[ "${DRY_RUN}" == "True" ]]; then
     echo "Dry run complete; no jobs were launched."
 else
-    echo "Launched six BAFCv3_TR/BAFCv6 4-GPU jobs: ${PIDS[*]}"
+    echo "Launched six BAFCv3_TR2/BAFCv6 4-GPU jobs: ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
 fi
 echo "To monitor: tail -f ${ROOT_DIR}/*/seed_*/out.log"
