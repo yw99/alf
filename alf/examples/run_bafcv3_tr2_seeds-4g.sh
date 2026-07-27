@@ -9,6 +9,8 @@
 #   -n, --steps NUM_STEPS     Total environment steps (default: 400000)
 #       --critic-utd N        Critic update-to-data ratio (default: 3)
 #       --eval-trust-max X    Eval trust threshold (default: 40.0)
+#       --eval-trust-max-decay Enable linear eval trust threshold decay
+#       --no-eval-trust-max-decay Disable eval trust threshold decay (default)
 #       NUM_CHECKPOINTS=1 disables intermediate checkpoints by default
 #   -h, --help                Show this help message
 #
@@ -18,6 +20,7 @@
 #   bash run_bafcv3_tr2_seeds-4g.sh --env hopper:hop --steps 2000000 --dir /my/results
 #   EVAL_TRUST_MAX=30.0 bash run_bafcv3_tr2_seeds-4g.sh --critic-utd 3
 #   bash run_bafcv3_tr2_seeds-4g.sh --critic-utd 3 --eval-trust-max 30.0
+#   bash run_bafcv3_tr2_seeds-4g.sh --critic-utd 3 --eval-trust-max 30.0 --eval-trust-max-decay
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +34,7 @@ NUM_ENV_STEPS=480000
 # with per-rank rollout progress and hang at the checkpoint barrier.
 NUM_CHECKPOINTS=1
 EVAL_TRUST_MAX="${EVAL_TRUST_MAX:-30.0}"
+EVAL_TRUST_MAX_DECAY="${EVAL_TRUST_MAX_DECAY:-False}"
 NUM_FEATURE_COORDS=4
 METRIC_INTERVAL=8
 ROLLOUT_SKIP_CAP=3
@@ -72,6 +76,14 @@ while [[ $# -gt 0 ]]; do
             EVAL_TRUST_MAX="$2"
             shift 2
             ;;
+        --eval-trust-max-decay)
+            EVAL_TRUST_MAX_DECAY=True
+            shift
+            ;;
+        --no-eval-trust-max-decay)
+            EVAL_TRUST_MAX_DECAY=False
+            shift
+            ;;
         -h|--help)
             print_help
             exit 0
@@ -94,10 +106,19 @@ if [[ ! "${EVAL_TRUST_MAX}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     exit 1
 fi
 
+if [[ "${EVAL_TRUST_MAX_DECAY}" != "True" && "${EVAL_TRUST_MAX_DECAY}" != "False" ]]; then
+    echo "EVAL_TRUST_MAX_DECAY must be True or False, got: ${EVAL_TRUST_MAX_DECAY}" >&2
+    exit 1
+fi
+
 # Extract domain name for directory (e.g., hopper:hop -> hopper)
 ENV_DIR=$(echo "$ENV_NAME" | cut -d':' -f1)
 ROOT_BASE="${BASE_DIR}/${ENV_DIR}/bafcv3_tr2_dmc_4g"
-ROOT_DIR="${ROOT_BASE}/critic_utd${CRITIC_UTD}/eval${EVAL_TRUST_MAX}"
+EVAL_DIR="eval${EVAL_TRUST_MAX}"
+if [[ "${EVAL_TRUST_MAX_DECAY}" == "True" ]]; then
+    EVAL_DIR="${EVAL_DIR}_decay"
+fi
+ROOT_DIR="${ROOT_BASE}/critic_utd${CRITIC_UTD}/${EVAL_DIR}"
 
 echo "Starting BAFCv3-TR2 training with 4 seeds on shared GPUs 0,1,2,3"
 echo "  Config: $CONF_FILE"
@@ -108,6 +129,7 @@ echo "  Num checkpoints: $NUM_CHECKPOINTS"
 echo "  Seeds: ${SEEDS[*]}"
 echo "  critic_utd: $CRITIC_UTD"
 echo "  Eval threshold: $EVAL_TRUST_MAX"
+echo "  Eval threshold decay: $EVAL_TRUST_MAX_DECAY"
 echo "  num_feature_coords: $NUM_FEATURE_COORDS"
 echo "  metric_interval: $METRIC_INTERVAL"
 echo "  rollout_skip_cap: $ROLLOUT_SKIP_CAP"
@@ -140,6 +162,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 MASTER_PORT=29500 python -m alf.bin.train \
     --conf_param "BafcAlgorithmV3TR2.monitor_trust_metrics=True" \
     --conf_param "BafcAlgorithmV3TR2.critic_utd=${CRITIC_UTD}" \
     --conf_param "BafcAlgorithmV3TR2.eval_trust_max=${EVAL_TRUST_MAX}" \
+    --conf_param "BafcAlgorithmV3TR2.enable_eval_trust_max_decay=${EVAL_TRUST_MAX_DECAY}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_update_interval=${METRIC_INTERVAL}" \
     --conf_param "BafcAlgorithmV3TR2.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}" \
@@ -170,6 +193,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 MASTER_PORT=29501 python -m alf.bin.train \
     --conf_param "BafcAlgorithmV3TR2.monitor_trust_metrics=True" \
     --conf_param "BafcAlgorithmV3TR2.critic_utd=${CRITIC_UTD}" \
     --conf_param "BafcAlgorithmV3TR2.eval_trust_max=${EVAL_TRUST_MAX}" \
+    --conf_param "BafcAlgorithmV3TR2.enable_eval_trust_max_decay=${EVAL_TRUST_MAX_DECAY}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_update_interval=${METRIC_INTERVAL}" \
     --conf_param "BafcAlgorithmV3TR2.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}" \
@@ -200,6 +224,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 MASTER_PORT=29502 python -m alf.bin.train \
     --conf_param "BafcAlgorithmV3TR2.monitor_trust_metrics=True" \
     --conf_param "BafcAlgorithmV3TR2.critic_utd=${CRITIC_UTD}" \
     --conf_param "BafcAlgorithmV3TR2.eval_trust_max=${EVAL_TRUST_MAX}" \
+    --conf_param "BafcAlgorithmV3TR2.enable_eval_trust_max_decay=${EVAL_TRUST_MAX_DECAY}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_update_interval=${METRIC_INTERVAL}" \
     --conf_param "BafcAlgorithmV3TR2.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}" \
@@ -230,6 +255,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 MASTER_PORT=29503 python -m alf.bin.train \
     --conf_param "BafcAlgorithmV3TR2.monitor_trust_metrics=True" \
     --conf_param "BafcAlgorithmV3TR2.critic_utd=${CRITIC_UTD}" \
     --conf_param "BafcAlgorithmV3TR2.eval_trust_max=${EVAL_TRUST_MAX}" \
+    --conf_param "BafcAlgorithmV3TR2.enable_eval_trust_max_decay=${EVAL_TRUST_MAX_DECAY}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_num_feature_coords=${NUM_FEATURE_COORDS}" \
     --conf_param "BafcAlgorithmV3TR2.trust_metric_update_interval=${METRIC_INTERVAL}" \
     --conf_param "BafcAlgorithmV3TR2.eval_gate_max_consecutive_rollout_skips=${ROLLOUT_SKIP_CAP}" \

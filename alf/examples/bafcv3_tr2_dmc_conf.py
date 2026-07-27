@@ -36,6 +36,7 @@ obs_normalizer_clipping = False
 trust_cov_reg = 1e-4
 monitor_trust_metrics = True
 eval_trust_max = 2.0
+eval_trust_max_decay = False
 delta_trust_max = 2.0
 eval_gate_max_consecutive_rollout_skips = 5
 grad_gate_max_consecutive_actor_extensions = 5
@@ -108,6 +109,7 @@ alf.config(
     delta_trust_max=delta_trust_max,
     trust_metric_update_interval=1,
     enable_eval_rollout_skip_gate=False,
+    enable_eval_trust_max_decay=eval_trust_max_decay,
     enable_grad_actor_extend_gate=True,
     eval_gate_max_consecutive_rollout_skips=eval_gate_max_consecutive_rollout_skips,
     grad_gate_max_consecutive_actor_extensions=grad_gate_max_consecutive_actor_extensions,

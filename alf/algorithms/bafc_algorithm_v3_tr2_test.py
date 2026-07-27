@@ -27,6 +27,7 @@ from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import LossInfo, StepType, TimeStep
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
+from alf.utils.schedulers import update_progress
 
 
 class _DummyProcess:
@@ -48,10 +49,13 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
             return_value=_DummyProcess())
         self._psutil_patcher.start()
         self.addCleanup(self._psutil_patcher.stop)
+        update_progress("env_steps", 0)
+        self.addCleanup(update_progress, "env_steps", 0)
 
     def _make_alg(self, **kwargs):
         num_updates_per_train_iter = kwargs.pop("num_updates_per_train_iter",
                                                 3)
+        num_env_steps = kwargs.pop("num_env_steps", 0)
         actor_network_cls = kwargs.pop(
             "actor_network_cls",
             partial(ActorFCNetwork, fc_layer_params=(32, 32)))
@@ -67,6 +71,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
             mini_batch_length=2,
             mini_batch_size=4,
             initial_collect_steps=0,
+            num_env_steps=num_env_steps,
             num_updates_per_train_iter=num_updates_per_train_iter)
         kwargs.setdefault("trust_metric_num_obs", 8)
         return BafcAlgorithmV3TR2(
@@ -92,6 +97,10 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
             observation=observation,
             prev_action=(),
             env_id=())
+
+    def _set_env_steps(self, alg, env_steps):
+        del alg
+        update_progress("env_steps", env_steps)
 
     def _clone_state_dict(self, module):
         return {
@@ -532,6 +541,42 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self.assertEqual(alg._train_mode, TrainMode.critic)
         self._assert_state_dict_equal(alg._reference_actor_networks,
                                       self._clone_state_dict(alg._actor_networks))
+
+    def test_eval_trust_max_decay_disabled_keeps_fixed_threshold(self):
+        alg = self._make_alg(eval_trust_max=10.0, num_env_steps=100)
+        self._set_env_steps(alg, 50)
+
+        self.assertEqual(alg._current_eval_trust_max(), 10.0)
+
+    def test_eval_trust_max_decay_uses_env_step_progress(self):
+        alg = self._make_alg(
+            eval_trust_max=10.0,
+            enable_eval_trust_max_decay=True,
+            num_env_steps=100)
+
+        self._set_env_steps(alg, 0)
+        self.assertAlmostEqual(alg._current_eval_trust_max(), 10.0)
+        self._set_env_steps(alg, 50)
+        self.assertAlmostEqual(alg._current_eval_trust_max(), 5.0)
+        self._set_env_steps(alg, 100)
+        self.assertAlmostEqual(alg._current_eval_trust_max(), 0.0)
+
+    def test_eval_gate_uses_decayed_eval_trust_max(self):
+        alg = self._make_alg(
+            eval_trust_max=10.0,
+            enable_eval_rollout_skip_gate=True,
+            enable_eval_trust_max_decay=True,
+            num_env_steps=100)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._completed_cycles_since_rollout = alg._rollout_cycles_per_collect
+        self._set_env_steps(alg, 50)
+
+        alg._last_eval_trust = torch.tensor(6.0)
+        self.assertFalse(alg._should_skip_unroll_iter_off_policy())
+
+        alg._last_eval_trust = torch.tensor(4.0)
+        self.assertTrue(alg._should_skip_unroll_iter_off_policy())
 
     def _without_runtime_state(self, state_dict):
         state_dict = state_dict.copy()

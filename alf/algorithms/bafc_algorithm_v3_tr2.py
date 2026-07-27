@@ -37,7 +37,7 @@ from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import TensorSpec, BoundedTensorSpec
 from alf.utils import losses, common, dist_utils, math_ops
 from alf.utils.normalizers import ScalarAdaptiveNormalizer
-from alf.utils.schedulers import Scheduler
+from alf.utils.schedulers import Scheduler, get_progress
 from alf.utils.summary_utils import safe_mean_hist_summary
 from alf.networks.network import Network
 from alf.networks.neural_graphs.actor_graph import ActorGraph
@@ -122,6 +122,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                  delta_trust_max: float = 2.0,
                  monitor_trust_metrics: bool = True,
                  enable_eval_rollout_skip_gate: bool = False,
+                 enable_eval_trust_max_decay: bool = False,
                  enable_grad_actor_extend_gate: bool = False,
                  enable_critic_reweighting: bool = False,
                  critic_reweighting_beta: Optional[float] = None,
@@ -167,6 +168,8 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             enable_eval_rollout_skip_gate (bool): whether to skip rollout
                 collection when eval trust is below threshold. When False,
                 eval trust is not computed (to save compute).
+            enable_eval_trust_max_decay (bool): whether to linearly decay
+                eval_trust_max according to local environment-step progress.
             freeze_eval_samples (bool): If True, keep actor eval samples fixed
                 throughout training instead of optimizing them.
             rollout_cycles_per_collect (int): number of completed
@@ -263,6 +266,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._delta_trust_max = delta_trust_max
         self._monitor_trust_metrics = monitor_trust_metrics
         self._enable_eval_rollout_skip_gate = enable_eval_rollout_skip_gate
+        self._enable_eval_trust_max_decay = enable_eval_trust_max_decay
         self._enable_grad_actor_extend_gate = enable_grad_actor_extend_gate
         self._enable_critic_reweighting = enable_critic_reweighting
         self._critic_reweighting_beta = critic_reweighting_beta
@@ -1696,6 +1700,15 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             end_rollout_opportunity=int(self._rollout_opportunity_count),
             skip_length=int(skip_length))
 
+    def _current_eval_trust_max(self):
+        """Return the effective eval-trust threshold for the current step."""
+        if not self._enable_eval_trust_max_decay:
+            return self._eval_trust_max
+        final_env_step = max(float(self._config.num_env_steps), 1e-6)
+        current_env_step = float(get_progress("env_steps"))
+        return self._eval_trust_max * (
+            final_env_step - current_env_step) / final_env_step
+
     def _should_skip_unroll_iter_off_policy(self):
         """Return whether the next off-policy unroll should be skipped."""
         self._last_rollout_skipped_due_eval_gate = False
@@ -1720,7 +1733,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         if self._enable_eval_rollout_skip_gate:
             eval_trust = float(
                 torch.as_tensor(self._last_eval_trust).reshape(()).item())
-            if (eval_trust <= self._eval_trust_max
+            if (eval_trust <= self._current_eval_trust_max()
                     and previous_consecutive_skips <
                     self._eval_gate_max_consecutive_rollout_skips):
                 if previous_consecutive_skips == 0:
@@ -1808,11 +1821,12 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._sync_snapshot_critic_from_current()
         self._record_debug_scalar('eval_trust_metric', self._last_eval_trust)
         self._record_debug_scalar('grad_trust_metric', self._last_grad_trust)
-        self._record_debug_scalar('eval_trust_max', self._eval_trust_max)
+        eval_trust_max = self._current_eval_trust_max()
+        self._record_debug_scalar('eval_trust_max', eval_trust_max)
         self._record_debug_scalar('delta_trust_max', self._delta_trust_max)
         self._record_debug_scalar('eval_trust_over_max',
                                   self._last_eval_trust /
-                                  max(self._eval_trust_max, 1e-6))
+                                  max(eval_trust_max, 1e-6))
         self._record_debug_scalar('grad_trust_over_max',
                                   self._last_grad_trust /
                                   max(self._delta_trust_max, 1e-6))
