@@ -28,7 +28,7 @@ RLPD_CONF="${SCRIPT_DIR}/rlpd_dmc_conf.py"
 BAFCV3_CONF="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
-ENV_NAME="quadruped:walk"
+ENV_NAME="dog:walk"
 BASE_DIR="/root/numeric_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
@@ -115,7 +115,7 @@ ENV_DIR="${ENV_NAME%%:*}"
 ROOT_DIR="${BASE_DIR}/${ENV_DIR}/rlpd_bafcv3_comparison_4g"
 
 cat <<EOF
-Starting quadruped:walk RLPD/BAFCv3 comparison
+Starting dog:walk RLPD/BAFCv3 comparison
   Environment: ${ENV_NAME}
   Root dir: ${ROOT_DIR}
   Num env steps: ${NUM_ENV_STEPS}

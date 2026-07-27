@@ -24,12 +24,14 @@ from alf.algorithms.agent import Agent
 from alf.algorithms.bafc_algorithm_v3 import (BafcAlgorithmV3, BafcCriticInfo,
                                               BafcInfo)
 from alf.algorithms.config import TrainerConfig
+from alf.algorithms.data_transformer import ObservationNormalizer
 from alf.algorithms.rlpd_algorithm import TrainMode
-from alf.data_structures import StepType, TimeStep
-from alf.experience_replayers.replay_buffer import ReplayBuffer
+from alf.data_structures import Experience, StepType, TimeStep
+from alf.experience_replayers.replay_buffer import BatchInfo, ReplayBuffer
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.nest import utils as nest_utils
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
+from alf.utils import common
 from alf.utils.checkpoint_utils import Checkpointer
 
 
@@ -57,6 +59,15 @@ class _LinearParallelCritic(torch.nn.Module):
         return q_value, state
 
 
+class _EncodingParallelCritic(torch.nn.Module):
+
+    def forward(self, inputs, state=()):
+        actor_encoding, (_, action) = inputs
+        q_value = actor_encoding[..., 0]
+        q_value = q_value + 0. * action.sum(dim=-1)
+        return q_value, state
+
+
 class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
 
     def setUp(self):
@@ -71,6 +82,7 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
         num_actor_critic = kwargs.pop("num_actor_critic", 3)
         reward_spec = kwargs.pop("reward_spec", TensorSpec(()))
         reward_weights = kwargs.pop("reward_weights", None)
+        data_transformer = kwargs.pop("data_transformer", None)
         config = TrainerConfig(
             root_dir=tempfile.mkdtemp(prefix="bafc_v3_test_"),
             unroll_length=2,
@@ -78,6 +90,7 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
             mini_batch_size=4,
             initial_collect_steps=0,
             num_updates_per_train_iter=3)
+        config.data_transformer = data_transformer
         return BafcAlgorithmV3(
             observation_spec=TensorSpec((4, )),
             action_spec=BoundedTensorSpec((2, ), minimum=-1.0, maximum=1.0),
@@ -145,6 +158,231 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
                 env_ids=torch.tensor([0]))
         alg._replay_buffer = replay_buffer
         return replay_buffer
+
+    def _attach_experience_replay_buffer(self, alg, num_items=32):
+        time_step_spec = TimeStep(
+            step_type=TensorSpec((), dtype=torch.int64),
+            reward=TensorSpec(()),
+            discount=TensorSpec(()),
+            observation=TensorSpec((4, )),
+            prev_action=TensorSpec((2, )),
+            env_id=TensorSpec((), dtype=torch.int64))
+        replay_buffer = ReplayBuffer(
+            data_spec=Experience(time_step=time_step_spec),
+            num_environments=1,
+            max_length=max(64, num_items))
+        for value in range(num_items):
+            time_step = TimeStep(
+                step_type=torch.tensor([StepType.MID], dtype=torch.int64),
+                reward=torch.tensor([float(value)], dtype=torch.float32),
+                discount=torch.ones(1),
+                observation=torch.full((1, 4), float(value)),
+                prev_action=torch.zeros(1, 2),
+                env_id=torch.zeros(1, dtype=torch.int64))
+            replay_buffer.add_batch(
+                Experience(time_step=time_step), env_ids=time_step.env_id)
+        alg.preprocess_experience(
+            TimeStep(), BafcInfo(), BatchInfo(replay_buffer=replay_buffer))
+        return replay_buffer
+
+    def test_eval_samples_source_validation_and_optimizer(self):
+        with self.assertRaisesRegex(AssertionError, "eval_samples_source"):
+            self._make_alg(eval_samples_source='unknown')
+        with self.assertRaisesRegex(AssertionError,
+                                    "eval_samples_optimizer"):
+            self._make_alg(
+                eval_samples_source='replay',
+                eval_samples_optimizer=alf.optimizers.Adam(lr=1e-3))
+
+    def test_replay_eval_samples_keep_checkpoint_compatible_parameter_frozen(
+            self):
+        trainable_alg = self._make_alg()
+        replay_alg = self._make_alg(eval_samples_source='replay')
+
+        self.assertIn('_actor_eval_samples',
+                      dict(replay_alg.named_parameters()))
+        self.assertFalse(replay_alg._actor_eval_samples.requires_grad)
+        replay_alg.load_state_dict(trainable_alg.state_dict())
+        self.assertFalse(replay_alg._actor_eval_samples.requires_grad)
+        self.assertTensorEqual(replay_alg._actor_eval_samples,
+                               trainable_alg._actor_eval_samples)
+        replay_buffer = self._attach_experience_replay_buffer(replay_alg)
+        self.assertIs(replay_alg._actor_eval_replay_buffer_ref(), replay_buffer)
+        self.assertFalse(
+            any('actor_eval_replay_buffer_ref' in key
+                for key in replay_alg.state_dict()))
+
+        mode_alg = self._make_alg(
+            eval_samples_source='replay', actor_utd=1, critic_utd=2)
+        mode_alg._train_mode = TrainMode.actor
+        mode_alg._actor_update_counter = 1
+        mode_alg._update_train_mode()
+        self.assertEqual(mode_alg._train_mode, TrainMode.critic)
+        self.assertFalse(mode_alg._actor_eval_samples.requires_grad)
+        mode_alg._critic_update_counter = 2
+        mode_alg._update_train_mode()
+        self.assertEqual(mode_alg._train_mode, TrainMode.actor)
+        self.assertFalse(mode_alg._actor_eval_samples.requires_grad)
+
+    def test_replay_eval_samples_require_preprocessed_replay_buffer(self):
+        alg = self._make_alg(eval_samples_source='replay')
+        with self.assertRaisesRegex(RuntimeError, "preprocess_experience"):
+            alg._get_actor_eval_samples()
+
+    def test_replay_eval_samples_are_independently_drawn_and_transformed(self):
+        alg = self._make_alg(eval_samples_source='replay')
+        replay_buffer = self._attach_experience_replay_buffer(alg)
+
+        def _transform(experience):
+            self.assertTrue(common.is_eval())
+            time_step = experience.time_step._replace(
+                observation=experience.observation + 100.)
+            return experience._replace(time_step=time_step)
+
+        with mock.patch.object(
+                replay_buffer,
+                'get_batch',
+                wraps=replay_buffer.get_batch) as get_batch_mock, \
+             mock.patch.object(
+                 alg, 'transform_experience', side_effect=_transform):
+            with common.replay_context():
+                samples = alg._get_actor_eval_samples()
+                self.assertTrue(common.is_replay())
+
+        get_batch_mock.assert_called_once_with(batch_size=8, batch_length=2)
+        self.assertEqual(samples.shape, (16, 4))
+        self.assertFalse(samples.requires_grad)
+        self.assertTrue(torch.all(samples >= 100.))
+        self.assertTensorEqual(samples, samples[:, :1].expand_as(samples))
+
+    def test_replay_eval_samples_do_not_update_normalizer_statistics(self):
+        normalizer = ObservationNormalizer(TensorSpec((4, )))
+        normalizer._normalizer.update(torch.randn(64, 4) * 3. + 5.)
+        alg = self._make_alg(
+            eval_samples_source='replay', data_transformer=normalizer)
+        self._attach_experience_replay_buffer(alg)
+        state_before = {
+            key: value.clone()
+            for key, value in normalizer.state_dict().items()
+        }
+
+        with common.replay_context():
+            samples = alg._get_actor_eval_samples()
+
+        self.assertEqual(samples.shape, (16, 4))
+        for key, value in normalizer.state_dict().items():
+            self.assertTensorEqual(value, state_before[key])
+
+    def test_train_step_reuses_replay_eval_samples_and_summarizes_them(self):
+        alg = self._make_alg(
+            eval_samples_source='replay', debug_summaries=True)
+        actor_eval_samples = torch.arange(64, dtype=torch.float32).reshape(
+            16, 4)
+        inputs = TimeStep(
+            step_type=torch.full((2, ), StepType.MID, dtype=torch.int64),
+            reward=torch.zeros(2),
+            discount=torch.ones(2),
+            observation=torch.randn(2, 4),
+            prev_action=torch.zeros(2, 2),
+            env_id=torch.zeros(2, dtype=torch.int64))
+        rollout_info = BafcInfo(
+            action=torch.zeros(2, 2), bootstrap_mask=torch.ones(2, 3))
+        state = alg.get_initial_train_state(2)
+
+        with mock.patch.object(
+                alg,
+                '_get_actor_eval_samples',
+                return_value=actor_eval_samples) as get_samples_mock, \
+             mock.patch.object(
+                 alg,
+                 '_actor_train_step',
+                 wraps=alg._actor_train_step) as actor_step_mock, \
+             mock.patch.object(
+                 alg,
+                 '_critic_train_step',
+                 wraps=alg._critic_train_step) as critic_step_mock, \
+             mock.patch.object(
+                 alf.summary, 'should_record_summaries', return_value=True), \
+             mock.patch.object(alf.summary, 'scalar'), \
+             mock.patch.object(alf.summary, 'histogram'), \
+             mock.patch(
+                 'alf.algorithms.bafc_algorithm_v3.safe_mean_hist_summary'
+             ) as summary_mock:
+            alg.train_step(inputs, state, rollout_info)
+
+        get_samples_mock.assert_called_once_with()
+        self.assertIs(actor_step_mock.call_args.args[-1], actor_eval_samples)
+        self.assertIs(critic_step_mock.call_args.args[-1], actor_eval_samples)
+        eval_summary = next(
+            call for call in summary_mock.call_args_list
+            if call.args[0] == 'eval_samples')
+        self.assertIs(eval_summary.args[1], actor_eval_samples)
+
+    def test_actor_and_critic_only_steps_draw_replay_eval_samples_once(self):
+        inputs = TimeStep(
+            step_type=torch.full((2, ), StepType.MID, dtype=torch.int64),
+            reward=torch.zeros(2),
+            discount=torch.ones(2),
+            observation=torch.randn(2, 4),
+            prev_action=torch.zeros(2, 2),
+            env_id=torch.zeros(2, dtype=torch.int64))
+        rollout_info = BafcInfo(
+            action=torch.zeros(2, 2), bootstrap_mask=torch.ones(2, 3))
+        actor_eval_samples = torch.randn(16, 4)
+
+        for train_mode in (TrainMode.actor, TrainMode.critic):
+            alg = self._make_alg(
+                eval_samples_source='replay', actor_utd=1, critic_utd=2)
+            alg._train_mode = train_mode
+            alg._actor_update_counter = 1
+            alg._critic_update_counter = 1
+            alg._apply_train_mode_grad_flags()
+            state = alg.get_initial_train_state(2)
+            with mock.patch.object(
+                    alg,
+                    '_get_actor_eval_samples',
+                    return_value=actor_eval_samples) as get_samples_mock, \
+                 mock.patch.object(
+                     alg,
+                     '_actor_train_step',
+                     wraps=alg._actor_train_step) as actor_step_mock, \
+                 mock.patch.object(
+                     alg,
+                     '_critic_train_step',
+                     wraps=alg._critic_train_step) as critic_step_mock:
+                alg.train_step(inputs, state, rollout_info)
+
+            get_samples_mock.assert_called_once_with()
+            if train_mode == TrainMode.actor:
+                actor_step_mock.assert_called_once()
+                critic_step_mock.assert_not_called()
+                self.assertIs(actor_step_mock.call_args.args[-1],
+                              actor_eval_samples)
+            else:
+                actor_step_mock.assert_not_called()
+                critic_step_mock.assert_called_once()
+                self.assertIs(critic_step_mock.call_args.args[-1],
+                              actor_eval_samples)
+
+    def test_replay_eval_samples_preserve_functional_actor_gradient(self):
+        alg = self._make_alg(
+            eval_samples_source='replay', actor_eval_type='output')
+        alg._critic_networks = _EncodingParallelCritic()
+        observation = torch.randn(2, 4)
+        action = alg._actor_networks(observation)[0]
+        actor_eval_samples = torch.randn(16, 4)
+
+        _, actor_info = alg._actor_train_step(
+            observation, action, torch.zeros(2, 2), torch.ones(2, 3), (),
+            actor_eval_samples)
+        actor_info.extra.eval_action_loss.mean().backward()
+
+        self.assertFalse(actor_eval_samples.requires_grad)
+        self.assertIsNone(alg._actor_eval_samples.grad)
+        self.assertFalse(alg._actor_eval_samples.requires_grad)
+        self.assertTrue(
+            any(p.grad is not None and torch.count_nonzero(p.grad) > 0
+                for p in alg._actor_networks.parameters()))
 
     def _without_runtime_state(self, state_dict):
         state_dict = state_dict.copy()

@@ -28,6 +28,19 @@ alf.define_config('bafcv6_actor_use_ln', False)
 actor_use_ln = alf.get_config_value('bafcv6_actor_use_ln')
 alf.define_config('bafcv6_learning_rate', 3e-4)
 learning_rate = alf.get_config_value('bafcv6_learning_rate')
+alf.define_config('bafcv6_actor_critic_pairing', True)
+actor_critic_pairing = alf.get_config_value('bafcv6_actor_critic_pairing')
+alf.define_config('bafcv6_num_actor_critic', 10)
+num_actor_critic = alf.get_config_value('bafcv6_num_actor_critic')
+alf.define_config('bafcv6_num_sampled_critics_for_actor', 1)
+num_sampled_critics_for_actor = alf.get_config_value(
+    'bafcv6_num_sampled_critics_for_actor')
+alf.define_config('bafcv6_use_random_critic_targets', False)
+use_random_critic_targets = alf.get_config_value(
+    'bafcv6_use_random_critic_targets')
+alf.define_config('bafcv6_num_sampled_critic_targets', 1)
+num_sampled_critic_targets = alf.get_config_value(
+    'bafcv6_num_sampled_critic_targets')
 
 # Enable find_unused_parameters for DDP (needed for multi-GPU training).
 alf.config('make_ddp_performer', find_unused_parameters=True)
@@ -73,8 +86,11 @@ alf.config(
     'BafcAlgorithmV6',
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
-    num_actor_critic=10,
-    actor_critic_pairing=True,
+    num_actor_critic=num_actor_critic,
+    actor_critic_pairing=actor_critic_pairing,
+    num_sampled_critics_for_actor=num_sampled_critics_for_actor,
+    use_random_critic_targets=use_random_critic_targets,
+    num_sampled_critic_targets=num_sampled_critic_targets,
     use_bootstrap_actors=False,
     use_bootstrap_critics=False,
     actor_use_ln=actor_use_ln,

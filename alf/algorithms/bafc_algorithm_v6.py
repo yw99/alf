@@ -156,7 +156,10 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                  checkpoint=None,
                  debug_summaries=False,
                  reproduce_locomotion=False,
-                 name="BafcAlgorithmV6"):
+                 name="BafcAlgorithmV6",
+                 num_sampled_critics_for_actor=1,
+                 use_random_critic_targets=False,
+                 num_sampled_critic_targets=1):
         """
         Args:
 
@@ -166,6 +169,16 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 critic during actor training). If True, such a actor-critic pairing is 
                 fixed throughout the training. Otherwise, it is randomized at each
                 actor_train_step.
+            num_sampled_critics_for_actor (int): the number of distinct critics
+                used to update each actor when ``actor_critic_pairing`` is False.
+                Their gradients are averaged. It must be 1 when pairing is fixed.
+            use_random_critic_targets (bool): whether to use an RLPD-style
+                shared TD target sampled from the target critic ensemble. When
+                False, critic ``i`` uses target critic ``i`` as before.
+            num_sampled_critic_targets (int): the number of target critics
+                sampled without replacement when ``use_random_critic_targets``
+                is True. Their elementwise minimum is shared by all online
+                critics. A value of 1 selects one random target critic.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -187,6 +200,17 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             r"init method {eval_samples_init_method} is not supported.")
         assert bootstrap_mask_type in ['episode', 'step'], (
             r"bootstrap mask type {bootstrap_mask_type} is not supported.")
+        assert 1 <= num_sampled_critics_for_actor <= num_actor_critic, (
+            "num_sampled_critics_for_actor must be between 1 and "
+            f"num_actor_critic ({num_actor_critic}), got "
+            f"{num_sampled_critics_for_actor}.")
+        assert not actor_critic_pairing or num_sampled_critics_for_actor == 1, (
+            "num_sampled_critics_for_actor must be 1 when "
+            "actor_critic_pairing is True.")
+        assert 1 <= num_sampled_critic_targets <= num_actor_critic, (
+            "num_sampled_critic_targets must be between 1 and "
+            f"num_actor_critic ({num_actor_critic}), got "
+            f"{num_sampled_critic_targets}.")
         if critic_reweighting_beta is not None:
             assert critic_reweighting_beta >= 0, (
                 "critic_reweighting_beta must be nonnegative when set")
@@ -232,6 +256,9 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
 
         self._num_actor_critic = num_actor_critic
         self._actor_critic_pairing = actor_critic_pairing
+        self._num_sampled_critics_for_actor = num_sampled_critics_for_actor
+        self._use_random_critic_targets = use_random_critic_targets
+        self._num_sampled_critic_targets = num_sampled_critic_targets
         self._use_bootstrap_actors = use_bootstrap_actors
         self._use_bootstrap_critics = use_bootstrap_critics
         self._bootstrap_mask_prob = bootstrap_mask_prob
@@ -1222,17 +1249,30 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
     def _empty_critic_info_for_train_info(self, reward):
         if not isinstance(reward, torch.Tensor):
             return BafcCriticInfo()
-        critic_shape = reward.shape + (
+        reward_rank = len(self._reward_spec.shape)
+        if reward_rank:
+            outer_shape = reward.shape[:-reward_rank]
+            value_shape = reward.shape[-reward_rank:]
+        else:
+            outer_shape = reward.shape
+            value_shape = ()
+        critic_shape = outer_shape + (
             self._num_actor_critic,
             self._num_actor_critic,
-        )
+        ) + value_shape
         critic = reward.new_zeros(critic_shape)
+        if self._use_random_critic_targets:
+            target_shape = outer_shape + (
+                self._num_actor_critic, ) + value_shape
+            target_critic = reward.new_zeros(target_shape)
+        else:
+            target_critic = torch.zeros_like(critic)
         critic_sample_weight = ()
         if self._enable_critic_reweighting:
-            critic_sample_weight = torch.ones_like(reward)
+            critic_sample_weight = reward.new_ones(outer_shape)
         return BafcCriticInfo(
             critic=critic,
-            target_critic=torch.zeros_like(critic),
+            target_critic=target_critic,
             critic_sample_weight=critic_sample_weight,
             critic_reweighting_info=())
 
@@ -1477,7 +1517,125 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
 
         return eval_out_seq
 
-    def _actor_train_step(self, observation, action, mask, state):
+    def _sample_actor_critic_matchings(self, device=None):
+        """Sample balanced mappings from critic slots to actor identities."""
+        n = self._num_actor_critic
+        if self._actor_critic_pairing:
+            matching = torch.arange(n).unsqueeze(0)
+        else:
+            actor_permutation = torch.randperm(n)
+            if self._num_sampled_critics_for_actor == 1:
+                # Keep the random-number usage of the existing K=1 path.
+                matching = actor_permutation.unsqueeze(0)
+            else:
+                offsets = torch.randperm(n)[:self._num_sampled_critics_for_actor]
+                critic_slots = torch.arange(n).unsqueeze(0)
+                matching = actor_permutation[
+                    (critic_slots + offsets.unsqueeze(1)) % n]
+        if device is not None:
+            matching = matching.to(device=device)
+        return matching
+
+    def _restore_actor_order(self, matched_value, matched_actor_ids):
+        """Reorder the critic-slot dimension of every matching by actor id."""
+        trailing_shape = matched_value.shape[3:]
+        index = matched_actor_ids[:, None, :, *([None] * len(trailing_shape))]
+        index = index.expand_as(matched_value)
+        return torch.zeros_like(matched_value).scatter(2, index, matched_value)
+
+    def _aggregate_matched_action_gradients(self, matched_dqda,
+                                            matched_actor_ids, action):
+        """Scatter matched critic gradients back into actor identity order."""
+        del action
+        return self._restore_actor_order(matched_dqda,
+                                         matched_actor_ids).sum(dim=0)
+
+    @staticmethod
+    def _mean_pairwise_cosine(individual_dqda):
+        """Mean off-diagonal cosine without constructing a K by K Gram matrix."""
+        k = individual_dqda.shape[0]
+        flat_grad = individual_dqda.reshape(*individual_dqda.shape[:3], -1)
+        norm = flat_grad.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        unit_grad = flat_grad / norm
+        summed_sq_norm = unit_grad.sum(dim=0).square().sum(dim=-1)
+        self_sq_norm = unit_grad.square().sum(dim=-1).sum(dim=0)
+        return (summed_sq_norm - self_sq_norm) / (k * (k - 1))
+
+    def _summarize_actor_gradients(self, dqda, clipped_dqda, dqde,
+                                   clipped_dqde, current_action, replay_action,
+                                   q_value, individual_dqda):
+        dqda = dqda.detach()
+        safe_mean_hist_summary('actor_gradients/dqda', dqda)
+        safe_mean_hist_summary('actor_gradients/dqda_abs', dqda.abs())
+        safe_mean_hist_summary('actor_gradients/dqda_l2_norm',
+                               dqda.flatten(start_dim=2).norm(dim=-1))
+        for i in range(dqda.shape[-1]):
+            alf.summary.scalar(
+                f'actor_gradients/dqda_abs_component_{i}',
+                dqda[..., i].abs().mean())
+
+        if self._dqda_clipping:
+            clipped_dqda = clipped_dqda.detach()
+            safe_mean_hist_summary('actor_gradients/clipped_dqda', clipped_dqda)
+            safe_mean_hist_summary('actor_gradients/clipped_dqda_abs',
+                                   clipped_dqda.abs())
+            safe_mean_hist_summary(
+                'actor_gradients/clipped_dqda_l2_norm',
+                clipped_dqda.flatten(start_dim=2).norm(dim=-1))
+            for i in range(clipped_dqda.shape[-1]):
+                alf.summary.scalar(
+                    f'actor_gradients/clipped_dqda_abs_component_{i}',
+                    clipped_dqda[..., i].abs().mean())
+            alf.summary.scalar(
+                'actor_gradients/dqda_clip_fraction',
+                dqda.abs().gt(self._dqda_clipping).to(torch.float32).mean())
+
+        for i, (raw, clipped) in enumerate(
+                zip(nest.flatten(dqde), nest.flatten(clipped_dqde))):
+            raw = raw.detach()
+            safe_mean_hist_summary(f'actor_gradients/dqde_leaf_{i}_abs',
+                                   raw.abs())
+            safe_mean_hist_summary(
+                f'actor_gradients/dqde_leaf_{i}_l2_norm',
+                raw.flatten(start_dim=max(0, raw.ndim - 1)).norm(dim=-1))
+            if self._dqda_clipping:
+                clipped = clipped.detach()
+                safe_mean_hist_summary(
+                    f'actor_gradients/clipped_dqde_leaf_{i}_abs',
+                    clipped.abs())
+                safe_mean_hist_summary(
+                    f'actor_gradients/clipped_dqde_leaf_{i}_l2_norm',
+                    clipped.flatten(start_dim=max(0, clipped.ndim - 1)).norm(
+                        dim=-1))
+
+        current_action = current_action.detach()
+        replay_action = replay_action.detach().unsqueeze(1)
+        safe_mean_hist_summary(
+            'actor_actions/current_vs_replay_l2',
+            (current_action - replay_action).flatten(start_dim=2).norm(dim=-1))
+        safe_mean_hist_summary('actor_actions/current_abs',
+                               current_action.abs())
+        alf.summary.scalar(
+            'actor_actions/current_fraction_abs_gt_0_95',
+            current_action.abs().gt(0.95).to(torch.float32).mean())
+
+        if individual_dqda is not None:
+            q_value = q_value.detach()
+            individual_dqda = individual_dqda.detach()
+            safe_mean_hist_summary('actor_critic_aggregation/q_mean',
+                                   q_value.mean(dim=0))
+            safe_mean_hist_summary(
+                'actor_critic_aggregation/q_std',
+                q_value.std(dim=0, unbiased=False))
+            safe_mean_hist_summary(
+                'actor_critic_aggregation/individual_dqda_l2_norm',
+                individual_dqda.flatten(start_dim=3).norm(dim=-1))
+            safe_mean_hist_summary(
+                'actor_critic_aggregation/dqda_pairwise_cosine',
+                self._mean_pairwise_cosine(individual_dqda))
+
+
+    def _actor_train_step(self, observation, action, replay_action, mask, state):
         """Compute the exact off-policy policy gradient from the functional critic,
         which consists of two terms, 
 
@@ -1495,57 +1653,98 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         elif self._actor_eval_type == 'last_two':
             eval_action = eval_action[-2:]
 
-        actor_tokens = self._tokenize_actor_out(eval_action) 
+        actor_tokens = self._tokenize_actor_out(eval_action)
         actor_encoding = self._actor_encoder(actor_tokens)[0]
-        if not self._actor_critic_pairing:
-            perm = torch.randperm(self._num_actor_critic)
-            actor_encoding = actor_encoding[perm, :]
-            action = action[:, perm, :]
-        actor_encoding = actor_encoding.unsqueeze(0).repeat(
-            observation.shape[0], 1, 1)  # [T*B, n_actor, d_enc]
+
+        k = self._num_sampled_critics_for_actor
+        batch_size = observation.shape[0]
+        matched_actor_ids = self._sample_actor_critic_matchings(action.device)
+        matched_actor_encoding = actor_encoding[matched_actor_ids]
+        matched_action = torch.gather(
+            action.unsqueeze(0).expand(k, *action.shape),
+            dim=2,
+            index=matched_actor_ids[:, None, :, None].expand(
+                k, batch_size, self._num_actor_critic, action.shape[-1]))
+
+        critic_actor_encoding = matched_actor_encoding[:, None, :, :].expand(
+            k, batch_size, self._num_actor_critic,
+            matched_actor_encoding.shape[-1]).reshape(
+                k * batch_size, self._num_actor_critic,
+                matched_actor_encoding.shape[-1])
 
         ## Step 2: compute critic values for all actors
         ###############################################
         # # [T*B * n_actor, d_s]
         # critic_observation = observation.repeat_interleave(
         #     self._num_actor_critic, dim=0)
-        # [T*B, n_critic, d_s]
-        critic_observation = observation.unsqueeze(1).repeat(
-            1, self._num_actor_critic, 1)
-        # [T*B, n_critic]
+        # [K * T*B, n_critic, d_s]
+        critic_observation = observation.unsqueeze(0).expand(
+            k, *observation.shape).reshape(k * batch_size,
+                                           *observation.shape[1:])
+        critic_observation = critic_observation.unsqueeze(1).expand(
+            k * batch_size, self._num_actor_critic,
+            *observation.shape[1:])
+        critic_action = matched_action.reshape(
+            k * batch_size, self._num_actor_critic, action.shape[-1])
         q_value, critic_state = self._critic_networks(
-            (actor_encoding, (critic_observation, action)), state) 
+            (critic_actor_encoding, (critic_observation, critic_action)), state)
+        q_value = q_value.reshape(k, batch_size, *q_value.shape[1:])
 
         ## Step 3: exact off-policy policy gradient (OPG)
         #################################################
-        # This sum() will reduce all dims so q_value can be any rank
-        dqda = nest_utils.grad(action, q_value.sum(), retain_graph=True)
         # need to exclude the input actor_eval_samples, since they don't requires_grad
         # for actor TrainMode
         if self._actor_eval_type == 'full':
             eval_action_in_graph = eval_action[1:]
         else:
             eval_action_in_graph = eval_action
-        dqde = nest_utils.grad(eval_action_in_graph, q_value.sum(), 
-                               retain_graph=self._actor_eval_type != 'output')
+        record_debug = (self._debug_summaries
+                        and alf.summary.should_record_summaries())
+        need_individual_dqda = record_debug and k > 1
+        dqda_input = matched_action if need_individual_dqda else action
+        dqda, dqde = nest_utils.grad(
+            (dqda_input, eval_action_in_graph),
+            q_value.sum() / k,
+            retain_graph=self._actor_eval_type != 'output')
 
-        def action_loss_fn(dqda, a_in):
-            if self._dqda_clipping:
-                dqda = torch.clamp(dqda, -self._dqda_clipping,
-                                   self._dqda_clipping)
+        individual_dqda = None
+        if need_individual_dqda:
+            # dqda is scaled by 1/K through the mean-Q objective. Scatter-summing
+            # therefore produces the mean selected-critic gradient in actor order.
+            individual_dqda = self._restore_actor_order(
+                dqda * k, matched_actor_ids)
+            dqda = individual_dqda.mean(dim=0)
+            q_value = self._restore_actor_order(q_value, matched_actor_ids)
+
+        if self._dqda_clipping:
+            clipped_dqda = torch.clamp(dqda, -self._dqda_clipping,
+                                       self._dqda_clipping)
+            clipped_dqde = nest.map_structure(
+                lambda x: torch.clamp(x, -self._dqda_clipping,
+                                      self._dqda_clipping), dqde)
+        else:
+            clipped_dqda = dqda
+            clipped_dqde = dqde
+
+        if record_debug:
+            self._summarize_actor_gradients(
+                dqda, clipped_dqda, dqde, clipped_dqde, action, replay_action,
+                q_value, individual_dqda)
+
+        def action_loss_fn(gradient, a_in):
             loss = 0.5 * losses.element_wise_squared_loss(
-                (dqda + a_in).detach(), a_in)
+                (gradient + a_in).detach(), a_in)
             return loss.sum(list(range(2, loss.ndim)))
 
         # 1st term of OPG: loss corresponding to input action
-        action_loss = nest.map_structure(action_loss_fn, dqda, action)
+        action_loss = nest.map_structure(action_loss_fn, clipped_dqda, action)
         if self._use_bootstrap_actors:
             action_loss = action_loss * mask / self._bootstrap_mask_prob
         action_loss = action_loss.sum(-1)
 
         # 2nd term of OPG: loss corresponding to input eval_action
         eval_action_loss = nest.map_structure(
-            action_loss_fn, dqde, eval_action_in_graph)
+            action_loss_fn, clipped_dqde, eval_action_in_graph)
         # ALF workaround: reduce to scalar_loss and repeat to [T*B]
         # Will be averaged to a scalar_loss in calc_loss
         eval_action_loss = math_ops.add_n(eval_action_loss).mean().repeat(
@@ -1555,6 +1754,33 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             loss=action_loss,
             extra=BafcActorInfo(eval_action_loss=eval_action_loss)) 
         return critic_state, actor_info
+
+    def _select_critic_targets(self, target_critics):
+        """Optionally construct one RLPD-style target for all critics.
+
+        Args:
+            target_critics: target values with shape
+                ``[batch, n_actor, n_critic, ...]``.
+
+        Returns:
+            The input unchanged when random targets are disabled. Otherwise,
+            returns the elementwise minimum of a random subset with shape
+            ``[batch, n_actor, ...]``.
+        """
+        if not self._use_random_critic_targets:
+            return target_critics
+
+        if self._num_sampled_critic_targets < self._num_actor_critic:
+            critic_ids = torch.randperm(
+                self._num_actor_critic,
+                device=target_critics.device)[:self._num_sampled_critic_targets]
+            sampled_targets = target_critics.index_select(2, critic_ids)
+        else:
+            sampled_targets = target_critics
+        if self.has_multidim_reward():
+            sign = self.reward_weights.sign()
+            return (sampled_targets * sign).min(dim=2)[0] * sign
+        return sampled_targets.min(dim=2)[0]
 
     def _critic_train_step(self, observation, state: BafcCriticState, 
                            rollout_info: BafcInfo, action): 
@@ -1604,6 +1830,7 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         target_critics = target_critics.reshape(
             -1, self._num_actor_critic, *target_critics.shape[1:])
         target_critics = target_critics.detach()
+        target_critics = self._select_critic_targets(target_critics)
 
         state = BafcCriticState(
             critic=critic_state, target_critic=target_critic_state)
@@ -1649,7 +1876,7 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
                 and self._actor_update_counter == 0):
             actor_action = action  # [T*B, n_actor, d_a]
             actor_state, actor_info = self._actor_train_step(
-                inputs.observation, actor_action, 
+                inputs.observation, actor_action, rollout_info.action,
                 rollout_info.bootstrap_mask, state.actor)
             critic_action = action.reshape(-1, action.shape[-1])  # [T*B * n_actor, d_a]
             critic_state, critic_info = self._critic_train_step(
@@ -1661,7 +1888,7 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
         else:
             if self._train_mode == TrainMode.actor:
                 actor_state, actor_info = self._actor_train_step(
-                    inputs.observation, action, 
+                    inputs.observation, action, rollout_info.action,
                     rollout_info.bootstrap_mask, state.actor)
                 critic_info = self._empty_critic_info_for_train_info(
                     inputs.reward)
@@ -1737,11 +1964,17 @@ class BafcAlgorithmV6(OffPolicyAlgorithm):
             critic_info = info.critic
             critic_losses = []
             for i, l in enumerate(self._critic_losses):
-                # critics & target_critics has shape [T, S, n_actor, n_critic]
+                # critics has shape [T, S, n_actor, n_critic, ...].
+                # A random shared target has shape [T, S, n_actor, ...];
+                # otherwise targets retain the critic dimension.
+                if self._use_random_critic_targets:
+                    target_value = critic_info.target_critic
+                else:
+                    target_value = critic_info.target_critic[:, :, :, i, ...]
                 critic_loss = l(
                     info=info,
                     value=critic_info.critic[:, :, :, i, ...],
-                    target_value=critic_info.target_critic[:, :, :, i, ...]).loss
+                    target_value=target_value).loss
                 if self._use_bootstrap_critics:
                     bootstrap_mask = info.bootstrap_mask[:, :,
                                                          i] / self._bootstrap_mask_prob

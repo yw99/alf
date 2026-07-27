@@ -47,6 +47,8 @@ alf.define_config('bafcv3_use_bootstrap_critics', False)
 use_bootstrap_critics = alf.get_config_value('bafcv3_use_bootstrap_critics')
 alf.define_config('bafcv3_num_attention_heads', 1)
 num_attention_heads = alf.get_config_value('bafcv3_num_attention_heads')
+alf.define_config('bafcv3_eval_samples_source', 'trainable')
+eval_samples_source = alf.get_config_value('bafcv3_eval_samples_source')
 
 # Enable find_unused_parameters for DDP (needed for multi-GPU training)
 alf.config('make_ddp_performer', find_unused_parameters=True)
@@ -105,6 +107,7 @@ alf.config(
     num_actor_eval_samples=num_actor_eval_samples,
     eval_samples_init_method='normal',
     eval_samples_clipping=obs_normalizer_clipping,
+    eval_samples_source=eval_samples_source,
     actor_eval_type='last_two',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,

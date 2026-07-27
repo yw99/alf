@@ -17,6 +17,7 @@ from absl import logging
 import numpy as np
 import functools
 from enum import Enum
+import weakref
 
 import torch
 import torch.nn as nn
@@ -130,7 +131,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  name="BafcAlgorithm",
                  num_sampled_critics_for_actor=1,
                  use_random_critic_targets=False,
-                 num_sampled_critic_targets=1):
+                 num_sampled_critic_targets=1,
+                 eval_samples_source='trainable'):
         """
         Args:
 
@@ -150,6 +152,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 sampled without replacement when ``use_random_critic_targets``
                 is True. Their elementwise minimum is shared by all online
                 critics. A value of 1 selects one random target critic.
+            eval_samples_source (str): source of the observations used to
+                encode actors for the functional critic. ``'trainable'`` keeps
+                the existing randomly initialized, trainable evaluation
+                samples. ``'replay'`` draws a separate set of observations
+                from the replay buffer for every gradient update.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -160,6 +167,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             r"{actor_eval_type} in not supported.")
         assert eval_samples_init_method in ['normal', 'uniform'], (
             r"init method {eval_samples_init_method} is not supported.")
+        assert eval_samples_source in ['trainable', 'replay'], (
+            "eval_samples_source must be either 'trainable' or 'replay', got "
+            f"{eval_samples_source!r}.")
+        assert (eval_samples_source == 'trainable'
+                or eval_samples_optimizer is None), (
+                    "eval_samples_optimizer is not supported when "
+                    "eval_samples_source='replay'.")
         assert bootstrap_mask_type in ['episode', 'step'], (
             r"bootstrap mask type {bootstrap_mask_type} is not supported.")
         assert 1 <= num_sampled_critics_for_actor <= num_actor_critic, (
@@ -206,6 +220,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._num_sampled_critics_for_actor = num_sampled_critics_for_actor
         self._use_random_critic_targets = use_random_critic_targets
         self._num_sampled_critic_targets = num_sampled_critic_targets
+        self._eval_samples_source = eval_samples_source
+        self._num_actor_eval_samples = num_actor_eval_samples
+        self._actor_eval_replay_buffer_ref = None
         self._use_bootstrap_actors = use_bootstrap_actors
         self._use_bootstrap_critics = use_bootstrap_critics
         self._bootstrap_mask_prob = bootstrap_mask_prob
@@ -288,7 +305,12 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             self.add_optimizer(critic_optimizer, [critic_networks])
         if actor_encoder_optimizer is not None:
             self.add_optimizer(actor_encoder_optimizer, [actor_encoder])
-        self._actor_eval_samples = nn.Parameter(actor_eval_samples)
+        # Keep this parameter in replay mode so that initialization RNG,
+        # checkpoint keys, and optimizer parameter layouts remain compatible
+        # with existing BAFCv3 runs. It is frozen and unused in replay mode.
+        self._actor_eval_samples = nn.Parameter(
+            actor_eval_samples,
+            requires_grad=eval_samples_source == 'trainable')
         if eval_samples_optimizer is not None:
             self.add_optimizer(eval_samples_optimizer, [self._actor_eval_samples])
 
@@ -412,7 +434,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         actor_requires_grad = (standard_or_initial
                                or self._train_mode == TrainMode.actor)
         eval_samples_requires_grad = (
-            standard_or_initial or self._train_mode == TrainMode.critic)
+            self._eval_samples_source == 'trainable'
+            and (standard_or_initial or self._train_mode == TrainMode.critic))
         for p in self._actor_networks.parameters():
             p.requires_grad_(actor_requires_grad)
         self._actor_eval_samples.requires_grad_(eval_samples_requires_grad)
@@ -490,6 +513,71 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if obs.shape[0] > self._critic_reweighting_target_obs_cache_size:
             obs = obs[-self._critic_reweighting_target_obs_cache_size:]
         self._reweighting_target_observation_cache = obs
+
+    def preprocess_experience(self, root_inputs: TimeStep, rollout_info,
+                              batch_info):
+        """Remember the owning replay buffer for replay evaluation samples."""
+        if self._eval_samples_source == 'replay':
+            replay_buffer = getattr(batch_info, 'replay_buffer', ())
+            if not (isinstance(replay_buffer, tuple)
+                    and len(replay_buffer) == 0):
+                self._actor_eval_replay_buffer_ref = weakref.ref(replay_buffer)
+        return root_inputs, rollout_info
+
+    def _sample_replay_actor_eval_samples(self):
+        """Draw and transform an independent set of replay observations."""
+        replay_buffer_ref = self._actor_eval_replay_buffer_ref
+        replay_buffer = (replay_buffer_ref()
+                         if replay_buffer_ref is not None else None)
+        if replay_buffer is None:
+            raise RuntimeError(
+                "eval_samples_source='replay' requires a replay buffer from "
+                "preprocess_experience() before train_step().")
+
+        batch_length = self._config.mini_batch_length or 1
+        batch_size = ((self._num_actor_eval_samples + batch_length - 1) //
+                      batch_length)
+        experience, batch_info = replay_buffer.get_batch(
+            batch_size=batch_size, batch_length=batch_length)
+        experience = dist_utils.params_to_distributions(
+            experience, replay_buffer.data_spec)
+        if not isinstance(experience, Experience):
+            raise RuntimeError(
+                "Replay-derived actor evaluation samples require the replay "
+                "buffer to contain Experience values.")
+        experience = alf.data_structures.add_batch_info(
+            experience, batch_info, replay_buffer)
+
+        # The main replay batch has already updated normalization statistics.
+        # Use evaluation mode so this extra draw is transformed using the
+        # current statistics without updating them a second time.
+        with torch.no_grad(), common.eval_context():
+            with alf.device(experience.step_type.device.type):
+                experience = self.transform_experience(experience)
+        experience = alf.data_structures.clear_batch_info(experience)
+        observation = experience.time_step.observation
+        if not isinstance(observation, torch.Tensor):
+            raise RuntimeError(
+                "Replay-derived actor evaluation samples require a tensor "
+                "observation.")
+
+        observation_shape = tuple(self._observation_spec.shape)
+        if tuple(observation.shape[2:]) != observation_shape:
+            raise RuntimeError(
+                "Transformed replay observation shape must be [B, T, "
+                f"{observation_shape}], got {tuple(observation.shape)}.")
+        observation = observation.reshape(-1, *observation_shape)
+        if observation.shape[0] < self._num_actor_eval_samples:
+            raise RuntimeError(
+                "The independent replay draw produced fewer transformed "
+                "observations than num_actor_eval_samples: "
+                f"{observation.shape[0]} < {self._num_actor_eval_samples}.")
+        return observation[:self._num_actor_eval_samples].detach()
+
+    def _get_actor_eval_samples(self):
+        if self._eval_samples_source == 'replay':
+            return self._sample_replay_actor_eval_samples()
+        return self._actor_eval_samples
 
     def _predict_action(self,
                         actor_net,
@@ -696,7 +784,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 'actor_critic_aggregation/dqda_pairwise_cosine',
                 self._mean_pairwise_cosine(individual_dqda))
 
-    def _actor_train_step(self, observation, action, replay_action, mask, state):
+    def _actor_train_step(self,
+                          observation,
+                          action,
+                          replay_action,
+                          mask,
+                          state,
+                          actor_eval_samples=None):
         """Compute the exact off-policy policy gradient from the functional critic,
         which consists of two terms, 
 
@@ -707,8 +801,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         """
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
+        if actor_eval_samples is None:
+            actor_eval_samples = self._actor_eval_samples
         eval_action = self._actor_networks(
-            self._actor_eval_samples, full_neurons=self._actor_eval_type != 'output')[0]
+            actor_eval_samples,
+            full_neurons=self._actor_eval_type != 'output')[0]
         if self._actor_eval_type == 'exclude_input':
             eval_action = eval_action[1:]
         elif self._actor_eval_type == 'last_two':
@@ -844,12 +941,18 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             return (sampled_targets * sign).min(dim=2)[0] * sign
         return sampled_targets.min(dim=2)[0]
 
-    def _critic_train_step(self, observation, state: BafcCriticState,
-                           rollout_info: BafcInfo, action): 
+    def _critic_train_step(self,
+                           observation,
+                           state: BafcCriticState,
+                           rollout_info: BafcInfo,
+                           action,
+                           actor_eval_samples=None):
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
+        if actor_eval_samples is None:
+            actor_eval_samples = self._actor_eval_samples
         eval_action = self._actor_networks(
-            self._actor_eval_samples, 
+            actor_eval_samples,
             full_neurons=self._actor_eval_type != 'output')[0]
         if self._actor_eval_type == 'exclude_input':
             eval_action = eval_action[1:]
@@ -907,7 +1010,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 # self._critic_network.set_obs_action_batch_dominate(False)
                 for p in self._actor_networks.parameters():
                     p.requires_grad_(False)
-                self._actor_eval_samples.requires_grad_(True)
+                self._actor_eval_samples.requires_grad_(
+                    self._eval_samples_source == 'trainable')
         elif self._train_mode == TrainMode.critic:
             if self._critic_update_counter % self._critic_utd == 0:
                 self._train_mode = TrainMode.actor
@@ -920,6 +1024,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                    rollout_info: BafcInfo):
         assert not self._is_eval
         self._training_started = True
+        actor_eval_samples = self._get_actor_eval_samples()
 
         # [T*B, n_actor, d_a]
         action, action_state = self._predict_action(
@@ -932,10 +1037,11 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             actor_action = action  # [T*B, n_actor, d_a]
             actor_state, actor_info = self._actor_train_step(
                 inputs.observation, actor_action, rollout_info.action,
-                rollout_info.bootstrap_mask, state.actor)
+                rollout_info.bootstrap_mask, state.actor, actor_eval_samples)
             critic_action = action.reshape(-1, action.shape[-1])  # [T*B * n_actor, d_a]
             critic_state, critic_info = self._critic_train_step(
-                inputs.observation, state.critic, rollout_info, critic_action)
+                inputs.observation, state.critic, rollout_info, critic_action,
+                actor_eval_samples)
             new_state = BafcState(action=action_state,
                                   actor=actor_state,
                                   critic=critic_state)
@@ -944,7 +1050,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             if self._train_mode == TrainMode.actor:
                 actor_state, actor_info = self._actor_train_step(
                     inputs.observation, action, rollout_info.action,
-                    rollout_info.bootstrap_mask, state.actor)
+                    rollout_info.bootstrap_mask, state.actor,
+                    actor_eval_samples)
                 critic_info = BafcCriticInfo()
                 new_state = BafcState(action=action_state,
                                       actor=actor_state,
@@ -953,7 +1060,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             else:
                 action = action.reshape(-1, action.shape[-1])  # [T*B * n_actor, d_a]
                 critic_state, critic_info = self._critic_train_step(
-                    inputs.observation, state.critic, rollout_info, action)
+                    inputs.observation, state.critic, rollout_info, action,
+                    actor_eval_samples)
                 actor_info = LossInfo(extra=BafcActorInfo())
                 new_state = BafcState(action=action_state,
                                       actor=state.actor,
@@ -962,14 +1070,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
         if self._debug_summaries and alf.summary.should_record_summaries():
             self._do_critic_summary = True
-            safe_mean_hist_summary('eval_samples', self._actor_eval_samples)
+            safe_mean_hist_summary('eval_samples', actor_eval_samples)
             safe_mean_hist_summary('eval_samples/per_dim_mean',
-                                   self._actor_eval_samples.mean(dim=0))
+                                   actor_eval_samples.mean(dim=0))
             safe_mean_hist_summary(
                 'eval_samples/per_dim_std',
-                self._actor_eval_samples.std(dim=0, unbiased=False))
+                actor_eval_samples.std(dim=0, unbiased=False))
             safe_mean_hist_summary('eval_samples/per_sample_l2_norm',
-                                   self._actor_eval_samples.norm(dim=-1))
+                                   actor_eval_samples.norm(dim=-1))
 
         info = BafcInfo(
             reward=inputs.reward,
