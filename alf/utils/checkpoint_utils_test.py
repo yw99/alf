@@ -49,6 +49,22 @@ class Net(nn.Module):
         self.fc2 = nn.Linear(20, 10)
 
 
+class RankStateNet(Net):
+
+    def __init__(self):
+        super().__init__()
+        self.rank_value = 1
+        self.loaded_rank_state = False
+
+    def _rank_local_checkpoint_state(self):
+        return dict(rank_value=self.rank_value)
+
+    def _load_rank_local_checkpoint_state(self, state):
+        if state is not None:
+            self.rank_value = state["rank_value"]
+            self.loaded_rank_state = True
+
+
 def weights_init_zeros(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
         torch.nn.init.zeros_(m.weight.data)
@@ -184,6 +200,25 @@ class TestNetAndOptimizer(alf.test.TestCase):
             for para in list(net.parameters()):
                 self.assertTrue((para == 1).all())
 
+
+    def test_rank_state_sidecar_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            net = RankStateNet()
+            checkpointer = ckpt_utils.Checkpointer(ckpt_dir, net=net)
+            checkpointer.save(7, ddp_rank=0)
+            rank_path = os.path.join(ckpt_dir, "ckpt-7-rank-state-rank0")
+            self.assertTrue(os.path.exists(rank_path))
+
+            net.rank_value = 9
+            checkpointer.load(7, ddp_rank=0)
+            self.assertEqual(net.rank_value, 1)
+            self.assertTrue(net.loaded_rank_state)
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            net = Net()
+            ckpt_utils.Checkpointer(ckpt_dir, net=net).save(7, ddp_rank=0)
+            rank_path = os.path.join(ckpt_dir, "ckpt-7-rank-state-rank0")
+            self.assertFalse(os.path.exists(rank_path))
 
 class TestMultiAlgSingleOpt(alf.test.TestCase):
 

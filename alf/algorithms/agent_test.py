@@ -82,6 +82,13 @@ class AgentTest(alf.test.TestCase):
                           actor_network_ctor=actor_net,
                           value_network_ctor=value_net))
 
+        self.assertEqual(
+            agent._synchronize_trainer_control(True, False, True),
+            (True, False, True, False))
+        self.assertIsNone(agent._rank_local_checkpoint_state())
+        # A missing sidecar is a no-op for algorithms without the hook.
+        agent._load_rank_local_checkpoint_state(None)
+
         should_skip = mock.Mock(return_value=True)
         after_unroll = mock.Mock()
         agent._rl_algorithm._should_skip_unroll_iter_off_policy = should_skip

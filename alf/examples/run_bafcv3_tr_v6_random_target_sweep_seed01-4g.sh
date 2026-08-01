@@ -12,7 +12,7 @@
 #
 # Usage: bash run_bafcv3_tr_v6_random_target_sweep_seed01-4g.sh [options]
 #   -e, --env ENV_NAME              DMC environment (default: humanoid:walk)
-#   -d, --dir BASE_DIR              Base results directory (default: /root/numeric_results)
+#   -d, --dir BASE_DIR              Base results directory (default: /workspace/alf_results/)
 #   -n, --steps NUM_STEPS           Total environment steps (default: 600000)
 #       --num-actor-critic N        Number of actor-critic pairs (default: 10)
 #       --num-sampled-targets N     Target critics sampled per update (default: 1)
@@ -27,6 +27,11 @@
 
 set -euo pipefail
 
+# Use headless EGL rendering for dm_control unless explicitly overridden.
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+# Use deterministic CUBLAS workspace for reproducibility unless explicitly overridden.
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TR2_CONF_FILE="${SCRIPT_DIR}/bafcv3_tr2_dmc_conf.py"
@@ -34,7 +39,7 @@ V6_CONF_FILE="${SCRIPT_DIR}/bafcv6_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 ENV_NAME="humanoid:walk"
-BASE_DIR="/root/numeric_results"
+BASE_DIR="/workspace/alf_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
 NUM_ACTOR_CRITIC=10
@@ -54,8 +59,14 @@ TR2_ACTOR_USE_LN=False
 ENABLE_CRITIC_REWEIGHTING=False
 CRITIC_REWEIGHTING_BETA=None
 CRITIC_REWEIGHTING_RIDGE=None
-CRITIC_REWEIGHTING_SOLVER_ITERS=5
-CRITIC_REWEIGHTING_MAX_WEIGHT=20.0
+CRITIC_REWEIGHTING_SOLVER_ITERS=1
+CRITIC_REWEIGHTING_MAX_WEIGHT=10.0
+V6_ENABLE_CRITIC_REWEIGHTING=True
+V6_CRITIC_REWEIGHTING_SOLVER="lbfgs_logits"
+V6_CRITIC_REWEIGHTING_SOLVER_ITERS=1
+V6_CRITIC_REWEIGHTING_NUM_FEATURE_COORDS=32
+V6_CRITIC_REWEIGHTING_NUM_TARGET_OBS=128
+V6_CRITIC_REWEIGHTING_MAX_WEIGHT=10.0
 GPUS="0,1,2,3"
 BASE_PORT=29500
 DRY_RUN=False
@@ -173,6 +184,20 @@ if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + 5 > 65535 )); then
     echo "--base-port must leave room for six valid ports, got: ${BASE_PORT}" >&2
     exit 1
 fi
+for value_name in V6_CRITIC_REWEIGHTING_SOLVER_ITERS \
+        V6_CRITIC_REWEIGHTING_NUM_FEATURE_COORDS \
+        V6_CRITIC_REWEIGHTING_NUM_TARGET_OBS; do
+    value="${!value_name}"
+    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${value_name} must be a positive integer, got: ${value}" >&2
+        exit 1
+    fi
+done
+if [[ "${V6_CRITIC_REWEIGHTING_SOLVER}" != "lbfgs_logits" &&
+        "${V6_CRITIC_REWEIGHTING_SOLVER}" != "projected_gradient_fw" ]]; then
+    echo "V6_CRITIC_REWEIGHTING_SOLVER must be lbfgs_logits or projected_gradient_fw, got: ${V6_CRITIC_REWEIGHTING_SOLVER}" >&2
+    exit 1
+fi
 
 ENV_DIR="${ENV_NAME%%:*}"
 ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_tr2_v6_random_target_sweep_4g/num_actor_critic${NUM_ACTOR_CRITIC}_num_sampled_critics_for_actor${NUM_SAMPLED_CRITICS_FOR_ACTOR}_num_sampled_critic_targets${NUM_SAMPLED_CRITIC_TARGETS}/critic_utd${CRITIC_UTD}"
@@ -201,6 +226,12 @@ Starting BAFCv3_TR2/BAFCv6 random-target sweep
   TR2 rollout-skip eval interval: ${ROLLOUT_SKIP_EVAL_INTERVAL}
   TR2 actor layer norm: ${TR2_ACTOR_USE_LN}
   TR2 critic reweighting: ${ENABLE_CRITIC_REWEIGHTING}
+  v6 critic reweighting: ${V6_ENABLE_CRITIC_REWEIGHTING}
+  v6 critic reweighting solver: ${V6_CRITIC_REWEIGHTING_SOLVER}
+  v6 critic reweighting solver iterations: ${V6_CRITIC_REWEIGHTING_SOLVER_ITERS}
+  v6 critic reweighting feature coordinates: ${V6_CRITIC_REWEIGHTING_NUM_FEATURE_COORDS}
+  v6 critic reweighting target observations: ${V6_CRITIC_REWEIGHTING_NUM_TARGET_OBS}
+  v6 critic reweighting max weight: ${V6_CRITIC_REWEIGHTING_MAX_WEIGHT}
   debug_summaries: ${DEBUG_SUMMARIES}
   GPUs per job: ${GPUS}
   Dry run: ${DRY_RUN}
@@ -259,6 +290,15 @@ for condition_index in "${!CONDITION_NAMES[@]}"; do
                 --conf_param "BafcAlgorithmV3TR2.critic_reweighting_ridge=${CRITIC_REWEIGHTING_RIDGE}"
                 --conf_param "BafcAlgorithmV3TR2.critic_reweighting_solver_iters=${CRITIC_REWEIGHTING_SOLVER_ITERS}"
                 --conf_param "BafcAlgorithmV3TR2.critic_reweighting_max_weight=${CRITIC_REWEIGHTING_MAX_WEIGHT}"
+            )
+        elif [[ "${ALGORITHM_CONFIG}" == "BafcAlgorithmV6" ]]; then
+            COMMAND+=(
+                --conf_param "BafcAlgorithmV6.enable_critic_reweighting=${V6_ENABLE_CRITIC_REWEIGHTING}"
+                --conf_param "BafcAlgorithmV6.critic_reweighting_solver='${V6_CRITIC_REWEIGHTING_SOLVER}'"
+                --conf_param "BafcAlgorithmV6.critic_reweighting_solver_iters=${V6_CRITIC_REWEIGHTING_SOLVER_ITERS}"
+                --conf_param "BafcAlgorithmV6.critic_reweighting_num_feature_coords=${V6_CRITIC_REWEIGHTING_NUM_FEATURE_COORDS}"
+                --conf_param "BafcAlgorithmV6.critic_reweighting_num_target_obs=${V6_CRITIC_REWEIGHTING_NUM_TARGET_OBS}"
+                --conf_param "BafcAlgorithmV6.critic_reweighting_max_weight=${V6_CRITIC_REWEIGHTING_MAX_WEIGHT}"
             )
         fi
         COMMAND+=(--distributed multi-gpu)

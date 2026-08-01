@@ -185,6 +185,50 @@ class Checkpointer(object):
                 "buffer state.", legacy_path)
         return {k: {} for k in self._modules.keys()}
 
+    def _rank_local_checkpoint_state(self):
+        state = {}
+        for name, module in self._modules.items():
+            if type(module) == torch.nn.DataParallel:
+                module = module.module
+            hook = getattr(module, "_rank_local_checkpoint_state", None)
+            if hook is None:
+                continue
+            module_state = hook()
+            if module_state is not None:
+                state[name] = module_state
+        return state
+
+    def _load_rank_local_checkpoint_state(self, f_path, ddp_rank,
+                                          map_location):
+        if ddp_rank is None or ddp_rank < 0:
+            return
+        rank_path = f_path + f"-rank-state-rank{ddp_rank}"
+        module_states = {}
+        if os.path.exists(rank_path):
+            payload = torch.load(rank_path, map_location=map_location)
+            saved_rank = int(payload["rank"])
+            if saved_rank != ddp_rank:
+                raise RuntimeError(
+                    f"Rank-state checkpoint {rank_path} belongs to rank "
+                    f"{saved_rank}, not rank {ddp_rank}.")
+            saved_world_size = int(payload["world_size"])
+            current_world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized() else 1)
+            if saved_world_size != current_world_size:
+                raise RuntimeError(
+                    "Distributed checkpoint world size mismatch: saved "
+                    f"{saved_world_size}, current {current_world_size}.")
+            module_states = payload["modules"]
+
+        for name, module in self._modules.items():
+            if type(module) == torch.nn.DataParallel:
+                module = module.module
+            hook = getattr(module, "_load_rank_local_checkpoint_state", None)
+            if hook is not None:
+                hook(module_states.get(name))
+
     @alf.configurable
     def load(self,
              global_step="latest",
@@ -351,6 +395,9 @@ class Checkpointer(object):
                 finally:
                     self._run_checkpoint_cleanup(callbacks)
 
+        self._load_rank_local_checkpoint_state(f_path, ddp_rank,
+                                               map_location)
+
         logging.info(
             "Checkpoint 'ckpt-{}' is loaded successfully.".format(global_step))
 
@@ -417,8 +464,8 @@ class Checkpointer(object):
             suffix (str): the suffix to be appended to the checkpoint file name.
                 If provided, it will be used as the suffix instead of ``global_step``.
             ddp_rank (None|int): if not None and >=0, save the replay buffer
-                into a rank-specific sidecar. Only rank 0 saves model,
-                optimizer, and structure files.
+                and optional module-local state into rank-specific sidecars.
+                Only rank 0 saves model, optimizer, and structure files.
         """
         suffix = suffix or str(global_step)
         save_model_state = ddp_rank is None or ddp_rank <= 0
@@ -460,6 +507,20 @@ class Checkpointer(object):
                 torch.save(replay_buffer_state, f_path + '-replay_buffer')
         else:
             torch.save(replay_buffer_state, f_path + '-replay_buffer')
+
+        if ddp_rank is not None and ddp_rank >= 0:
+            rank_state = self._rank_local_checkpoint_state()
+            if rank_state:
+                world_size = (
+                    torch.distributed.get_world_size()
+                    if torch.distributed.is_available()
+                    and torch.distributed.is_initialized() else 1)
+                torch.save(
+                    dict(
+                        rank=int(ddp_rank),
+                        world_size=int(world_size),
+                        modules=rank_state),
+                    f_path + f'-rank-state-rank{ddp_rank}')
 
         if save_model_state and self._global_step == -1:
             # we only need to save the checkpoint structure once.``global_step``

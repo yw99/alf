@@ -14,8 +14,10 @@
 """Soft Actor Critic Algorithm."""
 
 from absl import logging
+import copy
 import numpy as np
 import functools
+import random
 from enum import Enum
 
 import torch
@@ -122,6 +124,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                  delta_trust_max: float = 2.0,
                  monitor_trust_metrics: bool = True,
                  enable_eval_rollout_skip_gate: bool = False,
+                 rollout_skip_sync_mode: str = "min",
                  enable_eval_trust_max_decay: bool = False,
                  enable_grad_actor_extend_gate: bool = False,
                  enable_critic_reweighting: bool = False,
@@ -181,6 +184,12 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             enable_eval_rollout_skip_gate (bool): whether to skip rollout
                 collection when eval trust is below threshold. When False,
                 eval trust is not computed (to save compute).
+            rollout_skip_sync_mode (str): how distributed ranks combine rollout
+                skip decisions. ``async`` keeps rank-local decisions, ``min``
+                skips only when all ranks agree, ``avg`` applies the gate to
+                the mean eval-trust metric, and ``max`` skips when any rank
+                agrees. Synchronization is inactive when eval rollout skipping
+                is disabled or distributed training is not initialized.
             enable_eval_trust_max_decay (bool): whether to linearly decay
                 eval_trust_max according to local environment-step progress.
             freeze_eval_samples (bool): If True, keep actor eval samples fixed
@@ -223,6 +232,9 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             "trust_metric_update_interval must be >= 1")
         assert eval_gate_max_consecutive_rollout_skips >= 1, (
             "eval_gate_max_consecutive_rollout_skips must be >= 1")
+        assert rollout_skip_sync_mode in ("async", "min", "avg", "max"), (
+            "rollout_skip_sync_mode must be one of async, min, avg, max; "
+            f"got {rollout_skip_sync_mode!r}")
         if critic_reweighting_beta is not None:
             assert critic_reweighting_beta >= 0, (
                 "critic_reweighting_beta must be nonnegative when set")
@@ -293,6 +305,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._delta_trust_max = delta_trust_max
         self._monitor_trust_metrics = monitor_trust_metrics
         self._enable_eval_rollout_skip_gate = enable_eval_rollout_skip_gate
+        self._rollout_skip_sync_mode = rollout_skip_sync_mode
         self._enable_eval_trust_max_decay = enable_eval_trust_max_decay
         self._enable_grad_actor_extend_gate = enable_grad_actor_extend_gate
         self._enable_critic_reweighting = enable_critic_reweighting
@@ -505,7 +518,9 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             grad_gate_actor_extension_count=(
                 self._grad_gate_actor_extension_count, torch.int64),
             grad_gate_consecutive_actor_extensions=(
-                self._grad_gate_consecutive_actor_extensions, torch.int64))
+                self._grad_gate_consecutive_actor_extensions, torch.int64),
+            target_updater_counter=(self._update_target_critic._counter,
+                                    torch.int64))
         for name, (value, dtype) in scalar_fields.items():
             destination[self._bafc_runtime_key(
                 prefix, name)] = self._bafc_scalar_tensor(value, dtype=dtype)
@@ -562,7 +577,101 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         if "target_metric_observation_cache" in runtime_state:
             self._target_metric_observation_cache = self._bafc_runtime_tensor(
                 runtime_state["target_metric_observation_cache"])
+        if "target_updater_counter" in runtime_state:
+            self._update_target_critic._counter = self._bafc_scalar_int(
+                runtime_state["target_updater_counter"])
+
         self._apply_train_mode_grad_flags()
+
+    def _checkpoint_copy(self, value):
+        """Copy rank-local runtime state without retaining device storage."""
+
+        def _copy(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            return copy.deepcopy(value)
+
+        return alf.nest.map_structure(_copy, value)
+
+    def _restore_rank_value(self, value):
+        device = self._actor_eval_samples.device
+
+        def _restore(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().clone().to(device)
+            return copy.deepcopy(value)
+
+        return alf.nest.map_structure(_restore, value)
+
+    def _rank_local_checkpoint_state(self):
+        """Return TR2 state that is intentionally different on each rank."""
+        state = dict(
+            version=1,
+            last_eval_trust=self._checkpoint_copy(self._last_eval_trust),
+            last_grad_trust=self._checkpoint_copy(self._last_grad_trust),
+            rollout_actor_id=self._bafc_scalar_int(self._rollout_actor_id),
+            target_metric_observation_cache=self._checkpoint_copy(
+                self._target_metric_observation_cache),
+            bootstrap_mask=self._checkpoint_copy(self._bootstrap_mask),
+            active_rollout_skip_start_opportunity=(
+                self._active_rollout_skip_start_opportunity),
+            pending_rollout_skip_event=copy.deepcopy(
+                self._pending_rollout_skip_event),
+            active_grad_extension_start_step=(
+                self._active_grad_extension_start_step),
+            pending_grad_extension_event=copy.deepcopy(
+                self._pending_grad_extension_event),
+            last_rollout_skipped_due_eval_gate=(
+                self._last_rollout_skipped_due_eval_gate),
+            last_grad_gate_actor_extended=(
+                self._last_grad_gate_actor_extended),
+            last_update_had_actor_step=self._last_update_had_actor_step,
+            python_rng_state=random.getstate(),
+            numpy_rng_state=np.random.get_state(),
+            torch_rng_state=torch.get_rng_state())
+        if torch.cuda.is_available():
+            state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _load_rank_local_checkpoint_state(self, state):
+        """Restore state returned by :meth:`_rank_local_checkpoint_state`."""
+        if state is None:
+            logging.warning(
+                "Rank-local TR2 checkpoint state is missing; using the "
+                "rank-zero runtime state from the main checkpoint.")
+            return
+        if state.get("version") != 1:
+            raise RuntimeError(
+                "Unsupported TR2 rank-state checkpoint version: "
+                f"{state.get('version')!r}")
+        self._last_eval_trust = self._restore_rank_value(
+            state["last_eval_trust"])
+        self._last_grad_trust = self._restore_rank_value(
+            state["last_grad_trust"])
+        self._rollout_actor_id = int(state["rollout_actor_id"])
+        self._target_metric_observation_cache = self._restore_rank_value(
+            state["target_metric_observation_cache"])
+        self._bootstrap_mask = self._restore_rank_value(
+            state["bootstrap_mask"])
+        self._active_rollout_skip_start_opportunity = state.get(
+            "active_rollout_skip_start_opportunity")
+        self._pending_rollout_skip_event = copy.deepcopy(
+            state.get("pending_rollout_skip_event"))
+        self._active_grad_extension_start_step = state.get(
+            "active_grad_extension_start_step")
+        self._pending_grad_extension_event = copy.deepcopy(
+            state.get("pending_grad_extension_event"))
+        self._last_rollout_skipped_due_eval_gate = bool(
+            state.get("last_rollout_skipped_due_eval_gate", False))
+        self._last_grad_gate_actor_extended = bool(
+            state.get("last_grad_gate_actor_extended", False))
+        self._last_update_had_actor_step = bool(
+            state.get("last_update_had_actor_step", False))
+        random.setstate(state["python_rng_state"])
+        np.random.set_state(state["numpy_rng_state"])
+        torch.set_rng_state(state["torch_rng_state"])
+        if "cuda_rng_state_all" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
 
     def _set_actor_eval_samples_requires_grad(self, requires_grad):
         if self._freeze_eval_samples:
@@ -1678,6 +1787,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                     grad_trust = float(
                         torch.as_tensor(self._last_grad_trust).reshape(
                             ()).item())
+                    if self._distributed_rollout_skip_sync_enabled():
+                        grad_trust = float(
+                            self._all_reduce_control(
+                                [grad_trust],
+                                op=torch.distributed.ReduceOp.MAX)[0].item())
                     # Algorithm 3: continue actor-improvement steps while the
                     # anchored critic remains trustworthy, and refresh critic
                     # when grad trust violates the threshold.
@@ -1919,6 +2033,49 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             end_rollout_opportunity=int(self._rollout_opportunity_count),
             skip_length=int(skip_length))
 
+    def _distributed_rollout_skip_sync_enabled(self):
+        return (
+            self._enable_eval_rollout_skip_gate
+            and self._rollout_skip_sync_mode != "async"
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1)
+
+    def _distributed_world_size(self):
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            return torch.distributed.get_world_size()
+        return 1
+
+    def _distributed_control_device(self):
+        backend = str(torch.distributed.get_backend()).lower()
+        if "nccl" in backend:
+            device = self._actor_eval_samples.device
+            if device.type != "cuda":
+                device = torch.device("cuda", torch.cuda.current_device())
+            return device
+        return torch.device("cpu")
+
+    def _all_reduce_control(self, values, op=torch.distributed.ReduceOp.SUM):
+        tensor = torch.tensor(
+            values,
+            dtype=torch.float64,
+            device=self._distributed_control_device())
+        torch.distributed.all_reduce(tensor, op=op)
+        return tensor.cpu()
+
+    def _synchronize_trainer_control(self, termination_due,
+                                     periodic_checkpoint_due,
+                                     checkpoint_requested):
+        """Coordinate barrier-bearing trainer decisions when sync is active."""
+        flags = (bool(termination_due), bool(periodic_checkpoint_due),
+                 bool(checkpoint_requested))
+        if not self._distributed_rollout_skip_sync_enabled():
+            return flags + (False, )
+        reduced = self._all_reduce_control(
+            flags, op=torch.distributed.ReduceOp.MAX)
+        return tuple(bool(value.item()) for value in reduced) + (True, )
+
     def _current_eval_trust_max(self):
         """Return the effective eval-trust threshold for the current step."""
         if not self._enable_eval_trust_max_decay:
@@ -1928,50 +2085,111 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         return self._eval_trust_max * (
             final_env_step - current_env_step) / final_env_step
 
-    def _should_skip_unroll_iter_off_policy(self):
-        """Return whether the next off-policy unroll should be skipped."""
-        self._last_rollout_skipped_due_eval_gate = False
-        self._pending_rollout_skip_event = None
+    def _local_rollout_skip_proposal(self):
+        """Build a rank-local rollout decision without mutating controller state."""
+        proposal = dict(
+            should_skip=False,
+            rollout_opportunity=False,
+            skip_due_eval=False,
+            eval_trust=0.0,
+            eval_trust_max=0.0,
+            eval_gate_allowed=False)
 
         # Preserve the default behavior during warmup/initial collection and
         # for standard (non-alternating) training mode.
         if not self._training_started or self._train_mode == TrainMode.standard:
-            return False
+            return proposal
 
-        # Skip rollout until enough actor->critic cycles have completed since
-        # the previous rollout. Once the threshold is reached, this iter becomes
-        # a rollout opportunity.
-        if self._completed_cycles_since_rollout < self._rollout_cycles_per_collect:
-            return True
+        # Cadence skips are controller decisions, not eval-gate skips.
+        if (self._completed_cycles_since_rollout <
+                self._rollout_cycles_per_collect):
+            proposal["should_skip"] = True
+            return proposal
 
-        self._rollout_opportunity_count += 1
+        proposal["rollout_opportunity"] = True
+        if not self._enable_eval_rollout_skip_gate:
+            return proposal
+
+        proposal["eval_trust"] = float(
+            torch.as_tensor(self._last_eval_trust).reshape(()).item())
+        proposal["eval_trust_max"] = float(self._current_eval_trust_max())
+        proposal["eval_gate_allowed"] = (
+            self._eval_gate_consecutive_rollout_skips <
+            self._eval_gate_max_consecutive_rollout_skips)
+        proposal["skip_due_eval"] = (
+            proposal["eval_gate_allowed"]
+            and proposal["eval_trust"] <= proposal["eval_trust_max"])
+        proposal["should_skip"] = proposal["skip_due_eval"]
+        return proposal
+
+    def _synchronize_rollout_skip_proposal(self, proposal):
+        if not self._distributed_rollout_skip_sync_enabled():
+            return proposal
+
+        reduced = self._all_reduce_control([
+            proposal["should_skip"], proposal["rollout_opportunity"],
+            proposal["skip_due_eval"], proposal["eval_trust"],
+            proposal["eval_trust_max"], proposal["eval_gate_allowed"]
+        ])
+        world_size = self._distributed_world_size()
+        skip_count = int(round(reduced[0].item()))
+        all_at_opportunity = int(round(reduced[1].item())) == world_size
+
+        if self._rollout_skip_sync_mode == "min":
+            should_skip = skip_count == world_size
+        elif self._rollout_skip_sync_mode == "max":
+            should_skip = skip_count > 0
+        else:
+            if all_at_opportunity:
+                eval_trust = reduced[3].item() / world_size
+                eval_trust_max = reduced[4].item() / world_size
+                gate_allowed = int(round(reduced[5].item())) == world_size
+                should_skip = (
+                    gate_allowed and np.isfinite(eval_trust)
+                    and np.isfinite(eval_trust_max)
+                    and eval_trust <= eval_trust_max)
+            else:
+                # Controller state is expected to agree. If loading inconsistent
+                # legacy state, a rank that still requires rollout wins.
+                should_skip = skip_count == world_size
+
+        synchronized = dict(proposal)
+        synchronized["should_skip"] = bool(should_skip)
+        synchronized["rollout_opportunity"] = all_at_opportunity
+        synchronized["skip_due_eval"] = bool(should_skip
+                                               and all_at_opportunity)
+        return synchronized
+
+    def _commit_rollout_skip_decision(self, proposal):
+        self._last_rollout_skipped_due_eval_gate = False
+        self._pending_rollout_skip_event = None
+
+        if proposal["rollout_opportunity"]:
+            self._rollout_opportunity_count += 1
+
         previous_consecutive_skips = self._eval_gate_consecutive_rollout_skips
-
-        # Real rollout skip: when eval trust remains below threshold, skip this
-        # rollout and keep training from replay only.
-        if self._enable_eval_rollout_skip_gate:
-            eval_trust = float(
-                torch.as_tensor(self._last_eval_trust).reshape(()).item())
-            if (eval_trust <= self._current_eval_trust_max()
-                    and previous_consecutive_skips <
-                    self._eval_gate_max_consecutive_rollout_skips):
-                if previous_consecutive_skips == 0:
-                    self._active_rollout_skip_start_opportunity = (
-                        self._rollout_opportunity_count)
-                self._eval_gate_consecutive_rollout_skips += 1
-                self._rollout_skip_due_eval_gate_count += 1
-                self._last_rollout_skipped_due_eval_gate = True
-                if previous_consecutive_skips == 0:
-                    self._set_rollout_skip_event(
-                        "skip_start",
-                        self._eval_gate_consecutive_rollout_skips)
-                return True
-
-        if previous_consecutive_skips > 0:
+        if proposal["skip_due_eval"]:
+            if previous_consecutive_skips == 0:
+                self._active_rollout_skip_start_opportunity = (
+                    self._rollout_opportunity_count)
+            self._eval_gate_consecutive_rollout_skips += 1
+            self._rollout_skip_due_eval_gate_count += 1
+            self._last_rollout_skipped_due_eval_gate = True
+            if previous_consecutive_skips == 0:
+                self._set_rollout_skip_event(
+                    "skip_start",
+                    self._eval_gate_consecutive_rollout_skips)
+        elif proposal["rollout_opportunity"] and previous_consecutive_skips > 0:
             self._set_rollout_skip_event("skip_end",
                                          previous_consecutive_skips)
 
-        return False
+        return bool(proposal["should_skip"])
+
+    def _should_skip_unroll_iter_off_policy(self):
+        """Return the common decision for the next off-policy unroll."""
+        proposal = self._local_rollout_skip_proposal()
+        proposal = self._synchronize_rollout_skip_proposal(proposal)
+        return self._commit_rollout_skip_decision(proposal)
 
     def _after_unroll_iter_off_policy(self, unrolled):
         """Update BAFC rollout-gate state after a real parent unroll."""

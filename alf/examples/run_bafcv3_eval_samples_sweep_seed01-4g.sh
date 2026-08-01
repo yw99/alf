@@ -1,25 +1,29 @@
 #!/bin/bash
-# Launch BAFCv3 actor-evaluation-sample conditions on seeds 0 and 1.
+# Launch a BAFCv3 evaluation-sample/RLPD comparison on seeds 0 and 1.
 # Each job uses all configured GPUs through DDP; all six jobs run in parallel.
 #
-# Conditions (all use pairing=False, K_actor=8, and critic_utd=11):
-#   1. trainable eval samples, num_actor_eval_samples=2048
-#   2. replay eval samples, default num_actor_eval_samples
-#   3. replay eval samples, num_actor_eval_samples=2048
-# All conditions use an RLPD-style random critic TD target with M_target=1.
+# Conditions:
+#   1. BAFCv3 with replay evaluation samples, no fixed actor-critic pairing,
+#      and an RLPD-style random critic TD target
+#   2. BAFCv3 with trainable evaluation samples, no fixed actor-critic pairing,
+#      and an RLPD-style random critic TD target
+#   3. Default RLPD
 #
 # Usage: bash run_bafcv3_eval_samples_sweep_seed01-4g.sh [options]
 #   -e, --env ENV_NAME              DMC environment (default: humanoid:walk)
-#   -d, --dir BASE_DIR              Base results directory (default: /root/numeric_results)
+#   -d, --dir BASE_DIR              Base results directory (default: /workspace/alf_results)
 #   -n, --steps NUM_STEPS           Total environment steps (default: 600000)
-#       --learning-rate LR          Learning rate (default: 3e-4)
-#       --num-actor-critic N        Number of actor-critic pairs (default: 10)
-#       --large-num-eval-samples N  Large evaluation-sample count (default: 2048)
-#       --num-sampled-targets N     Target critics sampled per update (default: 1)
-#       --num-attention-heads N     Transformer attention heads (default: 1)
+#       --learning-rate LR          BAFCv3 learning rate (default: 3e-4)
+#       --num-actor-critic N        BAFCv3 actor-critic pairs (default: 10)
+#       --num-sampled-critics N     Critics sampled per BAFCv3 actor (default: 8)
+#       --num-sampled-targets N     BAFCv3 target critics per update (default: 1)
+#       --num-eval-samples N        BAFCv3 actor evaluation samples (default: 512)
+#       --critic-utd N              BAFCv3 critic UTD (default: 11)
+#       --num-attention-heads N     BAFCv3 attention heads (default: 1)
 #       --gpus CSV                  Comma-separated GPU ids (default: 0,1,2,3)
 #       --checkpoints N             Number of checkpoints (default: 10)
 #       --base-port PORT            First DDP master port (default: 29500)
+#       --http-base-port PORT       First ALF HTTP-control port (default: 18080)
 #       --dry-run                   Print commands without launching jobs
 #   -h, --help                      Show this help message
 #
@@ -28,28 +32,60 @@
 
 set -euo pipefail
 
+# Use headless EGL rendering for dm_control unless explicitly overridden.
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+# Use deterministic CUBLAS workspace for reproducibility unless explicitly overridden.
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-CONF_FILE="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
+BAFCV3_CONF_FILE="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
+RLPD_CONF_FILE="${SCRIPT_DIR}/rlpd_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 ENV_NAME="humanoid:walk"
-BASE_DIR="/root/numeric_results"
+BASE_DIR="/workspace/alf_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
-LEARNING_RATE=3e-4
-NUM_ACTOR_CRITIC=10
-NUM_SAMPLED_CRITICS_FOR_ACTOR=8
-LARGE_NUM_ACTOR_EVAL_SAMPLES=2048
-NUM_SAMPLED_CRITIC_TARGETS=1
-NUM_ATTENTION_HEADS=1
-CRITIC_UTD=11
-NUM_UPDATES_PER_TRAIN_ITER=12
 DEBUG_SUMMARIES=True
+
+# BAFCv3 comparison macros. Both BAFCv3 conditions differ only in their
+# evaluation-sample source.
+BAFCV3_LEARNING_RATE=3e-4
+BAFCV3_ACTOR_USE_LN=False
+BAFCV3_ACTOR_CRITIC_PAIRING=False
+BAFCV3_NUM_ACTOR_CRITIC=10
+BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR=8
+BAFCV3_USE_RANDOM_CRITIC_TARGETS=True
+BAFCV3_NUM_SAMPLED_CRITIC_TARGETS=1
+BAFCV3_NUM_ACTOR_EVAL_SAMPLES=512
+BAFCV3_NUM_ATTENTION_HEADS=1
+BAFCV3_USE_BOOTSTRAP_ACTORS=False
+BAFCV3_USE_BOOTSTRAP_CRITICS=False
+BAFCV3_CRITIC_UTD=11
+BAFCV3_NUM_UPDATES_PER_TRAIN_ITER=12
+
 GPUS="0,1,2,3"
-BASE_PORT=29500
+DDP_BASE_PORT=29500
+HTTP_BASE_PORT=18080
 DRY_RUN=False
 SEEDS=(0 1)
+
+CONDITION_NAMES=(
+    "bafcv3_replay_eval_samples_random_target"
+    "bafcv3_trainable_eval_samples_random_target"
+    "rlpd_default"
+)
+CONDITION_TYPES=(
+    "bafcv3"
+    "bafcv3"
+    "rlpd"
+)
+EVAL_SAMPLES_SOURCES=(
+    "replay"
+    "trainable"
+    "default"
+)
 
 print_help() {
     sed -n '/^# Usage:/,/^# Example:/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
@@ -70,23 +106,32 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --learning-rate)
-            LEARNING_RATE="$2"
+            BAFCV3_LEARNING_RATE="$2"
             shift 2
             ;;
         --num-actor-critic)
-            NUM_ACTOR_CRITIC="$2"
+            BAFCV3_NUM_ACTOR_CRITIC="$2"
             shift 2
             ;;
-        --large-num-eval-samples)
-            LARGE_NUM_ACTOR_EVAL_SAMPLES="$2"
+        --num-sampled-critics)
+            BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR="$2"
             shift 2
             ;;
         --num-sampled-targets)
-            NUM_SAMPLED_CRITIC_TARGETS="$2"
+            BAFCV3_NUM_SAMPLED_CRITIC_TARGETS="$2"
+            shift 2
+            ;;
+        --num-eval-samples)
+            BAFCV3_NUM_ACTOR_EVAL_SAMPLES="$2"
+            shift 2
+            ;;
+        --critic-utd)
+            BAFCV3_CRITIC_UTD="$2"
+            BAFCV3_NUM_UPDATES_PER_TRAIN_ITER=$((BAFCV3_CRITIC_UTD + 1))
             shift 2
             ;;
         --num-attention-heads)
-            NUM_ATTENTION_HEADS="$2"
+            BAFCV3_NUM_ATTENTION_HEADS="$2"
             shift 2
             ;;
         --gpus)
@@ -98,7 +143,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --base-port)
-            BASE_PORT="$2"
+            DDP_BASE_PORT="$2"
+            shift 2
+            ;;
+        --http-base-port)
+            HTTP_BASE_PORT="$2"
             shift 2
             ;;
         --dry-run)
@@ -122,10 +171,12 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Set PYTHON_BIN to a working interpreter, or create ${REPO_ROOT}/.venv." >&2
     exit 1
 fi
-if [[ ! -f "${CONF_FILE}" ]]; then
-    echo "Config file not found: ${CONF_FILE}" >&2
-    exit 1
-fi
+for conf_file in "${BAFCV3_CONF_FILE}" "${RLPD_CONF_FILE}"; do
+    if [[ ! -f "${conf_file}" ]]; then
+        echo "Config file not found: ${conf_file}" >&2
+        exit 1
+    fi
+done
 if [[ ! "${NUM_ENV_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--steps must be a positive integer, got: ${NUM_ENV_STEPS}" >&2
     exit 1
@@ -134,68 +185,72 @@ if [[ ! "${NUM_CHECKPOINTS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--checkpoints must be a positive integer, got: ${NUM_CHECKPOINTS}" >&2
     exit 1
 fi
-if [[ ! "${NUM_ACTOR_CRITIC}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "--num-actor-critic must be a positive integer, got: ${NUM_ACTOR_CRITIC}" >&2
+for value_name in BAFCV3_NUM_ACTOR_CRITIC \
+        BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR \
+        BAFCV3_NUM_SAMPLED_CRITIC_TARGETS \
+        BAFCV3_NUM_ACTOR_EVAL_SAMPLES \
+        BAFCV3_NUM_ATTENTION_HEADS \
+        BAFCV3_CRITIC_UTD \
+        BAFCV3_NUM_UPDATES_PER_TRAIN_ITER; do
+    value="${!value_name}"
+    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${value_name} must be a positive integer, got: ${value}" >&2
+        exit 1
+    fi
+done
+if (( BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR > BAFCV3_NUM_ACTOR_CRITIC )); then
+    echo "--num-sampled-critics must be at most ${BAFCV3_NUM_ACTOR_CRITIC}, got: ${BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR}" >&2
     exit 1
 fi
-if (( NUM_ACTOR_CRITIC < NUM_SAMPLED_CRITICS_FOR_ACTOR )); then
-    echo "--num-actor-critic must be at least ${NUM_SAMPLED_CRITICS_FOR_ACTOR} for K_actor=${NUM_SAMPLED_CRITICS_FOR_ACTOR}." >&2
+if (( BAFCV3_NUM_SAMPLED_CRITIC_TARGETS > BAFCV3_NUM_ACTOR_CRITIC )); then
+    echo "--num-sampled-targets must be at most ${BAFCV3_NUM_ACTOR_CRITIC}, got: ${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}" >&2
     exit 1
 fi
-if [[ ! "${LARGE_NUM_ACTOR_EVAL_SAMPLES}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "--large-num-eval-samples must be a positive integer, got: ${LARGE_NUM_ACTOR_EVAL_SAMPLES}" >&2
+if (( BAFCV3_NUM_UPDATES_PER_TRAIN_ITER != BAFCV3_CRITIC_UTD + 1 )); then
+    echo "BAFCV3_NUM_UPDATES_PER_TRAIN_ITER must equal BAFCV3_CRITIC_UTD + actor_utd (1)." >&2
     exit 1
 fi
-if [[ ! "${NUM_SAMPLED_CRITIC_TARGETS}" =~ ^[1-9][0-9]*$ ]] ||
-        (( NUM_SAMPLED_CRITIC_TARGETS > NUM_ACTOR_CRITIC )); then
-    echo "--num-sampled-targets must be between 1 and ${NUM_ACTOR_CRITIC}, got: ${NUM_SAMPLED_CRITIC_TARGETS}" >&2
+for port_name in DDP_BASE_PORT HTTP_BASE_PORT; do
+    port="${!port_name}"
+    if [[ ! "${port}" =~ ^[1-9][0-9]*$ ]] || (( port + 5 > 65535 )); then
+        echo "${port_name} must leave room for six valid ports, got: ${port}" >&2
+        exit 1
+    fi
+done
+if (( DDP_BASE_PORT <= HTTP_BASE_PORT + 5 && HTTP_BASE_PORT <= DDP_BASE_PORT + 5 )); then
+    echo "DDP and HTTP port ranges must not overlap." >&2
     exit 1
 fi
-if [[ ! "${NUM_ATTENTION_HEADS}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "--num-attention-heads must be a positive integer, got: ${NUM_ATTENTION_HEADS}" >&2
-    exit 1
-fi
-if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + 5 > 65535 )); then
-    echo "--base-port must leave room for six valid ports, got: ${BASE_PORT}" >&2
-    exit 1
-fi
-
-EVAL_SAMPLES_SOURCES=(trainable replay replay)
-NUM_ACTOR_EVAL_SAMPLES=(
-    "${LARGE_NUM_ACTOR_EVAL_SAMPLES}"
-    default
-    "${LARGE_NUM_ACTOR_EVAL_SAMPLES}"
-)
-CONDITION_NAMES=(
-    "trainable_eval_samples${LARGE_NUM_ACTOR_EVAL_SAMPLES}"
-    "replay_eval_samples_default"
-    "replay_eval_samples${LARGE_NUM_ACTOR_EVAL_SAMPLES}"
-)
 
 ENV_DIR="${ENV_NAME%%:*}"
-ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_dmc_4g_random_target_eval_samples_sweep/lr${LEARNING_RATE}/num_actor_critic${NUM_ACTOR_CRITIC}_num_sampled_critic_targets${NUM_SAMPLED_CRITIC_TARGETS}_num_attention_heads${NUM_ATTENTION_HEADS}/pairingFalse_num_sampled_critics_for_actor${NUM_SAMPLED_CRITICS_FOR_ACTOR}_critic_utd${CRITIC_UTD}"
+ROOT_DIR="${BASE_DIR%/}/${ENV_DIR}/bafcv3_eval_samples_rlpd_comparison_4g/num_actor_critic${BAFCV3_NUM_ACTOR_CRITIC}_num_sampled_critics_for_actor${BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR}_num_sampled_critic_targets${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}/critic_utd${BAFCV3_CRITIC_UTD}"
 
 cat <<EOF
-Starting BAFCv3 random-target evaluation-sample sweep
-  Config: ${CONF_FILE}
+Starting BAFCv3 evaluation-sample/default-RLPD comparison
+  BAFCv3 config: ${BAFCV3_CONF_FILE}
+  RLPD config: ${RLPD_CONF_FILE}
   Environment: ${ENV_NAME}
   Root dir: ${ROOT_DIR}
   Num env steps: ${NUM_ENV_STEPS}
   Num checkpoints: ${NUM_CHECKPOINTS}
   Seeds: ${SEEDS[*]}
-  learning rate: ${LEARNING_RATE}
-  actor_critic_pairing: False
-  num_actor_critic: ${NUM_ACTOR_CRITIC}
-  num_sampled_critics_for_actor: ${NUM_SAMPLED_CRITICS_FOR_ACTOR}
-  critic_utd: ${CRITIC_UTD}
-  use_random_critic_targets: True
-  num_sampled_critic_targets: ${NUM_SAMPLED_CRITIC_TARGETS}
-  large num_actor_eval_samples: ${LARGE_NUM_ACTOR_EVAL_SAMPLES}
-  default num_actor_eval_samples: config default (512 in non-debug mode)
-  num_attention_heads: ${NUM_ATTENTION_HEADS}
-  bootstrap actors/critics: False/False
+  BAFCv3 learning rate: ${BAFCV3_LEARNING_RATE}
+  BAFCv3 actor layer norm: ${BAFCV3_ACTOR_USE_LN}
+  BAFCv3 actor_critic_pairing: ${BAFCV3_ACTOR_CRITIC_PAIRING}
+  BAFCv3 num_actor_critic: ${BAFCV3_NUM_ACTOR_CRITIC}
+  BAFCv3 num_sampled_critics_for_actor: ${BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR}
+  BAFCv3 use_random_critic_targets: ${BAFCV3_USE_RANDOM_CRITIC_TARGETS}
+  BAFCv3 num_sampled_critic_targets: ${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}
+  BAFCv3 num_actor_eval_samples: ${BAFCV3_NUM_ACTOR_EVAL_SAMPLES}
+  BAFCv3 critic_utd: ${BAFCV3_CRITIC_UTD}
+  BAFCv3 num_updates_per_train_iter: ${BAFCV3_NUM_UPDATES_PER_TRAIN_ITER}
+  BAFCv3 attention heads: ${BAFCV3_NUM_ATTENTION_HEADS}
+  BAFCv3 bootstrap actors/critics: ${BAFCV3_USE_BOOTSTRAP_ACTORS}/${BAFCV3_USE_BOOTSTRAP_CRITICS}
+  RLPD algorithm settings: config defaults
   debug_summaries: ${DEBUG_SUMMARIES}
   GPUs per job: ${GPUS}
+  DDP ports: ${DDP_BASE_PORT}-$((DDP_BASE_PORT + 5))
+  HTTP-control ports: ${HTTP_BASE_PORT}-$((HTTP_BASE_PORT + 5))
   Dry run: ${DRY_RUN}
 EOF
 echo ""
@@ -205,40 +260,58 @@ cd "${REPO_ROOT}"
 PIDS=()
 for condition_index in "${!CONDITION_NAMES[@]}"; do
     CONDITION_NAME="${CONDITION_NAMES[$condition_index]}"
+    CONDITION_TYPE="${CONDITION_TYPES[$condition_index]}"
     EVAL_SAMPLES_SOURCE="${EVAL_SAMPLES_SOURCES[$condition_index]}"
-    EVAL_SAMPLE_COUNT="${NUM_ACTOR_EVAL_SAMPLES[$condition_index]}"
 
-    echo "Condition: eval_samples_source=${EVAL_SAMPLES_SOURCE}, num_actor_eval_samples=${EVAL_SAMPLE_COUNT}"
+    if [[ "${CONDITION_TYPE}" == "bafcv3" ]]; then
+        CONF_FILE="${BAFCV3_CONF_FILE}"
+        echo "Condition: ${CONDITION_NAME}, eval_samples_source=${EVAL_SAMPLES_SOURCE}"
+    else
+        CONF_FILE="${RLPD_CONF_FILE}"
+        echo "Condition: ${CONDITION_NAME}, algorithm settings=config defaults"
+    fi
+
     for seed_index in "${!SEEDS[@]}"; do
         SEED="${SEEDS[$seed_index]}"
-        MASTER_PORT=$((BASE_PORT + condition_index * ${#SEEDS[@]} + seed_index))
+        JOB_INDEX=$((condition_index * ${#SEEDS[@]} + seed_index))
+        MASTER_PORT=$((DDP_BASE_PORT + JOB_INDEX))
+        HTTP_PORT=$((HTTP_BASE_PORT + JOB_INDEX))
         RUN_DIR="${ROOT_DIR}/${CONDITION_NAME}/seed_${SEED}"
         COMMAND=(
             "${PYTHON_BIN}" -m alf.bin.train
+            --port "${HTTP_PORT}"
             --conf "${CONF_FILE}"
             --root_dir "${RUN_DIR}"
             --conf_param "TrainerConfig.random_seed=${SEED}"
             --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False"
             --conf_param "TrainerConfig.num_checkpoints=${NUM_CHECKPOINTS}"
             --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}"
-            --conf_param "TrainerConfig.num_updates_per_train_iter=${NUM_UPDATES_PER_TRAIN_ITER}"
             --conf_param "TrainerConfig.debug_summaries=${DEBUG_SUMMARIES}"
-            --conf_param "BafcAlgorithmV3.critic_utd=${CRITIC_UTD}"
-            --conf_param "bafcv3_learning_rate=${LEARNING_RATE}"
-            --conf_param "bafcv3_actor_critic_pairing=False"
-            --conf_param "bafcv3_num_actor_critic=${NUM_ACTOR_CRITIC}"
-            --conf_param "bafcv3_num_sampled_critics_for_actor=${NUM_SAMPLED_CRITICS_FOR_ACTOR}"
-            --conf_param "bafcv3_use_random_critic_targets=True"
-            --conf_param "bafcv3_num_sampled_critic_targets=${NUM_SAMPLED_CRITIC_TARGETS}"
-            --conf_param "bafcv3_eval_samples_source='${EVAL_SAMPLES_SOURCE}'"
-            --conf_param "bafcv3_use_bootstrap_actors=False"
-            --conf_param "bafcv3_use_bootstrap_critics=False"
-            --conf_param "bafcv3_num_attention_heads=${NUM_ATTENTION_HEADS}"
             --conf_param "create_environment.env_name='${ENV_NAME}'"
         )
-        if [[ "${EVAL_SAMPLE_COUNT}" != "default" ]]; then
+
+        if [[ "${CONDITION_TYPE}" == "bafcv3" ]]; then
             COMMAND+=(
-                --conf_param "BafcAlgorithmV3.num_actor_eval_samples=${EVAL_SAMPLE_COUNT}"
+                --conf_param "TrainerConfig.num_updates_per_train_iter=${BAFCV3_NUM_UPDATES_PER_TRAIN_ITER}"
+                --conf_param "BafcAlgorithmV3.critic_utd=${BAFCV3_CRITIC_UTD}"
+                --conf_param "BafcAlgorithmV3.num_actor_eval_samples=${BAFCV3_NUM_ACTOR_EVAL_SAMPLES}"
+                --conf_param "bafcv3_learning_rate=${BAFCV3_LEARNING_RATE}"
+                --conf_param "bafcv3_actor_use_ln=${BAFCV3_ACTOR_USE_LN}"
+                --conf_param "bafcv3_actor_critic_pairing=${BAFCV3_ACTOR_CRITIC_PAIRING}"
+                --conf_param "bafcv3_num_actor_critic=${BAFCV3_NUM_ACTOR_CRITIC}"
+                --conf_param "bafcv3_num_sampled_critics_for_actor=${BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR}"
+                --conf_param "bafcv3_use_random_critic_targets=${BAFCV3_USE_RANDOM_CRITIC_TARGETS}"
+                --conf_param "bafcv3_num_sampled_critic_targets=${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}"
+                --conf_param "bafcv3_eval_samples_source='${EVAL_SAMPLES_SOURCE}'"
+                --conf_param "bafcv3_use_bootstrap_actors=${BAFCV3_USE_BOOTSTRAP_ACTORS}"
+                --conf_param "bafcv3_use_bootstrap_critics=${BAFCV3_USE_BOOTSTRAP_CRITICS}"
+                --conf_param "bafcv3_num_attention_heads=${BAFCV3_NUM_ATTENTION_HEADS}"
+            )
+        else
+            # RLPD keeps critic UTD, update count, ensemble, entropy, and target
+            # update settings from rlpd_dmc_conf.py.
+            COMMAND+=(
+                --conf_param "make_ddp_performer.find_unused_parameters=True"
             )
         fi
         COMMAND+=(--distributed multi-gpu)
@@ -253,7 +326,7 @@ for condition_index in "${!CONDITION_NAMES[@]}"; do
                 "${COMMAND[@]}" > "${RUN_DIR}/out.log" 2>&1 &
             PID=$!
             PIDS+=("${PID}")
-            echo "  seed ${SEED}: port ${MASTER_PORT}, PID ${PID}"
+            echo "  seed ${SEED}: DDP port ${MASTER_PORT}, HTTP port ${HTTP_PORT}, PID ${PID}"
             echo "    Log: ${RUN_DIR}/out.log"
         fi
     done
@@ -263,7 +336,7 @@ done
 if [[ "${DRY_RUN}" == "True" ]]; then
     echo "Dry run complete; no jobs were launched."
 else
-    echo "Launched six BAFCv3 4-GPU jobs: ${PIDS[*]}"
+    echo "Launched six BAFCv3/RLPD 4-GPU jobs: ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
 fi
 echo "To monitor: tail -f ${ROOT_DIR}/*/seed_*/out.log"

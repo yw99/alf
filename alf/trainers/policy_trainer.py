@@ -831,20 +831,34 @@ class RLTrainer(Trainer):
                 self._eval()
                 self._num_evals_performed += 1
 
-            if self.progress() >= 1:
+            termination_due = self.progress() >= 1
+            periodic_checkpoint_due = bool(
+                (self._num_iterations and iter_num >= time_to_checkpoint)
+                or (not self._num_iterations and self._num_env_steps
+                    and total_time_steps >= time_to_checkpoint))
+            checkpoint_requested = bool(self._checkpoint_requested)
+            coordinated_control = False
+            synchronize = getattr(self._algorithm,
+                                  "_synchronize_trainer_control", None)
+            if synchronize is not None:
+                (termination_due, periodic_checkpoint_due,
+                 checkpoint_requested,
+                 coordinated_control) = synchronize(
+                     termination_due, periodic_checkpoint_due,
+                     checkpoint_requested)
+
+            if termination_due:
                 break
 
             self._check_dpp_paras_consistency(iter_num,
                                               training_setting_summarized)
 
-            if ((self._num_iterations and iter_num >= time_to_checkpoint)
-                    or (not self._num_iterations and self._num_env_steps
-                        and total_time_steps >= time_to_checkpoint)):
+            if periodic_checkpoint_due:
                 self._save_checkpoint(sync_ddp=True)
                 time_to_checkpoint += checkpoint_interval
-            elif self._checkpoint_requested:
+            elif checkpoint_requested:
                 logging.info("Saving checkpoint upon request...")
-                self._save_checkpoint(sync_ddp=False)
+                self._save_checkpoint(sync_ddp=coordinated_control)
                 self._checkpoint_requested = False
 
             if self._video_clip_requested:

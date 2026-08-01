@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import tempfile
 from functools import partial
 from types import SimpleNamespace
@@ -42,6 +43,56 @@ class _DummyProcess:
         del recursive
         return []
 
+
+def _distributed_rollout_skip_worker(rank, world_size, init_method, mode,
+                                     eval_trust_values, output_dir):
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=world_size, init_method=init_method)
+    try:
+        alg = object.__new__(BafcAlgorithmV3TR2)
+        torch.nn.Module.__init__(alg)
+        alg._enable_eval_rollout_skip_gate = True
+        alg._rollout_skip_sync_mode = mode
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._completed_cycles_since_rollout = 1
+        alg._rollout_cycles_per_collect = 1
+        alg._last_eval_trust = torch.tensor(
+            eval_trust_values[rank], dtype=torch.float64, device="cpu")
+        alg._eval_trust_max = 1.0
+        alg._enable_eval_trust_max_decay = False
+        alg._eval_gate_consecutive_rollout_skips = 0
+        alg._eval_gate_max_consecutive_rollout_skips = 5
+        alg._last_rollout_skipped_due_eval_gate = False
+        alg._pending_rollout_skip_event = None
+        alg._rollout_opportunity_count = 0
+        alg._rollout_skip_due_eval_gate_count = 0
+        alg._active_rollout_skip_start_opportunity = None
+
+        should_skip = alg._should_skip_unroll_iter_off_policy()
+        checkpoint_control = alg._synchronize_trainer_control(
+            termination_due=False,
+            periodic_checkpoint_due=rank == 0,
+            checkpoint_requested=False)
+        if checkpoint_control[1]:
+            torch.distributed.barrier()
+
+        termination_control = alg._synchronize_trainer_control(
+            termination_due=rank == world_size - 1,
+            periodic_checkpoint_due=False,
+            checkpoint_requested=False)
+        if termination_control[0]:
+            torch.distributed.barrier()
+
+        torch.save(
+            dict(
+                should_skip=should_skip,
+                checkpoint_control=checkpoint_control,
+                termination_control=termination_control,
+                skip_count=alg._rollout_skip_due_eval_gate_count),
+            os.path.join(output_dir, f"rank-{rank}.pt"))
+    finally:
+        torch.distributed.destroy_process_group()
 
 class _LinearParallelCritic(torch.nn.Module):
 
@@ -150,6 +201,200 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         with torch.no_grad():
             for parameter in module.parameters():
                 parameter.fill_(fill_value)
+
+    def _run_distributed_rollout_skip(self, mode, eval_trust_values):
+        world_size = len(eval_trust_values)
+        with tempfile.TemporaryDirectory(
+                prefix="tr2_distributed_skip_test_") as output_dir:
+            init_method = "file://" + os.path.join(output_dir, "init")
+            torch.multiprocessing.start_processes(
+                _distributed_rollout_skip_worker,
+                args=(world_size, init_method, mode, eval_trust_values,
+                      output_dir),
+                nprocs=world_size,
+                join=True,
+                start_method="spawn")
+            return [
+                torch.load(
+                    os.path.join(output_dir, f"rank-{rank}.pt"),
+                    weights_only=False) for rank in range(world_size)
+            ]
+
+    def test_rollout_skip_sync_mode_default_and_validation(self):
+        alg = self._make_alg()
+        self.assertEqual(alg._rollout_skip_sync_mode, "min")
+        with self.assertRaisesRegex(AssertionError,
+                                    "rollout_skip_sync_mode"):
+            self._make_alg(rollout_skip_sync_mode="invalid")
+
+
+    def test_async_and_disabled_gate_do_not_enable_distributed_control(self):
+        async_alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            rollout_skip_sync_mode="async")
+        disabled_alg = self._make_alg(
+            enable_eval_rollout_skip_gate=False,
+            rollout_skip_sync_mode="min")
+        with mock.patch.object(
+                torch.distributed, "is_available", return_value=True
+        ), mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+        ), mock.patch.object(
+                torch.distributed, "get_world_size", return_value=4
+        ), mock.patch.object(torch.distributed, "all_reduce") as all_reduce:
+            self.assertFalse(
+                async_alg._distributed_rollout_skip_sync_enabled())
+            self.assertFalse(
+                disabled_alg._distributed_rollout_skip_sync_enabled())
+            async_alg._synchronize_trainer_control(False, False, False)
+            disabled_alg._synchronize_trainer_control(False, False, False)
+        all_reduce.assert_not_called()
+
+    def test_sync_collective_runs_during_warmup(self):
+        alg = self._make_alg(enable_eval_rollout_skip_gate=True)
+        self.assertFalse(alg._training_started)
+        with mock.patch.object(
+                alg,
+                "_distributed_rollout_skip_sync_enabled",
+                return_value=True), mock.patch.object(
+                    alg,
+                    "_distributed_world_size",
+                    return_value=2), mock.patch.object(
+                        alg,
+                        "_all_reduce_control",
+                        return_value=torch.zeros(6)) as reduce_mock:
+            self.assertFalse(alg._should_skip_unroll_iter_off_policy())
+        reduce_mock.assert_called_once()
+        self.assertEqual(alg._rollout_opportunity_count, 0)
+    def test_local_rollout_skip_proposal_has_no_side_effects(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=2,
+            enable_eval_rollout_skip_gate=True)
+        alg._training_started = True
+        alg._train_mode = TrainMode.critic
+        alg._completed_cycles_since_rollout = alg._rollout_cycles_per_collect
+        alg._last_eval_trust = torch.tensor(0.5)
+        before = (
+            alg._rollout_opportunity_count,
+            alg._eval_gate_consecutive_rollout_skips,
+            alg._rollout_skip_due_eval_gate_count,
+            alg._pending_rollout_skip_event)
+
+        proposal = alg._local_rollout_skip_proposal()
+
+        self.assertTrue(proposal["should_skip"])
+        self.assertTrue(proposal["skip_due_eval"])
+        self.assertEqual(
+            before,
+            (alg._rollout_opportunity_count,
+             alg._eval_gate_consecutive_rollout_skips,
+             alg._rollout_skip_due_eval_gate_count,
+             alg._pending_rollout_skip_event))
+
+    def test_distributed_rollout_skip_modes_and_trainer_control(self):
+        cases = (
+            ("min", (0.5, 2.0), False),
+            ("avg", (0.5, 1.5), True),
+            ("max", (0.5, 2.0), True),
+        )
+        for mode, values, expected_skip in cases:
+            with self.subTest(mode=mode):
+                results = self._run_distributed_rollout_skip(mode, values)
+                self.assertEqual(
+                    [result["should_skip"] for result in results],
+                    [expected_skip] * len(values))
+                self.assertEqual(
+                    [result["checkpoint_control"] for result in results],
+                    [(False, True, False, True)] * len(values))
+                self.assertEqual(
+                    [result["termination_control"] for result in results],
+                    [(True, False, False, True)] * len(values))
+
+    def test_distributed_min_with_four_ranks(self):
+        results = self._run_distributed_rollout_skip(
+            "min", (0.25, 0.5, 0.75, 1.0))
+        self.assertEqual([result["should_skip"] for result in results],
+                         [True] * 4)
+        self.assertEqual([result["skip_count"] for result in results],
+                         [1] * 4)
+
+    def test_avg_nonfinite_metric_forces_rollout(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=2,
+            enable_eval_rollout_skip_gate=True,
+            rollout_skip_sync_mode="avg")
+        proposal = dict(
+            should_skip=True,
+            rollout_opportunity=True,
+            skip_due_eval=True,
+            eval_trust=float("nan"),
+            eval_trust_max=1.0,
+            eval_gate_allowed=True)
+        reduced = torch.tensor([2., 2., 2., float("nan"), 2., 2.])
+        with mock.patch.object(
+                alg,
+                "_distributed_rollout_skip_sync_enabled",
+                return_value=True), mock.patch.object(
+                    alg,
+                    "_distributed_world_size",
+                    return_value=2), mock.patch.object(
+                        alg, "_all_reduce_control", return_value=reduced):
+            synchronized = alg._synchronize_rollout_skip_proposal(proposal)
+        self.assertFalse(synchronized["should_skip"])
+
+    def test_grad_trust_uses_worst_rank_for_phase_transition(self):
+        alg = self._make_alg(
+            actor_utd=1,
+            critic_utd=2,
+            enable_eval_rollout_skip_gate=True,
+            enable_grad_actor_extend_gate=True,
+            delta_trust_max=1.0)
+        alg._train_mode = TrainMode.actor
+        alg._actor_update_counter = 1
+        alg._last_grad_trust = torch.tensor(0.25)
+        with mock.patch.object(
+                alg,
+                "_distributed_rollout_skip_sync_enabled",
+                return_value=True), mock.patch.object(
+                    alg,
+                    "_all_reduce_control",
+                    return_value=torch.tensor([2.0])) as reduce_mock:
+            alg._update_train_mode()
+
+        self.assertEqual(alg._train_mode, TrainMode.critic)
+        reduce_mock.assert_called_once()
+        self.assertIs(reduce_mock.call_args.kwargs["op"],
+                      torch.distributed.ReduceOp.MAX)
+
+    def test_rank_local_checkpoint_state_round_trip(self):
+        alg = self._make_alg()
+        alg._last_eval_trust = torch.tensor(0.25)
+        alg._last_grad_trust = torch.tensor(0.5)
+        alg._rollout_actor_id = 2
+        alg._target_metric_observation_cache = torch.arange(4.)
+        alg._bootstrap_mask = torch.tensor([1., 0., 1.])
+        alg._pending_rollout_skip_event = dict(type="skip_start")
+        state = alg._rank_local_checkpoint_state()
+
+        alg._last_eval_trust = torch.tensor(9.)
+        alg._last_grad_trust = torch.tensor(9.)
+        alg._rollout_actor_id = 0
+        alg._target_metric_observation_cache = ()
+        alg._bootstrap_mask = ()
+        alg._pending_rollout_skip_event = None
+        alg._load_rank_local_checkpoint_state(state)
+
+        self.assertTensorClose(alg._last_eval_trust, torch.tensor(0.25))
+        self.assertTensorClose(alg._last_grad_trust, torch.tensor(0.5))
+        self.assertEqual(alg._rollout_actor_id, 2)
+        self.assertTensorClose(alg._target_metric_observation_cache,
+                               torch.arange(4.))
+        self.assertTensorClose(alg._bootstrap_mask,
+                               torch.tensor([1., 0., 1.]))
+        self.assertEqual(alg._pending_rollout_skip_event,
+                         dict(type="skip_start"))
 
     def test_initialization_smoke_and_config_name(self):
         alg = self._make_alg()
@@ -1069,6 +1314,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         alg._rollout_opportunity_count = 9
         alg._grad_gate_actor_extension_count = 10
         alg._grad_gate_consecutive_actor_extensions = 11
+        alg._update_target_critic._counter = 1
         alg._target_metric_observation_cache = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         alg._apply_train_mode_grad_flags()
 
@@ -1094,6 +1340,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self.assertEqual(restored._rollout_opportunity_count, 9)
         self.assertEqual(restored._grad_gate_actor_extension_count, 10)
         self.assertEqual(restored._grad_gate_consecutive_actor_extensions, 11)
+        self.assertEqual(restored._update_target_critic._counter, 1)
         self.assertTensorClose(restored._target_metric_observation_cache,
                                torch.arange(12, dtype=torch.float32).reshape(3, 4))
         self.assertTrue(all(not p.requires_grad

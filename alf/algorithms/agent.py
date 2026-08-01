@@ -449,6 +449,28 @@ class Agent(RLAlgorithm):
 
         return unrolled, root_inputs, rollout_info
 
+    def _synchronize_trainer_control(self, termination_due,
+                                     periodic_checkpoint_due,
+                                     checkpoint_requested):
+        synchronize = getattr(self._rl_algorithm,
+                              "_synchronize_trainer_control", None)
+        if synchronize is None:
+            return (termination_due, periodic_checkpoint_due,
+                    checkpoint_requested, False)
+        return synchronize(termination_due, periodic_checkpoint_due,
+                           checkpoint_requested)
+
+    def _rank_local_checkpoint_state(self):
+        get_state = getattr(self._rl_algorithm,
+                            "_rank_local_checkpoint_state", None)
+        return get_state() if get_state is not None else None
+
+    def _load_rank_local_checkpoint_state(self, state):
+        load_state = getattr(self._rl_algorithm,
+                             "_load_rank_local_checkpoint_state", None)
+        if load_state is not None:
+            load_state(state)
+
     def train_step_offline(self, time_step: TimeStep, state, rollout_info,
                            pre_train):
         new_state = AgentState()
