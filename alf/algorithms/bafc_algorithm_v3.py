@@ -17,7 +17,6 @@ from absl import logging
 import numpy as np
 import functools
 from enum import Enum
-import weakref
 
 import torch
 import torch.nn as nn
@@ -30,13 +29,13 @@ from alf.algorithms.off_policy_algorithm import OffPolicyAlgorithm
 from alf.algorithms.one_step_loss import OneStepTDLoss
 from alf.algorithms.rl_algorithm import RLAlgorithm
 from alf.algorithms.rlpd_algorithm import TrainMode
-from alf.data_structures import TimeStep, Experience, LossInfo, namedtuple
+from alf.data_structures import TimeStep, LossInfo, namedtuple
 from alf.data_structures import AlgStep, StepType
 from alf.nest import nest
 import alf.nest.utils as nest_utils
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import TensorSpec, BoundedTensorSpec
-from alf.utils import losses, common, dist_utils, math_ops, checkpoint_utils
+from alf.utils import losses, common, math_ops, checkpoint_utils
 from alf.utils.normalizers import ScalarAdaptiveNormalizer
 from alf.utils.schedulers import Scheduler
 from alf.utils.summary_utils import safe_mean_hist_summary
@@ -155,8 +154,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             eval_samples_source (str): source of the observations used to
                 encode actors for the functional critic. ``'trainable'`` keeps
                 the existing randomly initialized, trainable evaluation
-                samples. ``'replay'`` draws a separate set of observations
-                from the replay buffer for every gradient update.
+                samples. ``'replay'`` samples without replacement from the
+                transformed observations in the current training iteration.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -222,7 +221,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._num_sampled_critic_targets = num_sampled_critic_targets
         self._eval_samples_source = eval_samples_source
         self._num_actor_eval_samples = num_actor_eval_samples
-        self._actor_eval_replay_buffer_ref = None
+        # An ephemeral, iteration-local cache. Keeping this as a plain
+        # attribute deliberately excludes it from parameters, buffers and
+        # checkpoints.
+        self._replay_eval_observation_pool = None
         self._use_bootstrap_actors = use_bootstrap_actors
         self._use_bootstrap_critics = use_bootstrap_critics
         self._bootstrap_mask_prob = bootstrap_mask_prob
@@ -516,67 +518,48 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
     def preprocess_experience(self, root_inputs: TimeStep, rollout_info,
                               batch_info):
-        """Remember the owning replay buffer for replay evaluation samples."""
-        if self._eval_samples_source == 'replay':
-            replay_buffer = getattr(batch_info, 'replay_buffer', ())
-            if not (isinstance(replay_buffer, tuple)
-                    and len(replay_buffer) == 0):
-                self._actor_eval_replay_buffer_ref = weakref.ref(replay_buffer)
-        return root_inputs, rollout_info
+        """Prepare replay evaluation observations from the training batch."""
+        if self._eval_samples_source != 'replay':
+            return root_inputs, rollout_info
 
-    def _sample_replay_actor_eval_samples(self):
-        """Draw and transform an independent set of replay observations."""
-        replay_buffer_ref = self._actor_eval_replay_buffer_ref
-        replay_buffer = (replay_buffer_ref()
-                         if replay_buffer_ref is not None else None)
-        if replay_buffer is None:
-            raise RuntimeError(
-                "eval_samples_source='replay' requires a replay buffer from "
-                "preprocess_experience() before train_step().")
-
-        batch_length = self._config.mini_batch_length or 1
-        batch_size = ((self._num_actor_eval_samples + batch_length - 1) //
-                      batch_length)
-        experience, batch_info = replay_buffer.get_batch(
-            batch_size=batch_size, batch_length=batch_length)
-        experience = dist_utils.params_to_distributions(
-            experience, replay_buffer.data_spec)
-        if not isinstance(experience, Experience):
-            raise RuntimeError(
-                "Replay-derived actor evaluation samples require the replay "
-                "buffer to contain Experience values.")
-        experience = alf.data_structures.add_batch_info(
-            experience, batch_info, replay_buffer)
-
-        # The main replay batch has already updated normalization statistics.
-        # Use evaluation mode so this extra draw is transformed using the
-        # current statistics without updating them a second time.
-        with torch.no_grad(), common.eval_context():
-            with alf.device(experience.step_type.device.type):
-                experience = self.transform_experience(experience)
-        experience = alf.data_structures.clear_batch_info(experience)
-        observation = experience.time_step.observation
-        if not isinstance(observation, torch.Tensor):
-            raise RuntimeError(
-                "Replay-derived actor evaluation samples require a tensor "
-                "observation.")
-
+        # Invalidate first so a validation failure cannot leave a stale pool
+        # available to a later train_step().
+        self._replay_eval_observation_pool = None
+        observation = root_inputs.observation
         observation_shape = tuple(self._observation_spec.shape)
-        if tuple(observation.shape[2:]) != observation_shape:
+        if (not isinstance(observation, torch.Tensor)
+                or observation.ndim != 2 + len(observation_shape)
+                or tuple(observation.shape[2:]) != observation_shape):
+            actual_shape = (tuple(observation.shape)
+                            if isinstance(observation, torch.Tensor) else
+                            type(observation).__name__)
             raise RuntimeError(
-                "Transformed replay observation shape must be [B, T, "
-                f"{observation_shape}], got {tuple(observation.shape)}.")
-        observation = observation.reshape(-1, *observation_shape)
-        if observation.shape[0] < self._num_actor_eval_samples:
+                "eval_samples_source='replay' requires a tensor observation "
+                "with shape [batch, time, *observation_shape], where "
+                f"observation_shape={observation_shape}; got {actual_shape}.")
+
+        pool = observation.reshape(-1, *observation_shape).detach()
+        actual_size = pool.shape[0]
+        required_size = self._num_actor_eval_samples
+        if actual_size < required_size:
             raise RuntimeError(
-                "The independent replay draw produced fewer transformed "
-                "observations than num_actor_eval_samples: "
-                f"{observation.shape[0]} < {self._num_actor_eval_samples}.")
-        return observation[:self._num_actor_eval_samples].detach()
+                "The current transformed replay observation pool is too "
+                f"small: actual size {actual_size}, required size "
+                f"{required_size}. Increase the replay training batch size "
+                "or reduce num_actor_eval_samples.")
+        self._replay_eval_observation_pool = pool
+        return root_inputs, rollout_info
 
     def _get_actor_eval_samples(self):
         if self._eval_samples_source == 'replay':
-            return self._sample_replay_actor_eval_samples()
+            pool = self._replay_eval_observation_pool
+            if pool is None:
+                raise RuntimeError(
+                    "eval_samples_source='replay' requires a valid "
+                    "preprocess_experience() call before train_step().")
+            indices = torch.randperm(
+                pool.shape[0], device=pool.device)[:self._num_actor_eval_samples]
+            return torch.index_select(pool, 0, indices)
         return self._actor_eval_samples
 
     def _predict_action(self,

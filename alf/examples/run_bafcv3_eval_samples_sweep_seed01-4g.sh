@@ -1,13 +1,14 @@
 #!/bin/bash
-# Launch a BAFCv3 evaluation-sample/RLPD comparison on seeds 0 and 1.
-# Each job uses all configured GPUs through DDP; all six jobs run in parallel.
+# Launch a BAFCv3 evaluation-sample comparison on seeds 0 and 1, optionally
+# including default RLPD. Each job uses all configured GPUs through DDP; four
+# jobs run by default, or six when --with-rlpd is specified.
 #
 # Conditions:
 #   1. BAFCv3 with replay evaluation samples, no fixed actor-critic pairing,
 #      and an RLPD-style random critic TD target
 #   2. BAFCv3 with trainable evaluation samples, no fixed actor-critic pairing,
 #      and an RLPD-style random critic TD target
-#   3. Default RLPD
+#   3. Default RLPD (optional; enable with --with-rlpd)
 #
 # Usage: bash run_bafcv3_eval_samples_sweep_seed01-4g.sh [options]
 #   -e, --env ENV_NAME              DMC environment (default: humanoid:walk)
@@ -24,6 +25,7 @@
 #       --checkpoints N             Number of checkpoints (default: 10)
 #       --base-port PORT            First DDP master port (default: 29500)
 #       --http-base-port PORT       First ALF HTTP-control port (default: 18080)
+#       --with-rlpd                 Also launch the default RLPD comparison
 #       --dry-run                   Print commands without launching jobs
 #   -h, --help                      Show this help message
 #
@@ -69,22 +71,20 @@ GPUS="0,1,2,3"
 DDP_BASE_PORT=29500
 HTTP_BASE_PORT=18080
 DRY_RUN=False
+RUN_RLPD=False
 SEEDS=(0 1)
 
 CONDITION_NAMES=(
     "bafcv3_replay_eval_samples_random_target"
     "bafcv3_trainable_eval_samples_random_target"
-    "rlpd_default"
 )
 CONDITION_TYPES=(
     "bafcv3"
     "bafcv3"
-    "rlpd"
 )
 EVAL_SAMPLES_SOURCES=(
     "replay"
     "trainable"
-    "default"
 )
 
 print_help() {
@@ -150,6 +150,10 @@ while [[ $# -gt 0 ]]; do
             HTTP_BASE_PORT="$2"
             shift 2
             ;;
+        --with-rlpd)
+            RUN_RLPD=True
+            shift
+            ;;
         --dry-run)
             DRY_RUN=True
             shift
@@ -171,7 +175,11 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Set PYTHON_BIN to a working interpreter, or create ${REPO_ROOT}/.venv." >&2
     exit 1
 fi
-for conf_file in "${BAFCV3_CONF_FILE}" "${RLPD_CONF_FILE}"; do
+conf_files=("${BAFCV3_CONF_FILE}")
+if [[ "${RUN_RLPD}" == "True" ]]; then
+    conf_files+=("${RLPD_CONF_FILE}")
+fi
+for conf_file in "${conf_files[@]}"; do
     if [[ ! -f "${conf_file}" ]]; then
         echo "Config file not found: ${conf_file}" >&2
         exit 1
@@ -210,25 +218,33 @@ if (( BAFCV3_NUM_UPDATES_PER_TRAIN_ITER != BAFCV3_CRITIC_UTD + 1 )); then
     echo "BAFCV3_NUM_UPDATES_PER_TRAIN_ITER must equal BAFCV3_CRITIC_UTD + actor_utd (1)." >&2
     exit 1
 fi
+if [[ "${RUN_RLPD}" == "True" ]]; then
+    CONDITION_NAMES+=("rlpd_default")
+    CONDITION_TYPES+=("rlpd")
+    EVAL_SAMPLES_SOURCES+=("default")
+fi
+NUM_JOBS=$((${#CONDITION_NAMES[@]} * ${#SEEDS[@]}))
+MAX_PORT_OFFSET=$((NUM_JOBS - 1))
+
 for port_name in DDP_BASE_PORT HTTP_BASE_PORT; do
     port="${!port_name}"
-    if [[ ! "${port}" =~ ^[1-9][0-9]*$ ]] || (( port + 5 > 65535 )); then
-        echo "${port_name} must leave room for six valid ports, got: ${port}" >&2
+    if [[ ! "${port}" =~ ^[1-9][0-9]*$ ]] || (( port + MAX_PORT_OFFSET > 65535 )); then
+        echo "${port_name} must leave room for ${NUM_JOBS} valid ports, got: ${port}" >&2
         exit 1
     fi
 done
-if (( DDP_BASE_PORT <= HTTP_BASE_PORT + 5 && HTTP_BASE_PORT <= DDP_BASE_PORT + 5 )); then
+if (( DDP_BASE_PORT <= HTTP_BASE_PORT + MAX_PORT_OFFSET && HTTP_BASE_PORT <= DDP_BASE_PORT + MAX_PORT_OFFSET )); then
     echo "DDP and HTTP port ranges must not overlap." >&2
     exit 1
 fi
 
 ENV_DIR="${ENV_NAME%%:*}"
-ROOT_DIR="${BASE_DIR%/}/${ENV_DIR}/bafcv3_eval_samples_rlpd_comparison_4g/num_actor_critic${BAFCV3_NUM_ACTOR_CRITIC}_num_sampled_critics_for_actor${BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR}_num_sampled_critic_targets${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}/critic_utd${BAFCV3_CRITIC_UTD}"
+ROOT_DIR="${BASE_DIR%/}/${ENV_DIR}/bafcv3_eval_samples_comparison_v2_4g/num_actor_critic${BAFCV3_NUM_ACTOR_CRITIC}_num_sampled_critics_for_actor${BAFCV3_NUM_SAMPLED_CRITICS_FOR_ACTOR}_num_sampled_critic_targets${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}/critic_utd${BAFCV3_CRITIC_UTD}"
 
 cat <<EOF
-Starting BAFCv3 evaluation-sample/default-RLPD comparison
+Starting BAFCv3 evaluation-sample comparison
   BAFCv3 config: ${BAFCV3_CONF_FILE}
-  RLPD config: ${RLPD_CONF_FILE}
+  RLPD config (when enabled): ${RLPD_CONF_FILE}
   Environment: ${ENV_NAME}
   Root dir: ${ROOT_DIR}
   Num env steps: ${NUM_ENV_STEPS}
@@ -246,11 +262,11 @@ Starting BAFCv3 evaluation-sample/default-RLPD comparison
   BAFCv3 num_updates_per_train_iter: ${BAFCV3_NUM_UPDATES_PER_TRAIN_ITER}
   BAFCv3 attention heads: ${BAFCV3_NUM_ATTENTION_HEADS}
   BAFCv3 bootstrap actors/critics: ${BAFCV3_USE_BOOTSTRAP_ACTORS}/${BAFCV3_USE_BOOTSTRAP_CRITICS}
-  RLPD algorithm settings: config defaults
+  Include default RLPD: ${RUN_RLPD}
   debug_summaries: ${DEBUG_SUMMARIES}
   GPUs per job: ${GPUS}
-  DDP ports: ${DDP_BASE_PORT}-$((DDP_BASE_PORT + 5))
-  HTTP-control ports: ${HTTP_BASE_PORT}-$((HTTP_BASE_PORT + 5))
+  DDP ports: ${DDP_BASE_PORT}-$((DDP_BASE_PORT + MAX_PORT_OFFSET))
+  HTTP-control ports: ${HTTP_BASE_PORT}-$((HTTP_BASE_PORT + MAX_PORT_OFFSET))
   Dry run: ${DRY_RUN}
 EOF
 echo ""
@@ -336,7 +352,7 @@ done
 if [[ "${DRY_RUN}" == "True" ]]; then
     echo "Dry run complete; no jobs were launched."
 else
-    echo "Launched six BAFCv3/RLPD 4-GPU jobs: ${PIDS[*]}"
+    echo "Launched ${#PIDS[@]} comparison 4-GPU jobs: ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
 fi
 echo "To monitor: tail -f ${ROOT_DIR}/*/seed_*/out.log"
