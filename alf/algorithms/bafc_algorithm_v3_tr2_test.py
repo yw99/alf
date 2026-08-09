@@ -21,6 +21,7 @@ from unittest import mock
 import torch
 
 import alf
+from alf.algorithms.agent import Agent
 from alf.algorithms.bafc_algorithm_v3_tr2 import (BafcActorInfo,
                                                   BafcAlgorithmV3TR2,
                                                   BafcCriticInfo, BafcInfo,
@@ -28,9 +29,11 @@ from alf.algorithms.bafc_algorithm_v3_tr2 import (BafcActorInfo,
 from alf.algorithms.config import TrainerConfig
 from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.data_structures import LossInfo, StepType, TimeStep
+from alf.experience_replayers.replay_buffer import ReplayBuffer
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.nest import utils as nest_utils
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
+from alf.utils.checkpoint_utils import Checkpointer
 from alf.utils.schedulers import update_progress
 
 
@@ -51,6 +54,7 @@ def _distributed_rollout_skip_worker(rank, world_size, init_method, mode,
     try:
         alg = object.__new__(BafcAlgorithmV3TR2)
         torch.nn.Module.__init__(alg)
+        alg._debug_summaries = True
         alg._enable_eval_rollout_skip_gate = True
         alg._rollout_skip_sync_mode = mode
         alg._training_started = True
@@ -69,6 +73,7 @@ def _distributed_rollout_skip_worker(rank, world_size, init_method, mode,
         alg._rollout_skip_due_eval_gate_count = 0
         alg._active_rollout_skip_start_opportunity = None
 
+        alg._refresh_eval_trust_aggregates()
         should_skip = alg._should_skip_unroll_iter_off_policy()
         checkpoint_control = alg._synchronize_trainer_control(
             termination_due=False,
@@ -89,6 +94,10 @@ def _distributed_rollout_skip_worker(rank, world_size, init_method, mode,
                 should_skip=should_skip,
                 checkpoint_control=checkpoint_control,
                 termination_control=termination_control,
+                rank_min=float(alg._last_eval_trust_rank_min),
+                rank_avg=float(alg._last_eval_trust_rank_avg),
+                rank_max=float(alg._last_eval_trust_rank_max),
+                effective=float(alg._last_eval_trust_effective),
                 skip_count=alg._rollout_skip_due_eval_gate_count),
             os.path.join(output_dir, f"rank-{rank}.pt"))
     finally:
@@ -169,6 +178,72 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
             num_actor_eval_samples=16,
             **kwargs)
 
+    def _make_internal_grad_gate_alg(self, **kwargs):
+        """Construct the dormant gradient-gate path for internal coverage."""
+        kwargs.pop("enable_grad_actor_extend_gate", None)
+        alg = self._make_alg(enable_grad_actor_extend_gate=False, **kwargs)
+        alg._enable_grad_actor_extend_gate = True
+        return alg
+
+    def _make_agent(self, **kwargs):
+        num_actor_critic = kwargs.pop("num_actor_critic", 3)
+        config = TrainerConfig(
+            root_dir=tempfile.mkdtemp(prefix="bafc_v3_tr2_agent_test_"),
+            unroll_length=2,
+            mini_batch_length=2,
+            mini_batch_size=4,
+            initial_collect_steps=0,
+            num_updates_per_train_iter=3)
+        kwargs.setdefault("trust_metric_num_obs", 8)
+        return Agent(
+            observation_spec=TensorSpec((4, )),
+            action_spec=BoundedTensorSpec((2, ), minimum=-1.0, maximum=1.0),
+            config=config,
+            rl_algorithm_cls=partial(
+                BafcAlgorithmV3TR2,
+                actor_network_cls=partial(
+                    ActorFCNetwork, fc_layer_params=(32, 32)),
+                critic_network_cls=partial(
+                    FuncCriticNetwork,
+                    obs_action_joint_fc_layer_params=(32, 32),
+                    actor_obs_action_joint_fc_layer_params=(32, 32)),
+                actor_encoder_cls=partial(
+                    TransformerEncoder, num_layers=2,
+                    num_attention_heads=1),
+                num_actor_critic=num_actor_critic,
+                num_actor_eval_samples=16,
+                **kwargs))
+
+    def _attach_replay_buffer(self, alg, num_items=0):
+        replay_buffer = ReplayBuffer(
+            data_spec=TimeStep(
+                step_type=TensorSpec((), dtype=torch.int64),
+                reward=TensorSpec(()),
+                discount=TensorSpec(()),
+                observation=TensorSpec((4, )),
+                prev_action=TensorSpec((2, )),
+                env_id=TensorSpec((), dtype=torch.int64)),
+            num_environments=1,
+            max_length=8)
+        for value in range(num_items):
+            replay_buffer.add_batch(
+                TimeStep(
+                    step_type=torch.tensor([StepType.MID], dtype=torch.int64),
+                    reward=torch.tensor([float(value)], dtype=torch.float32),
+                    discount=torch.ones(1),
+                    observation=torch.full((1, 4), float(value)),
+                    prev_action=torch.zeros(1, 2),
+                    env_id=torch.tensor([0], dtype=torch.int64)),
+                env_ids=torch.tensor([0]))
+        alg._replay_buffer = replay_buffer
+        return replay_buffer
+
+    def _assert_replay_values(self, replay_buffer, values):
+        experience, _ = replay_buffer.gather_all()
+        expected = torch.tensor(values, dtype=torch.float32).unsqueeze(0)
+        self.assertTensorEqual(experience.reward, expected)
+        self.assertTensorEqual(experience.observation[..., 0], expected)
+
     def _make_train_time_step(self, observation=None):
         if observation is None:
             observation = torch.randn(4, 4)
@@ -227,6 +302,63 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
                                     "rollout_skip_sync_mode"):
             self._make_alg(rollout_skip_sync_mode="invalid")
 
+    def test_metric_gate_configuration_validation(self):
+        with self.assertRaisesRegex(
+                ValueError,
+                "enable_grad_actor_extend_gate=True is currently unsupported"):
+            self._make_alg(enable_grad_actor_extend_gate=True)
+        with self.assertRaisesRegex(
+                ValueError,
+                "requires monitor_trust_metrics=True"):
+            self._make_alg(
+                enable_eval_rollout_skip_gate=True,
+                monitor_trust_metrics=False)
+        alg = self._make_alg(monitor_trust_metrics=False)
+        self.assertFalse(alg._monitor_trust_metrics)
+
+    def test_rollout_cadence_derives_from_update_schedule(self):
+        legacy = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=3)
+        current = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=11)
+        explicit = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=11,
+            rollout_cycles_per_collect=2)
+        standard = self._make_alg(num_updates_per_train_iter=12)
+        self.assertEqual(legacy._rollout_cycles_per_collect, 3)
+        self.assertEqual(current._rollout_cycles_per_collect, 1)
+        self.assertEqual(explicit._rollout_cycles_per_collect, 2)
+        self.assertEqual(standard._rollout_cycles_per_collect, 1)
+        with self.assertRaisesRegex(AssertionError, "rollout_cycles_per_collect"):
+            self._make_alg(rollout_cycles_per_collect=0)
+        with self.assertRaisesRegex(TypeError, "reference_actor_sync_interval"):
+            self._make_alg(reference_actor_sync_interval=1)
+
+    def test_current_utd_schedule_reaches_rollout_each_iteration(self):
+        alg = self._make_alg(
+            num_updates_per_train_iter=12,
+            actor_utd=1,
+            critic_utd=11)
+        alg._training_started = True
+        for _ in range(3):
+            for _ in range(12):
+                if alg._train_mode == TrainMode.critic:
+                    alg._critic_update_counter += 1
+                else:
+                    alg._actor_update_counter += 1
+                alg._update_train_mode()
+            self.assertEqual(
+                alg._completed_cycles_since_rollout, 1)
+            self.assertFalse(
+                alg._local_rollout_skip_proposal()["should_skip"])
+            alg._after_unroll_iter_off_policy(True)
+            self.assertEqual(alg._completed_cycles_since_rollout, 0)
 
     def test_async_and_disabled_gate_do_not_enable_distributed_control(self):
         async_alg = self._make_alg(
@@ -249,6 +381,139 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
             async_alg._synchronize_trainer_control(False, False, False)
             disabled_alg._synchronize_trainer_control(False, False, False)
         all_reduce.assert_not_called()
+
+    def test_aggregate_collective_requires_sync_gate_and_debug(self):
+        algorithms = (
+            self._make_alg(
+                enable_eval_rollout_skip_gate=True,
+                rollout_skip_sync_mode="async",
+                debug_summaries=True),
+            self._make_alg(
+                enable_eval_rollout_skip_gate=False,
+                rollout_skip_sync_mode="min",
+                debug_summaries=True),
+            self._make_alg(
+                enable_eval_rollout_skip_gate=True,
+                rollout_skip_sync_mode="min",
+                debug_summaries=False),
+        )
+        with mock.patch.object(
+                torch.distributed, "is_available", return_value=True
+        ), mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+        ), mock.patch.object(
+                torch.distributed, "get_world_size", return_value=4
+        ), mock.patch.object(torch.distributed, "all_gather") as gather_mock:
+            for alg in algorithms:
+                alg._last_eval_trust = torch.tensor(0.5)
+                alg._refresh_eval_trust_aggregates()
+        gather_mock.assert_not_called()
+
+    def test_async_ddp_records_only_local_eval_trust_tag(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            rollout_skip_sync_mode="async",
+            debug_summaries=True)
+        alg._last_eval_trust = torch.tensor(0.5)
+        alg._last_update_had_actor_step = False
+        with mock.patch.object(
+                torch.distributed, "is_available", return_value=True
+        ), mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+        ), mock.patch.object(
+                torch.distributed, "get_world_size", return_value=4
+        ), mock.patch.object(
+                alf.summary, "should_record_summaries", return_value=True
+        ), mock.patch.object(alf.summary, "scalar") as scalar_mock:
+            alg.after_update(self._make_train_time_step(), BafcInfo())
+
+        names = {
+            call.args[0]
+            for call in scalar_mock.call_args_list
+        }
+        self.assertIn("eval_trust_metric", names)
+        self.assertFalse(
+            any(name.startswith("eval_trust_metric/") for name in names))
+
+    def test_single_process_eval_trust_aggregates_equal_local_metric(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            rollout_skip_sync_mode="min",
+            debug_summaries=True)
+        alg._last_eval_trust = torch.tensor(0.75)
+
+        alg._refresh_eval_trust_aggregates()
+
+        for name in (
+                "_last_eval_trust_rank_min", "_last_eval_trust_rank_avg",
+                "_last_eval_trust_rank_max", "_last_eval_trust_effective"):
+            self.assertEqual(float(getattr(alg, name)), 0.75)
+
+    def test_nonfinite_eval_trust_propagates_to_aggregate_telemetry(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            rollout_skip_sync_mode="avg",
+            debug_summaries=True)
+        alg._last_eval_trust = torch.tensor(float("nan"))
+        with mock.patch.object(
+                alg,
+                "_distributed_rollout_skip_sync_enabled",
+                return_value=True), mock.patch.object(
+                    alg,
+                    "_all_gather_control",
+                    return_value=torch.tensor([float("nan"), 1.0])):
+            alg._refresh_eval_trust_aggregates()
+
+        for name in (
+                "_last_eval_trust_rank_min", "_last_eval_trust_rank_avg",
+                "_last_eval_trust_rank_max", "_last_eval_trust_effective"):
+            self.assertTrue(torch.isnan(getattr(alg, name)).item())
+
+    def test_eval_trust_aggregate_refresh_follows_metric_cadence(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True,
+            trust_metric_update_interval=2,
+            debug_summaries=True)
+        inputs = self._make_train_time_step()
+        info = BafcInfo(action=torch.randn(inputs.observation.shape[0], 2))
+        alg._last_update_had_actor_step = True
+        with mock.patch.object(
+                alf.summary, "should_record_summaries", return_value=False
+        ), mock.patch.object(
+                alg,
+                "_compute_eval_trust_metric",
+                return_value=torch.tensor(2.5)) as metric_mock, mock.patch.object(
+                    alg,
+                    "_refresh_eval_trust_aggregates",
+                    wraps=alg._refresh_eval_trust_aggregates) as refresh_mock:
+            for _ in range(3):
+                alg.after_update(inputs, info)
+
+        self.assertEqual(metric_mock.call_count, 2)
+        self.assertEqual(refresh_mock.call_count, 2)
+
+    def test_eval_trust_aggregate_tensorboard_tags_use_cached_values(self):
+        alg = self._make_alg(
+            enable_eval_rollout_skip_gate=True, debug_summaries=True)
+        alg._last_eval_trust = torch.tensor(0.25)
+        alg._last_eval_trust_rank_min = torch.tensor(0.1)
+        alg._last_eval_trust_rank_avg = torch.tensor(0.2)
+        alg._last_eval_trust_rank_max = torch.tensor(0.3)
+        alg._last_eval_trust_effective = torch.tensor(0.3)
+        alg._last_update_had_actor_step = False
+
+        with mock.patch.object(
+                alf.summary, "should_record_summaries", return_value=True
+        ), mock.patch.object(alf.summary, "scalar") as scalar_mock:
+            alg.after_update(self._make_train_time_step(), BafcInfo())
+
+        values = {call.args[0]: call.args[1]
+                  for call in scalar_mock.call_args_list}
+        self.assertEqual(values["eval_trust_metric"], 0.25)
+        self.assertAlmostEqual(values["eval_trust_metric/rank_min"], 0.1)
+        self.assertAlmostEqual(values["eval_trust_metric/rank_avg"], 0.2)
+        self.assertAlmostEqual(values["eval_trust_metric/rank_max"], 0.3)
+        self.assertAlmostEqual(values["eval_trust_metric/effective"], 0.3)
 
     def test_sync_collective_runs_during_warmup(self):
         alg = self._make_alg(enable_eval_rollout_skip_gate=True)
@@ -294,13 +559,18 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
 
     def test_distributed_rollout_skip_modes_and_trainer_control(self):
         cases = (
-            ("min", (0.5, 2.0), False),
-            ("avg", (0.5, 1.5), True),
-            ("max", (0.5, 2.0), True),
+            ("min", (0.5, 2.0), False, (0.5, 1.25, 2.0, 2.0)),
+            ("avg", (0.5, 1.5), True, (0.5, 1.0, 1.5, 1.0)),
+            ("max", (0.5, 2.0), True, (0.5, 1.25, 2.0, 0.5)),
         )
-        for mode, values, expected_skip in cases:
+        aggregate_names = ("rank_min", "rank_avg", "rank_max", "effective")
+        for mode, values, expected_skip, expected_aggregates in cases:
             with self.subTest(mode=mode):
                 results = self._run_distributed_rollout_skip(mode, values)
+                for name, expected in zip(aggregate_names,
+                                          expected_aggregates):
+                    self.assertEqual([result[name] for result in results],
+                                     [expected] * len(values))
                 self.assertEqual(
                     [result["should_skip"] for result in results],
                     [expected_skip] * len(values))
@@ -314,6 +584,14 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
     def test_distributed_min_with_four_ranks(self):
         results = self._run_distributed_rollout_skip(
             "min", (0.25, 0.5, 0.75, 1.0))
+        self.assertEqual([result["rank_min"] for result in results],
+                         [0.25] * 4)
+        self.assertEqual([result["rank_avg"] for result in results],
+                         [0.625] * 4)
+        self.assertEqual([result["rank_max"] for result in results],
+                         [1.] * 4)
+        self.assertEqual([result["effective"] for result in results],
+                         [1.] * 4)
         self.assertEqual([result["should_skip"] for result in results],
                          [True] * 4)
         self.assertEqual([result["skip_count"] for result in results],
@@ -345,7 +623,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self.assertFalse(synchronized["should_skip"])
 
     def test_grad_trust_uses_worst_rank_for_phase_transition(self):
-        alg = self._make_alg(
+        alg = self._make_internal_grad_gate_alg(
             actor_utd=1,
             critic_utd=2,
             enable_eval_rollout_skip_gate=True,
@@ -371,6 +649,10 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
     def test_rank_local_checkpoint_state_round_trip(self):
         alg = self._make_alg()
         alg._last_eval_trust = torch.tensor(0.25)
+        alg._last_eval_trust_rank_min = torch.tensor(0.1)
+        alg._last_eval_trust_rank_avg = torch.tensor(0.2)
+        alg._last_eval_trust_rank_max = torch.tensor(0.3)
+        alg._last_eval_trust_effective = torch.tensor(0.3)
         alg._last_grad_trust = torch.tensor(0.5)
         alg._rollout_actor_id = 2
         alg._target_metric_observation_cache = torch.arange(4.)
@@ -379,6 +661,10 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         state = alg._rank_local_checkpoint_state()
 
         alg._last_eval_trust = torch.tensor(9.)
+        alg._last_eval_trust_rank_min = torch.tensor(9.)
+        alg._last_eval_trust_rank_avg = torch.tensor(9.)
+        alg._last_eval_trust_rank_max = torch.tensor(9.)
+        alg._last_eval_trust_effective = torch.tensor(9.)
         alg._last_grad_trust = torch.tensor(9.)
         alg._rollout_actor_id = 0
         alg._target_metric_observation_cache = ()
@@ -387,6 +673,14 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         alg._load_rank_local_checkpoint_state(state)
 
         self.assertTensorClose(alg._last_eval_trust, torch.tensor(0.25))
+        self.assertTensorClose(alg._last_eval_trust_rank_min,
+                               torch.tensor(0.1))
+        self.assertTensorClose(alg._last_eval_trust_rank_avg,
+                               torch.tensor(0.2))
+        self.assertTensorClose(alg._last_eval_trust_rank_max,
+                               torch.tensor(0.3))
+        self.assertTensorClose(alg._last_eval_trust_effective,
+                               torch.tensor(0.3))
         self.assertTensorClose(alg._last_grad_trust, torch.tensor(0.5))
         self.assertEqual(alg._rollout_actor_id, 2)
         self.assertTensorClose(alg._target_metric_observation_cache,
@@ -395,6 +689,19 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
                                torch.tensor([1., 0., 1.]))
         self.assertEqual(alg._pending_rollout_skip_event,
                          dict(type="skip_start"))
+
+        legacy_state = state.copy()
+        for name in (
+                "last_eval_trust_rank_min", "last_eval_trust_rank_avg",
+                "last_eval_trust_rank_max", "last_eval_trust_effective"):
+            del legacy_state[name]
+        legacy_alg = self._make_alg()
+        legacy_alg._load_rank_local_checkpoint_state(legacy_state)
+        for name in (
+                "_last_eval_trust_rank_min", "_last_eval_trust_rank_avg",
+                "_last_eval_trust_rank_max", "_last_eval_trust_effective"):
+            self.assertTensorClose(
+                getattr(legacy_alg, name), torch.tensor(0.25))
 
     def test_initialization_smoke_and_config_name(self):
         alg = self._make_alg()
@@ -1074,7 +1381,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self.assertTensorClose(alg._last_eval_trust, torch.tensor(3.5))
 
     def test_eval_metric_uses_post_transition_reference_after_grad_violation(self):
-        alg = self._make_alg(
+        alg = self._make_internal_grad_gate_alg(
             actor_utd=1,
             critic_utd=2,
             enable_eval_rollout_skip_gate=True,
@@ -1152,12 +1459,17 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         alg._actor_update_counter = 1
         alg._last_update_had_actor_step = True
 
-        alg.after_update(self._make_train_time_step(), BafcInfo())
+        with mock.patch.object(
+                alg,
+                "_sync_reference_from_current",
+                wraps=alg._sync_reference_from_current) as sync_mock:
+            alg.after_update(self._make_train_time_step(), BafcInfo())
+        sync_mock.assert_called_once()
 
         self._assert_state_dict_equal(alg._reference_actor_networks,
                                       self._clone_state_dict(alg._actor_networks))
 
-    def test_reference_syncs_without_actor_update_when_grad_gate_disabled(self):
+    def test_reference_does_not_sync_without_actor_update(self):
         alg = self._make_alg(
             actor_utd=1,
             critic_utd=2,
@@ -1165,18 +1477,21 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
             enable_grad_actor_extend_gate=False,
             monitor_trust_metrics=True)
         self._fill_module(alg._reference_actor_networks, 0.0)
+        reference_before = self._clone_state_dict(alg._reference_actor_networks)
         self._fill_module(alg._actor_networks, 1.0)
         alg._train_mode = TrainMode.critic
         alg._critic_update_counter = 1
         alg._last_update_had_actor_step = False
 
-        alg.after_update(self._make_train_time_step(), BafcInfo())
+        with mock.patch.object(alg, "_sync_reference_from_current") as sync_mock:
+            alg.after_update(self._make_train_time_step(), BafcInfo())
+        sync_mock.assert_not_called()
 
         self._assert_state_dict_equal(alg._reference_actor_networks,
-                                      self._clone_state_dict(alg._actor_networks))
+                                      reference_before)
 
     def test_reference_syncs_when_grad_gated_actor_epoch_starts(self):
-        alg = self._make_alg(
+        alg = self._make_internal_grad_gate_alg(
             actor_utd=1,
             critic_utd=2,
             enable_grad_actor_extend_gate=True,
@@ -1194,7 +1509,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
                                       self._clone_state_dict(alg._actor_networks))
 
     def test_reference_stays_fixed_during_safe_grad_gate_extension(self):
-        alg = self._make_alg(
+        alg = self._make_internal_grad_gate_alg(
             actor_utd=1,
             critic_utd=2,
             enable_grad_actor_extend_gate=True,
@@ -1213,7 +1528,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self._assert_state_dict_equal(alg._reference_actor_networks, ref_before)
 
     def test_reference_syncs_when_grad_trust_violates_threshold(self):
-        alg = self._make_alg(
+        alg = self._make_internal_grad_gate_alg(
             actor_utd=1,
             critic_utd=2,
             enable_grad_actor_extend_gate=True,
@@ -1233,7 +1548,7 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
                                       self._clone_state_dict(alg._actor_networks))
 
     def test_reference_syncs_when_grad_extension_cap_breaks_epoch(self):
-        alg = self._make_alg(
+        alg = self._make_internal_grad_gate_alg(
             actor_utd=1,
             critic_utd=2,
             enable_grad_actor_extend_gate=True,
@@ -1305,8 +1620,11 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         alg._actor_update_counter = 5
         alg._critic_update_counter = 7
         alg._completed_cycles_since_rollout = 3
-        alg._real_rollouts_since_reference_sync = 4
         alg._last_eval_trust = torch.tensor(0.25)
+        alg._last_eval_trust_rank_min = torch.tensor(0.1)
+        alg._last_eval_trust_rank_avg = torch.tensor(0.2)
+        alg._last_eval_trust_rank_max = torch.tensor(0.3)
+        alg._last_eval_trust_effective = torch.tensor(0.3)
         alg._last_grad_trust = torch.tensor(0.5)
         alg._trust_metric_update_counter = 6
         alg._eval_gate_consecutive_rollout_skips = 2
@@ -1321,6 +1639,17 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         state = alg.state_dict()
         self.assertIn("_bafc_runtime.training_started", state)
         self.assertIn("_bafc_runtime.target_metric_observation_cache", state)
+        aggregate_names = (
+            "last_eval_trust_rank_min", "last_eval_trust_rank_avg",
+            "last_eval_trust_rank_max", "last_eval_trust_effective")
+        for name in aggregate_names:
+            self.assertIn("_bafc_runtime." + name, state)
+        legacy_aggregate_state = state.copy()
+        for name in aggregate_names:
+            del legacy_aggregate_state["_bafc_runtime." + name]
+        legacy_reference_sync_key = "_bafc_runtime.real_rollouts_since_reference_sync"
+        self.assertNotIn(legacy_reference_sync_key, state)
+        state[legacy_reference_sync_key] = torch.tensor(4)
 
         restored = self._make_alg()
         restored.load_state_dict(state)
@@ -1331,8 +1660,17 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
         self.assertEqual(restored._actor_update_counter, 5)
         self.assertEqual(restored._critic_update_counter, 7)
         self.assertEqual(restored._completed_cycles_since_rollout, 3)
-        self.assertEqual(restored._real_rollouts_since_reference_sync, 4)
+        self.assertFalse(
+            hasattr(restored, "_real_rollouts_since_reference_sync"))
         self.assertTensorClose(restored._last_eval_trust, torch.tensor(0.25))
+        self.assertTensorClose(restored._last_eval_trust_rank_min,
+                               torch.tensor(0.1))
+        self.assertTensorClose(restored._last_eval_trust_rank_avg,
+                               torch.tensor(0.2))
+        self.assertTensorClose(restored._last_eval_trust_rank_max,
+                               torch.tensor(0.3))
+        self.assertTensorClose(restored._last_eval_trust_effective,
+                               torch.tensor(0.3))
         self.assertTensorClose(restored._last_grad_trust, torch.tensor(0.5))
         self.assertEqual(restored._trust_metric_update_counter, 6)
         self.assertEqual(restored._eval_gate_consecutive_rollout_skips, 2)
@@ -1347,10 +1685,101 @@ class BafcAlgorithmV3TR2Test(alf.test.TestCase):
                             for p in restored._actor_networks.parameters()))
         self.assertTrue(restored._actor_eval_samples.requires_grad)
 
+        legacy_aggregate_restored = self._make_alg()
+        legacy_aggregate_restored.load_state_dict(legacy_aggregate_state)
+        for name in aggregate_names:
+            self.assertTensorClose(
+                getattr(legacy_aggregate_restored, "_" + name),
+                torch.tensor(0.25))
+
         legacy_restored = self._make_alg()
         legacy_restored.load_state_dict(self._without_runtime_state(state))
         self.assertTrue(legacy_restored._training_started)
 
+    def test_replay_checkpoint_is_save_context_only_and_ranked(self):
+        alg = self._make_alg(checkpoint_replay_buffer=True)
+        self._attach_replay_buffer(alg, num_items=1)
+        self.assertFalse(
+            any("_replay_buffer." in key for key in alg.state_dict().keys()))
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            checkpointer = Checkpointer(ckpt_dir, algorithm=alg)
+            checkpointer.save(10, ddp_rank=0)
+            rank0_state = torch.load(
+                f"{ckpt_dir}/ckpt-10-replay_buffer-rank0",
+                weights_only=False)["algorithm"]
+            legacy_state = torch.load(
+                f"{ckpt_dir}/ckpt-10-replay_buffer",
+                weights_only=False)["algorithm"]
+            self.assertTrue(
+                any("_replay_buffer." in key for key in rank0_state))
+            self.assertTrue(
+                any("_replay_buffer." in key for key in legacy_state))
+
+            self._attach_replay_buffer(alg, num_items=3)
+            checkpointer.save(10, ddp_rank=1)
+
+            restored = self._make_alg(checkpoint_replay_buffer=True)
+            self._attach_replay_buffer(restored)
+            Checkpointer(ckpt_dir, algorithm=restored).load(
+                10, ddp_rank=1)
+            self.assertTensorEqual(restored._replay_buffer._current_pos,
+                                   torch.tensor([3]))
+            self._assert_replay_values(restored._replay_buffer, [0, 1, 2])
+
+        self.assertFalse(
+            any("_replay_buffer." in key for key in alg.state_dict().keys()))
+
+    def test_agent_replay_checkpoint_is_save_context_only_and_ranked(self):
+        agent = self._make_agent(checkpoint_replay_buffer=True)
+        self._attach_replay_buffer(agent, num_items=1)
+        self.assertFalse(
+            any("_replay_buffer." in key for key in agent.state_dict().keys()))
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            checkpointer = Checkpointer(ckpt_dir, algorithm=agent)
+            checkpointer.save(10, ddp_rank=0)
+            rank0_state = torch.load(
+                f"{ckpt_dir}/ckpt-10-replay_buffer-rank0",
+                weights_only=False)["algorithm"]
+            self.assertTrue(
+                any(key.startswith("_replay_buffer.")
+                    for key in rank0_state))
+            self.assertFalse(
+                any(key.startswith("_rl_algorithm._replay_buffer.")
+                    for key in rank0_state))
+
+            self._attach_replay_buffer(agent, num_items=3)
+            checkpointer.save(10, ddp_rank=1)
+
+            restored = self._make_agent(checkpoint_replay_buffer=True)
+            self._attach_replay_buffer(restored)
+            Checkpointer(ckpt_dir, algorithm=restored).load(
+                10, ddp_rank=1)
+            self.assertTensorEqual(restored._replay_buffer._current_pos,
+                                   torch.tensor([3]))
+            self._assert_replay_values(restored._replay_buffer, [0, 1, 2])
+
+        self.assertFalse(
+            any("_replay_buffer." in key for key in agent.state_dict().keys()))
+
+    def test_legacy_empty_replay_sidecar_loads(self):
+        source = self._make_alg(checkpoint_replay_buffer=False)
+        self._attach_replay_buffer(source, num_items=2)
+
+        with tempfile.TemporaryDirectory() as ckpt_dir:
+            Checkpointer(ckpt_dir, algorithm=source).save(10, ddp_rank=0)
+            replay_state = torch.load(
+                f"{ckpt_dir}/ckpt-10-replay_buffer-rank0",
+                weights_only=False)["algorithm"]
+            self.assertFalse(replay_state)
+
+            restored = self._make_alg(checkpoint_replay_buffer=True)
+            self._attach_replay_buffer(restored)
+            Checkpointer(ckpt_dir, algorithm=restored).load(
+                10, ddp_rank=0)
+            self.assertTensorEqual(restored._replay_buffer._current_pos,
+                                   torch.tensor([0]))
 
 
 if __name__ == "__main__":

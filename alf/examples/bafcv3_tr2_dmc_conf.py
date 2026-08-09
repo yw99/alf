@@ -54,8 +54,7 @@ eval_trust_max_decay = False
 delta_trust_max = 2.0
 eval_gate_max_consecutive_rollout_skips = 5
 grad_gate_max_consecutive_actor_extensions = 5
-rollout_cycles_per_collect = 3
-# Rollout cadence (cycle-based) should not change replay update budget.
+# Rollout cadence is derived from this budget and the actor/critic UTD values.
 num_updates_per_train_iter = 12
 
 if debug_mode:
@@ -122,15 +121,17 @@ alf.config(
     trust_metric_num_obs=trust_metric_num_obs,
     trust_metric_num_feature_coords=trust_metric_num_feature_coords,
     monitor_trust_metrics=monitor_trust_metrics,
+    checkpoint_replay_buffer=True,
     eval_trust_max=eval_trust_max,
     delta_trust_max=delta_trust_max,
     trust_metric_update_interval=1,
     enable_eval_rollout_skip_gate=False,
     enable_eval_trust_max_decay=eval_trust_max_decay,
-    enable_grad_actor_extend_gate=True,
+    # Unsupported until gradient-controlled phase changes are made DDP-safe;
+    # the algorithm fails fast if this is enabled.
+    enable_grad_actor_extend_gate=False,
     eval_gate_max_consecutive_rollout_skips=eval_gate_max_consecutive_rollout_skips,
     grad_gate_max_consecutive_actor_extensions=grad_gate_max_consecutive_actor_extensions,
-    rollout_cycles_per_collect=rollout_cycles_per_collect,
     actor_utd=1,
     critic_utd=3,
     # actor_encoder_optimizer=Adam(lr=4e-5),

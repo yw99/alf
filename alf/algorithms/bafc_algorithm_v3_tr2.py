@@ -37,7 +37,7 @@ from alf.nest import nest
 import alf.nest.utils as nest_utils
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import TensorSpec, BoundedTensorSpec
-from alf.utils import losses, common, dist_utils, math_ops
+from alf.utils import checkpoint_utils, common, dist_utils, losses, math_ops
 from alf.utils.normalizers import ScalarAdaptiveNormalizer
 from alf.utils.schedulers import Scheduler, get_progress
 from alf.utils.summary_utils import safe_mean_hist_summary
@@ -120,6 +120,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                  trust_metric_target_obs_cache_size: Optional[int] = None,
                  trust_metric_num_feature_coords: int = 64,
                  trust_metric_update_interval: int = 1,
+                 checkpoint_replay_buffer: bool = False,
                  eval_trust_max: float = 2.0,
                  delta_trust_max: float = 2.0,
                  monitor_trust_metrics: bool = True,
@@ -136,8 +137,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                  grad_gate_max_consecutive_actor_extensions: Optional[int] = None,
                  actor_utd: Optional[int] = None,
                  critic_utd: Optional[int] = None,
-                 rollout_cycles_per_collect: int = 3,
-                 reference_actor_sync_interval: Optional[int] = None,
+                 rollout_cycles_per_collect: Optional[int] = None,
                  env=None,
                  config: TrainerConfig = None,
                  critic_loss_ctor=None,
@@ -181,6 +181,10 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
                 every step of an episode. ``step`` means resampled bootstrap_mask for
                 every step of an episode.
+            checkpoint_replay_buffer (bool): whether checkpoint saves should
+                include the replay buffer.
+            trust_metric_update_interval (int): number of actor updates between
+                trust-metric refreshes. The first actor update is refreshed.
             enable_eval_rollout_skip_gate (bool): whether to skip rollout
                 collection when eval trust is below threshold. When False,
                 eval trust is not computed (to save compute).
@@ -189,19 +193,22 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                 skips only when all ranks agree, ``avg`` applies the gate to
                 the mean eval-trust metric, and ``max`` skips when any rank
                 agrees. Synchronization is inactive when eval rollout skipping
-                is disabled or distributed training is not initialized.
+                is disabled or distributed training is not initialized. In
+                DDP, ``async`` can let rank-local environment progress diverge,
+                including the timing of barrier-bearing checkpoints.
             enable_eval_trust_max_decay (bool): whether to linearly decay
                 eval_trust_max according to local environment-step progress.
+            enable_grad_actor_extend_gate (bool): unsupported. Gradient-based
+                actor extension can desynchronize DDP actor/critic phases and
+                checkpoint barriers. Enabling it raises ``ValueError`` until
+                distributed control for this feature is redesigned.
             freeze_eval_samples (bool): If True, keep actor eval samples fixed
                 throughout training instead of optimizing them.
-            rollout_cycles_per_collect (int): number of completed
+            rollout_cycles_per_collect (None|int): number of completed
                 critic-actor cycles to train on replay data after each unroll.
                 A cycle is counted when train mode switches from ``actor`` back
-                to ``critic``.
-            reference_actor_sync_interval (None|int): accepted for compatibility.
-                In TR2 the reference actor is synced at Algorithm-3 actor-epoch
-                boundaries when grad trust is enabled, and after every actor
-                update when grad trust is disabled.
+                to ``critic``. When ``None``, it is derived from the configured
+                update budget and actor/critic UTD values.
         """
         assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'output'], (
             r"{actor_eval_type} in not supported.")
@@ -230,6 +237,18 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             "trust_metric_num_feature_coords must be >= 1")
         assert trust_metric_update_interval >= 1, (
             "trust_metric_update_interval must be >= 1")
+        if enable_grad_actor_extend_gate:
+            raise ValueError(
+                "enable_grad_actor_extend_gate=True is currently unsupported: "
+                "gradient-controlled actor extension can desynchronize DDP "
+                "actor/critic phases and checkpoint barriers. This feature "
+                "must remain disabled until its distributed control is "
+                "redesigned.")
+        if enable_eval_rollout_skip_gate and not monitor_trust_metrics:
+            raise ValueError(
+                "enable_eval_rollout_skip_gate=True requires "
+                "monitor_trust_metrics=True so rollout decisions do not use "
+                "stale or default trust metrics.")
         assert eval_gate_max_consecutive_rollout_skips >= 1, (
             "eval_gate_max_consecutive_rollout_skips must be >= 1")
         assert rollout_skip_sync_mode in ("async", "min", "avg", "max"), (
@@ -250,23 +269,13 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         if grad_gate_max_consecutive_actor_extensions is not None:
             assert grad_gate_max_consecutive_actor_extensions >= 1, (
                 "grad_gate_max_consecutive_actor_extensions must be >= 1 when set")
-        assert rollout_cycles_per_collect >= 1, (
-            "rollout_cycles_per_collect must be >= 1")
-        if reference_actor_sync_interval is None:
-            reference_actor_sync_interval = 1
-            if config is not None:
-                unroll_length = config.unroll_length
-                if unroll_length == 0:
-                    unroll_length = config.max_unroll_length
-                unroll_length = max(1, unroll_length)
-                reference_actor_sync_interval = max(
-                    1,
-                    int(np.ceil(config.replay_buffer_length /
-                                (2 * unroll_length))))
-        assert reference_actor_sync_interval >= 1, (
-            "reference_actor_sync_interval must be >= 1")
+        if rollout_cycles_per_collect is not None:
+            assert rollout_cycles_per_collect >= 1, (
+                "rollout_cycles_per_collect must be >= 1")
         if actor_utd is None and critic_utd is None:
             self._train_mode = TrainMode.standard
+            if rollout_cycles_per_collect is None:
+                rollout_cycles_per_collect = 1
         else:
             total_utd = config.num_updates_per_train_iter
             if actor_utd is None:
@@ -285,6 +294,9 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             self._train_mode = TrainMode.critic
             self._actor_utd = actor_utd
             self._critic_utd = critic_utd
+            if rollout_cycles_per_collect is None:
+                rollout_cycles_per_collect = max(
+                    1, total_utd // (actor_utd + critic_utd))
 
         self._num_actor_critic = num_actor_critic
         self._actor_critic_pairing = actor_critic_pairing
@@ -301,6 +313,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             trust_metric_target_obs_cache_size)
         self._trust_metric_num_feature_coords = trust_metric_num_feature_coords
         self._trust_metric_update_interval = trust_metric_update_interval
+        self._checkpoint_replay_buffer = checkpoint_replay_buffer
         self._eval_trust_max = eval_trust_max
         self._delta_trust_max = delta_trust_max
         self._monitor_trust_metrics = monitor_trust_metrics
@@ -321,8 +334,6 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._grad_gate_max_consecutive_actor_extensions = (
             grad_gate_max_consecutive_actor_extensions)
         self._rollout_cycles_per_collect = rollout_cycles_per_collect
-        self._reference_actor_sync_interval = reference_actor_sync_interval
-        self._real_rollouts_since_reference_sync = 0
         self._bootstrap_mask = ()
         actor_networks = actor_network_cls(
             input_tensor_spec=observation_spec,
@@ -438,6 +449,10 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._training_started = False
         self._do_critic_summary = False
         self._last_eval_trust = torch.tensor(1.0)
+        self._last_eval_trust_rank_min = self._last_eval_trust.clone()
+        self._last_eval_trust_rank_avg = self._last_eval_trust.clone()
+        self._last_eval_trust_rank_max = self._last_eval_trust.clone()
+        self._last_eval_trust_effective = self._last_eval_trust.clone()
         self._last_grad_trust = torch.tensor(1.0)
         # Trust metrics are observability-only. This counter only schedules
         # when we refresh the cached logging values.
@@ -505,8 +520,6 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             critic_update_counter=(self._critic_update_counter, torch.int64),
             completed_cycles_since_rollout=(
                 self._completed_cycles_since_rollout, torch.int64),
-            real_rollouts_since_reference_sync=(
-                self._real_rollouts_since_reference_sync, torch.int64),
             trust_metric_update_counter=(
                 self._trust_metric_update_counter, torch.int64),
             eval_gate_consecutive_rollout_skips=(
@@ -527,6 +540,12 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         destination[self._bafc_runtime_key(
             prefix, "last_eval_trust")] = self._bafc_runtime_tensor(
                 self._last_eval_trust)
+        for name in (
+                "last_eval_trust_rank_min", "last_eval_trust_rank_avg",
+                "last_eval_trust_rank_max", "last_eval_trust_effective"):
+            destination[self._bafc_runtime_key(
+                prefix, name)] = self._bafc_runtime_tensor(
+                    getattr(self, "_" + name))
         destination[self._bafc_runtime_key(
             prefix, "last_grad_trust")] = self._bafc_runtime_tensor(
                 self._last_grad_trust)
@@ -558,7 +577,6 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         int_fields = (
             "rollout_actor_id", "actor_update_counter",
             "critic_update_counter", "completed_cycles_since_rollout",
-            "real_rollouts_since_reference_sync",
             "trust_metric_update_counter",
             "eval_gate_consecutive_rollout_skips",
             "rollout_skip_due_eval_gate_count",
@@ -571,6 +589,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         if "last_eval_trust" in runtime_state:
             self._last_eval_trust = self._bafc_runtime_tensor(
                 runtime_state["last_eval_trust"])
+        for name in (
+                "last_eval_trust_rank_min", "last_eval_trust_rank_avg",
+                "last_eval_trust_rank_max", "last_eval_trust_effective"):
+            value = runtime_state.get(name, self._last_eval_trust)
+            setattr(self, "_" + name, self._bafc_runtime_tensor(value))
         if "last_grad_trust" in runtime_state:
             self._last_grad_trust = self._bafc_runtime_tensor(
                 runtime_state["last_grad_trust"])
@@ -582,6 +605,31 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                 runtime_state["target_updater_counter"])
 
         self._apply_train_mode_grad_flags()
+
+    def checkpoint_replay_buffer_enabled(self):
+        return self._checkpoint_replay_buffer
+
+    def _set_replay_buffer_checkpoint_enabled(self, enabled):
+        if not self._checkpoint_replay_buffer or self._replay_buffer is None:
+            return None
+        old_enabled = checkpoint_utils.is_checkpoint_enabled(self._replay_buffer)
+        checkpoint_utils.enable_checkpoint(self._replay_buffer, enabled)
+
+        def _restore():
+            checkpoint_utils.enable_checkpoint(self._replay_buffer, old_enabled)
+
+        return _restore
+
+    def _has_replay_buffer_checkpoint(self, state_dict):
+        return any(key.startswith("_replay_buffer.")
+                   or "._replay_buffer." in key for key in state_dict.keys())
+
+    def _alf_prepare_checkpoint_save(self):
+        return self._set_replay_buffer_checkpoint_enabled(True)
+
+    def _alf_prepare_checkpoint_load(self, state_dict):
+        return self._set_replay_buffer_checkpoint_enabled(
+            self._has_replay_buffer_checkpoint(state_dict))
 
     def _checkpoint_copy(self, value):
         """Copy rank-local runtime state without retaining device storage."""
@@ -608,6 +656,14 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         state = dict(
             version=1,
             last_eval_trust=self._checkpoint_copy(self._last_eval_trust),
+            last_eval_trust_rank_min=self._checkpoint_copy(
+                self._last_eval_trust_rank_min),
+            last_eval_trust_rank_avg=self._checkpoint_copy(
+                self._last_eval_trust_rank_avg),
+            last_eval_trust_rank_max=self._checkpoint_copy(
+                self._last_eval_trust_rank_max),
+            last_eval_trust_effective=self._checkpoint_copy(
+                self._last_eval_trust_effective),
             last_grad_trust=self._checkpoint_copy(self._last_grad_trust),
             rollout_actor_id=self._bafc_scalar_int(self._rollout_actor_id),
             target_metric_observation_cache=self._checkpoint_copy(
@@ -646,6 +702,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                 f"{state.get('version')!r}")
         self._last_eval_trust = self._restore_rank_value(
             state["last_eval_trust"])
+        for name in (
+                "last_eval_trust_rank_min", "last_eval_trust_rank_avg",
+                "last_eval_trust_rank_max", "last_eval_trust_effective"):
+            value = state.get(name, self._last_eval_trust)
+            setattr(self, "_" + name, self._restore_rank_value(value))
         self._last_grad_trust = self._restore_rank_value(
             state["last_grad_trust"])
         self._rollout_actor_id = int(state["rollout_actor_id"])
@@ -2064,6 +2125,61 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         torch.distributed.all_reduce(tensor, op=op)
         return tensor.cpu()
 
+    def _all_gather_control(self, value):
+        """Gather one rank-local scalar on the distributed control device."""
+        tensor = torch.as_tensor(
+            value,
+            dtype=torch.float64,
+            device=self._distributed_control_device()).reshape(1)
+        gathered = [
+            torch.empty_like(tensor)
+            for _ in range(self._distributed_world_size())
+        ]
+        torch.distributed.all_gather(gathered, tensor)
+        return torch.stack(gathered).cpu()
+
+    def _eval_trust_aggregate_logging_enabled(self):
+        if not (self._debug_summaries
+                and self._enable_eval_rollout_skip_gate):
+            return False
+        world_size = self._distributed_world_size()
+        return (world_size == 1
+                or self._distributed_rollout_skip_sync_enabled())
+
+    def _refresh_eval_trust_aggregates(self):
+        """Refresh cached cross-rank eval-trust telemetry.
+
+        This method is called by every rank at metric-refresh cadence. The
+        collective deliberately lives outside summary-writing code because
+        TensorBoard summaries are emitted by rank zero only.
+        """
+        if not self._eval_trust_aggregate_logging_enabled():
+            return
+        local_value = torch.as_tensor(self._last_eval_trust).detach().reshape(
+            ()).to(dtype=torch.float64, device="cpu")
+        rank_values = local_value.unsqueeze(0)
+        if self._distributed_rollout_skip_sync_enabled():
+            rank_values = self._all_gather_control(local_value)
+
+        self._last_eval_trust_rank_min = rank_values.min().clone()
+        self._last_eval_trust_rank_avg = rank_values.mean().clone()
+        self._last_eval_trust_rank_max = rank_values.max().clone()
+        effective_by_mode = dict(
+            min=self._last_eval_trust_rank_max,
+            avg=self._last_eval_trust_rank_avg,
+            max=self._last_eval_trust_rank_min)
+        self._last_eval_trust_effective = effective_by_mode.get(
+            self._rollout_skip_sync_mode,
+            local_value).clone()
+
+    def _record_eval_trust_aggregate_summaries(self):
+        if not self._eval_trust_aggregate_logging_enabled():
+            return
+        for suffix in ("rank_min", "rank_avg", "rank_max", "effective"):
+            self._record_debug_scalar(
+                "eval_trust_metric/" + suffix,
+                getattr(self, "_last_eval_trust_" + suffix))
+
     def _synchronize_trainer_control(self, termination_due,
                                      periodic_checkpoint_due,
                                      checkpoint_requested):
@@ -2214,7 +2330,8 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         return unrolled, root_inputs, rollout_info
 
     def after_update(self, root_inputs, info: BafcInfo):
-        if not self._enable_grad_actor_extend_gate:
+        if (self._last_update_had_actor_step
+                and not self._enable_grad_actor_extend_gate):
             self._sync_reference_from_current()
         should_compute_trust_metrics = self._should_refresh_trust_metrics()
         observation = ()
@@ -2252,11 +2369,12 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                         self._last_eval_trust)
             else:
                 self._last_eval_trust = torch.ones_like(self._last_eval_trust)
-        if not self._enable_grad_actor_extend_gate:
-            self._sync_reference_from_current()
+            if self._enable_eval_rollout_skip_gate:
+                self._refresh_eval_trust_aggregates()
         self._update_target_critic()
         self._sync_snapshot_critic_from_current()
         self._record_debug_scalar('eval_trust_metric', self._last_eval_trust)
+        self._record_eval_trust_aggregate_summaries()
         self._record_debug_scalar('grad_trust_metric', self._last_grad_trust)
         eval_trust_max = self._current_eval_trust_max()
         self._record_debug_scalar('eval_trust_max', eval_trust_max)

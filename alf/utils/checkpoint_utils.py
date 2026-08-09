@@ -15,6 +15,7 @@
 from absl import logging
 import glob
 import json
+import numpy as np
 import os
 import torch
 from torch import nn
@@ -205,7 +206,16 @@ class Checkpointer(object):
         rank_path = f_path + f"-rank-state-rank{ddp_rank}"
         module_states = {}
         if os.path.exists(rank_path):
-            payload = torch.load(rank_path, map_location=map_location)
+            # Rank-local state includes NumPy RNG state. Keep weights-only
+            # loading enabled and allowlist only the NumPy types needed for
+            # that state.
+            numpy_safe_globals = [
+                np.core.multiarray._reconstruct, np.ndarray, np.dtype,
+                type(np.dtype(np.uint32))
+            ]
+            with torch.serialization.safe_globals(numpy_safe_globals):
+                payload = torch.load(
+                    rank_path, map_location=map_location, weights_only=True)
             saved_rank = int(payload["rank"])
             if saved_rank != ddp_rank:
                 raise RuntimeError(
