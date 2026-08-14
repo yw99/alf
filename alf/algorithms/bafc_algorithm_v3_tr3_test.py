@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 import alf
+from alf.algorithms.agent import Agent
 from alf.algorithms.bafc_algorithm_v3_tr2 import BafcAlgorithmV3TR2
 from alf.algorithms.bafc_algorithm_v3_tr3 import (
     BafcAlgorithmV3TR3, BafcAlgorithmV3TR3Agent)
@@ -111,6 +112,9 @@ class BafcAlgorithmV3TR3Test(alf.test.TestCase):
 
     def setUp(self):
         super().setUp()
+        default_device = alf.get_default_device()
+        alf.set_default_device("cpu")
+        self.addCleanup(alf.set_default_device, default_device)
         patcher = mock.patch(
             "alf.algorithms.algorithm.psutil.Process",
             return_value=_DummyProcess())
@@ -150,7 +154,12 @@ class BafcAlgorithmV3TR3Test(alf.test.TestCase):
             num_updates_per_train_iter=2)
         return self._algorithm_ctor(algorithm_cls, config, **kwargs)
 
-    def _make_agent(self, initial_steps=3, use_normalizer=True):
+    def _make_agent(self,
+                    initial_steps=3,
+                    use_normalizer=True,
+                    actor_utd=1,
+                    critic_utd=1,
+                    num_updates_per_train_iter=2):
         env = _TinyContinuousEnv()
         config = TrainerConfig(
             root_dir=tempfile.mkdtemp(prefix="bafc_v3_tr3_agent_test_"),
@@ -163,7 +172,7 @@ class BafcAlgorithmV3TR3Test(alf.test.TestCase):
                                    if use_normalizer else None),
             whole_replay_buffer_training=False,
             clear_replay_buffer=False,
-            num_updates_per_train_iter=2)
+            num_updates_per_train_iter=num_updates_per_train_iter)
         agent = BafcAlgorithmV3TR3Agent(
             observation_spec=env.observation_spec(),
             action_spec=env.action_spec(),
@@ -186,8 +195,8 @@ class BafcAlgorithmV3TR3Test(alf.test.TestCase):
                 trust_metric_num_obs=4,
                 monitor_trust_metrics=False,
                 checkpoint_replay_buffer=True,
-                actor_utd=1,
-                critic_utd=1,
+                actor_utd=actor_utd,
+                critic_utd=critic_utd,
                 rollout_cycles_per_collect=1))
         return agent, env
 
@@ -242,19 +251,159 @@ class BafcAlgorithmV3TR3Test(alf.test.TestCase):
         tr3 = self._make_alg(initial_steps=3)
 
         tr3._alf_prepare_checkpoint_load({})
+        self.assertTrue(tr3._tr3_is_replay_refill_decision_pending())
+        self.assertTrue(tr3._tr3_is_train_info_spec_priming_pending())
         self.assertEqual(
             tr3._tr3_replay_refill_plan(),
             dict(clear_probe_replay=True, checkpoint_size=None))
 
         tr3._alf_prepare_checkpoint_load(
             {"_replay_buffer._current_size": torch.tensor([2])})
+        self.assertTrue(tr3._tr3_is_replay_refill_decision_pending())
         self.assertEqual(
             tr3._tr3_replay_refill_plan(),
             dict(clear_probe_replay=False, checkpoint_size=2))
 
         tr3._alf_prepare_checkpoint_load(
             {"_replay_buffer._current_size": torch.tensor([3])})
+        self.assertTrue(tr3._tr3_is_replay_refill_decision_pending())
         self.assertIsNone(tr3._tr3_replay_refill_plan())
+
+        tr3._tr3_mark_replay_refill_complete()
+        self.assertFalse(tr3._tr3_is_replay_refill_decision_pending())
+        self.assertTrue(tr3._tr3_is_train_info_spec_priming_pending())
+        tr3._tr3_mark_train_info_spec_primed()
+        self.assertFalse(tr3._tr3_is_train_info_spec_priming_pending())
+        tr3._alf_prepare_checkpoint_load({})
+        self.assertTrue(tr3._tr3_is_replay_refill_decision_pending())
+        self.assertTrue(tr3._tr3_is_train_info_spec_priming_pending())
+
+    def test_refill_decision_collective_runs_once_after_restore(self):
+        agent, _ = self._make_agent(initial_steps=3, use_normalizer=False)
+        controller = agent._rl_algorithm
+
+        with mock.patch.object(
+                Agent, "train_iter", return_value=1), mock.patch.object(
+                    controller, "_all_reduce_control") as all_reduce:
+            # Training from scratch, including Trainer's lazy pre-load probe,
+            # must not perform a TR3 refill-decision collective.
+            self.assertEqual(agent.train_iter(), 1)
+            all_reduce.assert_not_called()
+            self.assertFalse(
+                controller._tr3_is_train_info_spec_priming_pending())
+
+            # A sufficient replay checkpoint still arms one common decision
+            # across ranks. Once resolved, later iterations bypass it.
+            controller._alf_prepare_checkpoint_load(
+                {"_replay_buffer._current_size": torch.tensor([3])})
+            all_reduce.return_value = torch.tensor([0.0])
+            with mock.patch.object(
+                    torch.distributed, "is_available", return_value=True), \
+                    mock.patch.object(
+                        torch.distributed, "is_initialized", return_value=True), \
+                    mock.patch.object(
+                        torch.distributed, "get_world_size", return_value=4):
+                self.assertEqual(agent.train_iter(), 1)
+                self.assertEqual(agent.train_iter(), 1)
+
+            all_reduce.assert_called_once_with(
+                [False], op=torch.distributed.ReduceOp.MAX)
+            self.assertFalse(
+                controller._tr3_is_replay_refill_decision_pending())
+
+    def test_resume_primes_spec_across_real_critic_actor_cycle(self):
+        agent, _ = self._make_agent(
+            initial_steps=3,
+            use_normalizer=False,
+            actor_utd=1,
+            critic_utd=11,
+            num_updates_per_train_iter=12)
+        controller = agent._rl_algorithm
+
+        # Mirror Trainer's lazy construction pass before restoring an old
+        # checkpoint without replay.
+        agent.train_iter()
+        self.assertIsNone(agent._train_info_spec)
+        controller._alf_prepare_checkpoint_load({})
+        controller._training_started = True
+        controller._train_mode = TrainMode.critic
+        controller._actor_update_counter = 7
+        controller._critic_update_counter = 77
+        controller._completed_cycles_since_rollout = 1
+        controller._apply_train_mode_grad_flags()
+
+        with mock.patch.object(
+                controller, "train_step", wraps=controller.train_step) as step:
+            trained_steps = agent.train_iter()
+
+        self.assertGreater(trained_steps, 0)
+        # Spec priming reuses the first normal update; it does not add a probe
+        # forward to the configured 12-update critic/actor cycle.
+        self.assertEqual(step.call_count, 12)
+        self.assertEqual(controller._critic_update_counter, 88)
+        self.assertEqual(controller._actor_update_counter, 8)
+        self.assertEqual(controller._train_mode, TrainMode.critic)
+        self.assertEqual(controller._completed_cycles_since_rollout, 1)
+        self.assertFalse(
+            controller._tr3_is_train_info_spec_priming_pending())
+
+        spec = agent.train_info_spec.rl
+        for leaf in (spec.actor.loss,
+                     spec.actor.extra.eval_action_loss,
+                     spec.critic.critic,
+                     spec.critic.target_critic,
+                     spec.critic.eval_trust_metric,
+                     spec.critic.critic_sample_weight):
+            self.assertIsInstance(leaf, TensorSpec)
+
+    def test_resume_spec_priming_handles_actor_and_standard_modes(self):
+        cases = ((TrainMode.actor, 1, 1), (TrainMode.standard, None, None))
+        for mode, actor_utd, critic_utd in cases:
+            with self.subTest(mode=mode):
+                agent, _ = self._make_agent(
+                    initial_steps=3,
+                    use_normalizer=False,
+                    actor_utd=actor_utd,
+                    critic_utd=critic_utd,
+                    num_updates_per_train_iter=2)
+                controller = agent._rl_algorithm
+                agent.train_iter()
+                controller._alf_prepare_checkpoint_load({})
+                controller._training_started = True
+                controller._train_mode = mode
+                controller._actor_update_counter = 5
+                controller._critic_update_counter = 5
+                controller._completed_cycles_since_rollout = 1
+                controller._apply_train_mode_grad_flags()
+
+                with mock.patch.object(
+                        controller,
+                        "train_step",
+                        wraps=controller.train_step) as step:
+                    self.assertGreater(agent.train_iter(), 0)
+
+                self.assertEqual(step.call_count, 2)
+                self.assertFalse(
+                    controller._tr3_is_train_info_spec_priming_pending())
+                spec = agent.train_info_spec.rl
+                self.assertIsInstance(spec.actor.loss, TensorSpec)
+                self.assertIsInstance(spec.critic.critic, TensorSpec)
+
+    def test_train_info_spec_priming_failure_stays_pending(self):
+        agent, _ = self._make_agent(initial_steps=3, use_normalizer=False)
+        controller = agent._rl_algorithm
+        controller._alf_prepare_checkpoint_load({})
+
+        with mock.patch.object(
+                Agent,
+                "train_step",
+                side_effect=RuntimeError("intentional train-step failure")):
+            with self.assertRaisesRegex(RuntimeError, "intentional"):
+                agent.train_step(None, None, None)
+
+        self.assertIsNone(agent._train_info_spec)
+        self.assertTrue(
+            controller._tr3_is_train_info_spec_priming_pending())
 
     def test_refill_is_pretraining_only_and_clears_probe_sample(self):
         agent, env = self._make_agent(initial_steps=3)
@@ -301,6 +450,8 @@ class BafcAlgorithmV3TR3Test(alf.test.TestCase):
         self.assertEqual(len(action_calls), 3)
         self.assertEqual(int(agent._replay_buffer.total_size), 3)
         self.assertIsNone(controller._tr3_replay_refill_plan())
+        self.assertFalse(
+            controller._tr3_is_replay_refill_decision_pending())
         self._assert_tensor_state_equal(model_state, agent)
         for expected, metric in zip(metric_states, agent.get_metrics()):
             actual = metric.state_dict()
@@ -375,6 +526,8 @@ class BafcAlgorithmV3TR3Test(alf.test.TestCase):
         with self.assertRaisesRegex(RuntimeError, "replay capacity"):
             agent._tr3_refill_replay_buffer(
                 agent._rl_algorithm._tr3_replay_refill_plan())
+        self.assertTrue(
+            agent._rl_algorithm._tr3_is_replay_refill_decision_pending())
 
     def test_ddp_refill_plan_includes_full_ranks(self):
         agent, _ = self._make_agent(initial_steps=3, use_normalizer=False)

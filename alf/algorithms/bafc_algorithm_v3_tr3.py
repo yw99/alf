@@ -13,10 +13,9 @@
 # limitations under the License.
 """TR2-compatible BAFC variant for rebuilding missing replay state.
 
-TR3 intentionally keeps TR2's registered module layout unchanged. Its only
-behavioral addition is a transient, pre-training replay refill coordinated by
-``BafcAlgorithmV3TR3Agent`` after a checkpoint has been restored without enough
-replay data.
+TR3 intentionally keeps TR2's registered module layout unchanged. Its
+resume-only additions are a transient pre-training replay refill and structural
+train-info spec priming coordinated by ``BafcAlgorithmV3TR3Agent``.
 """
 
 import time
@@ -27,11 +26,13 @@ import torch
 import alf
 from alf.algorithms.agent import Agent
 from alf.algorithms.bafc_algorithm_v3_tr2 import BafcAlgorithmV3TR2
+from alf.tensor_specs import TensorSpec
+from alf.utils import dist_utils
 
 
 @alf.configurable
 class BafcAlgorithmV3TR3(BafcAlgorithmV3TR2):
-    """A checkpoint-compatible TR2 subclass with transient refill control."""
+    """A checkpoint-compatible TR2 subclass with transient resume control."""
 
     def _root_replay_checkpoint_size(self, state_dict):
         replay_keys = [
@@ -56,12 +57,30 @@ class BafcAlgorithmV3TR3(BafcAlgorithmV3TR2):
     def _alf_prepare_checkpoint_load(self, state_dict):
         replay_size = self._root_replay_checkpoint_size(state_dict)
         initial_collect_steps = int(self._config.initial_collect_steps)
+        # ``Algorithm._train_info_spec`` is lazy and is not checkpointed. A
+        # restored TR2 controller can start in a mode whose train info omits
+        # the inactive actor or critic fields, so TR3 must prime a complete
+        # root-Agent spec before the first resumed replay update is batched.
+        self._tr3_train_info_spec_priming_pending = True
+        # Every rank must participate in exactly one refill decision after a
+        # checkpoint load, even when its own replay is already sufficient.
+        # Keep this transient so TR2 checkpoint keys and shapes stay unchanged.
+        self._tr3_replay_refill_decision_pending = True
         self._tr3_replay_checkpoint_size = replay_size
         self._tr3_clear_probe_replay = replay_size is None
         self._tr3_replay_refill_pending = (
             initial_collect_steps > 0
             and (replay_size is None or replay_size < initial_collect_steps))
         return super()._alf_prepare_checkpoint_load(state_dict)
+
+    def _tr3_is_train_info_spec_priming_pending(self):
+        return getattr(self, "_tr3_train_info_spec_priming_pending", False)
+
+    def _tr3_mark_train_info_spec_primed(self):
+        self._tr3_train_info_spec_priming_pending = False
+
+    def _tr3_is_replay_refill_decision_pending(self):
+        return getattr(self, "_tr3_replay_refill_decision_pending", False)
 
     def _tr3_replay_refill_plan(self):
         """Return transient refill information populated during checkpoint load."""
@@ -87,6 +106,7 @@ class BafcAlgorithmV3TR3(BafcAlgorithmV3TR2):
             self._tr3_replay_refill_snapshot = None
 
     def _tr3_mark_replay_refill_complete(self):
+        self._tr3_replay_refill_decision_pending = False
         self._tr3_replay_refill_pending = False
         self._tr3_clear_probe_replay = False
 
@@ -100,7 +120,52 @@ class BafcAlgorithmV3TR3(BafcAlgorithmV3TR2):
 
 @alf.configurable
 class BafcAlgorithmV3TR3Agent(Agent):
-    """Agent that performs TR3's replay refill before resumed training."""
+    """Agent that prepares replay and train-info state for resumed TR3."""
+
+    @staticmethod
+    def _tr3_tensor_leaf_spec(value):
+        # In a train-info spec, TensorSpec is also the structural leaf marker
+        # used by params_to_distributions(). Its shape is not consulted there.
+        return TensorSpec(()) if value == () else value
+
+    def _tr3_complete_train_info_spec(self, info):
+        """Make TR2's actor/critic mode-dependent leaves structural leaves."""
+        spec = dist_utils.extract_spec(info)
+        rl_spec = spec.rl
+
+        actor_spec = rl_spec.actor
+        actor_extra_spec = actor_spec.extra._replace(
+            eval_action_loss=self._tr3_tensor_leaf_spec(
+                actor_spec.extra.eval_action_loss))
+        actor_spec = actor_spec._replace(
+            loss=self._tr3_tensor_leaf_spec(actor_spec.loss),
+            extra=actor_extra_spec)
+
+        critic_spec = rl_spec.critic
+        critic_spec = critic_spec._replace(
+            critic=self._tr3_tensor_leaf_spec(critic_spec.critic),
+            target_critic=self._tr3_tensor_leaf_spec(
+                critic_spec.target_critic),
+            eval_trust_metric=self._tr3_tensor_leaf_spec(
+                critic_spec.eval_trust_metric),
+            critic_sample_weight=self._tr3_tensor_leaf_spec(
+                critic_spec.critic_sample_weight))
+
+        return spec._replace(
+            rl=rl_spec._replace(actor=actor_spec, critic=critic_spec))
+
+    def train_step(self, time_step, state, rollout_info):
+        policy_step = super().train_step(time_step, state, rollout_info)
+        controller = self._rl_algorithm
+        if controller._tr3_is_train_info_spec_priming_pending():
+            if self._train_info_spec is None:
+                # Set this inside train_step(), before Algorithm's outer
+                # collection path tries to infer a sparse spec from the same
+                # critic-only or actor-only result.
+                self._train_info_spec = self._tr3_complete_train_info_spec(
+                    policy_step.info)
+            controller._tr3_mark_train_info_spec_primed()
+        return policy_step
 
     def observe_for_metrics(self, time_step):
         if getattr(self, "_tr3_replay_refill_active", False):
@@ -213,10 +278,13 @@ class BafcAlgorithmV3TR3Agent(Agent):
         return plan
 
     def train_iter(self):
-        plan = self._rl_algorithm._tr3_replay_refill_plan()
-        plan = self._tr3_synchronize_refill_plan(plan)
-        if plan is not None:
-            self._tr3_refill_replay_buffer(plan)
+        if self._rl_algorithm._tr3_is_replay_refill_decision_pending():
+            plan = self._rl_algorithm._tr3_replay_refill_plan()
+            plan = self._tr3_synchronize_refill_plan(plan)
+            if plan is not None:
+                self._tr3_refill_replay_buffer(plan)
+            else:
+                self._rl_algorithm._tr3_mark_replay_refill_complete()
         # This is the first trainer-visible iteration after refill and follows
         # the ordinary Agent/TR2 path in full.
         return super().train_iter()
