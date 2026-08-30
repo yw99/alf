@@ -1,15 +1,27 @@
 #!/bin/bash
-# Launch hopper:hop RLPD, BAFCv3_TR2, and BAFCv3 on seed 2 using DDP.
-# This is the seed-2 counterpart of
-# run_hopper_hop_rlpd_bafcv3_seed01-4g.sh.
+# Launch a hopper:hop RLPD/BAFCv3/BAFCv3_TR2 comparison.
+# Every job uses all four configured GPUs through DDP. The five jobs run in
+# parallel on unique torch.distributed master ports.
+#
+# Conditions:
+#   1. RLPD on seed 2 (critic_utd=10, matching the seed-0/1 launcher)
+#   2. BAFCv3_TR2 on seeds 2 and 0 (critic_utd=3, eval_trust_max=20)
+#   3. BAFCv3 on seeds 2 and 0 (critic_utd=3)
+# Both BAFC variants use random critic TD targets.
 #
 # Usage: bash run_hopper_hop_bafcv3_seed2-4g.sh [options]
 #   -d, --dir BASE_DIR       Base results directory (default: /workspace/alf_results)
-#   -n, --steps NUM_STEPS    Total environment steps (default: 800000)
+#   -n, --steps NUM_STEPS    Total environment steps per job (default: 800000)
 #       --gpus CSV           Comma-separated GPU ids (default: 0,1,2,3)
 #       --checkpoints N      Number of checkpoints (default: 10)
-#       --base-port PORT     First DDP master port (wrapper default: 29506)
-#       --dry-run            Print all three commands without launching jobs
+#       --base-port PORT     First DDP master port (default: 29506)
+#       --seeds CSV          Seeds for all methods (default: 2,0)
+#       --rlpd-seeds CSV     RLPD seeds only (default: 2)
+#       --bafc-seeds CSV     BAFCv3 and BAFCv3_TR2 seeds only (default: 2,0)
+#       --bafc-critic-utd N  Critic UTD for BAFCv3 and BAFCv3_TR2
+#       --tr2-eval-trust-max VALUE
+#                            TR2 evaluation trust maximum
+#       --dry-run            Print commands without launching jobs
 #   -h, --help               Show this help message
 #
 # Example:
@@ -17,34 +29,50 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${SCRIPT_DIR}/run_hopper_hop_rlpd_bafcv3_seed01-4g.sh" \
-    --seeds 2 --base-port 29506 "$@"
-
+# Use headless EGL rendering for dm_control unless explicitly overridden.
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+# Use deterministic CUBLAS workspace for reproducibility unless explicitly overridden.
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-CONF_FILE="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
+RLPD_CONF="${SCRIPT_DIR}/rlpd_dmc_conf.py"
+BAFCV3_CONF="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
+BAFCV3_TR2_CONF="${SCRIPT_DIR}/bafcv3_tr2_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 ENV_NAME="hopper:hop"
 BASE_DIR="/workspace/alf_results"
 NUM_ENV_STEPS=800000
 NUM_CHECKPOINTS=10
-SEED=2
 GPUS="0,1,2,3"
-MASTER_PORT=29506
+BASE_PORT=29506
 DRY_RUN=False
+SEEDS=(2 0)
+RLPD_SEEDS=(2)
+BAFC_SEEDS=(2 0)
 
-CRITIC_UTD=11
-UPDATES_PER_ITER=12
-NUM_ACTOR_CRITIC=10
-NUM_SAMPLED_CRITICS=8
-NUM_SAMPLED_CRITIC_TARGETS=1
-ACTOR_USE_LN=False
-DEBUG_SUMMARIES=True
+RLPD_CRITIC_UTD=10
+RLPD_UPDATES_PER_ITER=11
+BAFCV3_CRITIC_UTD=3
+BAFCV3_UPDATES_PER_ITER=4
+BAFCV3_NUM_ACTOR_CRITIC=10
+BAFCV3_NUM_SAMPLED_CRITICS=8
+BAFCV3_NUM_SAMPLED_CRITIC_TARGETS=1
+BAFCV3_ACTOR_USE_LN=False
+BAFCV3_DEBUG_SUMMARIES=True
+TR2_EVAL_TRUST_MAX=20.0
+TR2_EVAL_TRUST_MAX_DECAY=True
+TR2_NUM_FEATURE_COORDS=4
+TR2_METRIC_INTERVAL=8
+TR2_ROLLOUT_SKIP_CAP=3
+TR2_ROLLOUT_SKIP_EVAL_INTERVAL=60
+TR2_FREEZE_EVAL_SAMPLES=False
+TR2_ENABLE_CRITIC_REWEIGHTING=False
+TR2_CRITIC_REWEIGHTING_BETA=None
+TR2_CRITIC_REWEIGHTING_RIDGE=None
+TR2_CRITIC_REWEIGHTING_SOLVER_ITERS=1
+TR2_CRITIC_REWEIGHTING_MAX_WEIGHT=10.0
 
 print_help() {
     sed -n '/^# Usage:/,/^# Example:/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
@@ -68,8 +96,31 @@ while [[ $# -gt 0 ]]; do
             NUM_CHECKPOINTS="$2"
             shift 2
             ;;
-        --port)
-            MASTER_PORT="$2"
+        --base-port)
+            BASE_PORT="$2"
+            shift 2
+            ;;
+        --seeds)
+            IFS=',' read -r -a SEEDS <<< "$2"
+            RLPD_SEEDS=("${SEEDS[@]}")
+            BAFC_SEEDS=("${SEEDS[@]}")
+            shift 2
+            ;;
+        --rlpd-seeds)
+            IFS=',' read -r -a RLPD_SEEDS <<< "$2"
+            shift 2
+            ;;
+        --bafc-seeds)
+            IFS=',' read -r -a BAFC_SEEDS <<< "$2"
+            shift 2
+            ;;
+        --bafc-critic-utd)
+            BAFCV3_CRITIC_UTD="$2"
+            BAFCV3_UPDATES_PER_ITER="$((BAFCV3_CRITIC_UTD + 1))"
+            shift 2
+            ;;
+        --tr2-eval-trust-max)
+            TR2_EVAL_TRUST_MAX="$2"
             shift 2
             ;;
         --dry-run)
@@ -93,10 +144,12 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Set PYTHON_BIN to a working interpreter, or create ${REPO_ROOT}/.venv." >&2
     exit 1
 fi
-if [[ ! -f "${CONF_FILE}" ]]; then
-    echo "Config file not found: ${CONF_FILE}" >&2
-    exit 1
-fi
+for config_file in "${RLPD_CONF}" "${BAFCV3_CONF}" "${BAFCV3_TR2_CONF}"; do
+    if [[ ! -f "${config_file}" ]]; then
+        echo "Config file not found: ${config_file}" >&2
+        exit 1
+    fi
+done
 if [[ ! "${NUM_ENV_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--steps must be a positive integer, got: ${NUM_ENV_STEPS}" >&2
     exit 1
@@ -105,68 +158,160 @@ if [[ ! "${NUM_CHECKPOINTS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--checkpoints must be a positive integer, got: ${NUM_CHECKPOINTS}" >&2
     exit 1
 fi
-if [[ ! "${MASTER_PORT}" =~ ^[1-9][0-9]*$ ]] || (( MASTER_PORT > 65535 )); then
-    echo "--port must be a valid port, got: ${MASTER_PORT}" >&2
+if (( ${#RLPD_SEEDS[@]} == 0 && ${#BAFC_SEEDS[@]} == 0 )); then
+    echo "At least one method-specific seed list must contain a seed" >&2
+    exit 1
+fi
+for seed in "${RLPD_SEEDS[@]}" "${BAFC_SEEDS[@]}"; do
+    if [[ ! "${seed}" =~ ^[0-9]+$ ]]; then
+        echo "Seed lists must contain comma-separated nonnegative integers, got: ${RLPD_SEEDS[*]} / ${BAFC_SEEDS[*]}" >&2
+        exit 1
+    fi
+done
+if [[ ! "${RLPD_CRITIC_UTD}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RLPD critic UTD must be a positive integer, got: ${RLPD_CRITIC_UTD}" >&2
+    exit 1
+fi
+if [[ ! "${BAFCV3_CRITIC_UTD}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--bafc-critic-utd must be a positive integer, got: ${BAFCV3_CRITIC_UTD}" >&2
+    exit 1
+fi
+NUM_JOBS=$((${#RLPD_SEEDS[@]} + 2 * ${#BAFC_SEEDS[@]}))
+if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + NUM_JOBS - 1 > 65535 )); then
+    echo "--base-port must leave room for ${NUM_JOBS} valid ports, got: ${BASE_PORT}" >&2
     exit 1
 fi
 
+# Keep the task in the path so hopper:hop cannot reuse dog:walk checkpoints.
 ENV_DIR="${ENV_NAME//:/_}"
 ROOT_DIR="${BASE_DIR}/${ENV_DIR}/rlpd_bafcv3_comparison_4g"
-RUN_DIR="${ROOT_DIR}/bafcv3/fixed_pairingFalse_num_sampled_critic${NUM_SAMPLED_CRITICS}/critic_utd${CRITIC_UTD}/seed_${SEED}"
-
-command=(
-    "${PYTHON_BIN}" -m alf.bin.train
-    --conf "${CONF_FILE}"
-    --root_dir "${RUN_DIR}"
-    --conf_param "TrainerConfig.random_seed=${SEED}"
-    --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False"
-    --conf_param "TrainerConfig.num_checkpoints=${NUM_CHECKPOINTS}"
-    --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}"
-    --conf_param "TrainerConfig.num_updates_per_train_iter=${UPDATES_PER_ITER}"
-    --conf_param "make_ddp_performer.find_unused_parameters=True"
-    --conf_param "create_environment.env_name='${ENV_NAME}'"
-    --conf_param "TrainerConfig.debug_summaries=${DEBUG_SUMMARIES}"
-    --conf_param "BafcAlgorithmV3.critic_utd=${CRITIC_UTD}"
-    --conf_param "bafcv3_actor_use_ln=${ACTOR_USE_LN}"
-    --conf_param "bafcv3_actor_critic_pairing=False"
-    --conf_param "bafcv3_num_actor_critic=${NUM_ACTOR_CRITIC}"
-    --conf_param "bafcv3_num_sampled_critics_for_actor=${NUM_SAMPLED_CRITICS}"
-    --conf_param "bafcv3_use_random_critic_targets=True"
-    --conf_param "bafcv3_num_sampled_critic_targets=${NUM_SAMPLED_CRITIC_TARGETS}"
-    --distributed multi-gpu
-)
 
 cat <<EOF
-Starting hopper:hop BAFCv3 replacement run
-  Run dir: ${RUN_DIR}
+Starting hopper:hop RLPD/BAFCv3/BAFCv3_TR2 comparison
+  Environment: ${ENV_NAME}
+  Root dir: ${ROOT_DIR}
   Num env steps: ${NUM_ENV_STEPS}
   Num checkpoints: ${NUM_CHECKPOINTS}
-  Seed: ${SEED}
-  GPUs: ${GPUS}
-  Master port: ${MASTER_PORT}
+  RLPD seeds: ${RLPD_SEEDS[*]}
+  BAFCv3/BAFCv3_TR2 seeds: ${BAFC_SEEDS[*]}
+  GPUs per job: ${GPUS}
+  RLPD: critic_utd=${RLPD_CRITIC_UTD}
+  BAFCv3_TR2 pairing off, random targets: critic_utd=${BAFCV3_CRITIC_UTD}, num_sampled_critic=${BAFCV3_NUM_SAMPLED_CRITICS}
+  BAFCv3 pairing off, random targets: critic_utd=${BAFCV3_CRITIC_UTD}, num_sampled_critic=${BAFCV3_NUM_SAMPLED_CRITICS}
+  BAFCv3_TR2 eval trust max: ${TR2_EVAL_TRUST_MAX}
   Dry run: ${DRY_RUN}
 EOF
 echo ""
 
 cd "${REPO_ROOT}"
 
+PIDS=()
+launch_job() {
+    local condition="$1"
+    local seed="$2"
+    local master_port="$3"
+    local config_file="$4"
+    local updates_per_iter="$5"
+    shift 5
+
+    local run_dir="${ROOT_DIR}/${condition}/seed_${seed}"
+    local -a command=(
+        "${PYTHON_BIN}" -m alf.bin.train
+        --conf "${config_file}"
+        --root_dir "${run_dir}"
+        --conf_param "TrainerConfig.random_seed=${seed}"
+        --conf_param "TrainerConfig.confirm_checkpoint_upon_crash=False"
+        --conf_param "TrainerConfig.num_checkpoints=${NUM_CHECKPOINTS}"
+        --conf_param "TrainerConfig.num_env_steps=${NUM_ENV_STEPS}"
+        --conf_param "TrainerConfig.num_updates_per_train_iter=${updates_per_iter}"
+        --conf_param "make_ddp_performer.find_unused_parameters=True"
+        --conf_param "create_environment.env_name='${ENV_NAME}'"
+        "$@"
+        --distributed multi-gpu
+    )
+
+    if [[ "${DRY_RUN}" == "True" ]]; then
+        printf 'CUDA_VISIBLE_DEVICES=%q MASTER_PORT=%q ' "${GPUS}" "${master_port}"
+        printf '%q ' "${command[@]}"
+        printf '> %q 2>&1 &\n' "${run_dir}/out.log"
+        return
+    fi
+
+    mkdir -p "${run_dir}"
+    CUDA_VISIBLE_DEVICES="${GPUS}" MASTER_PORT="${master_port}" \
+        "${command[@]}" > "${run_dir}/out.log" 2>&1 &
+    local pid=$!
+    PIDS+=("${pid}")
+    echo "  ${condition}, seed ${seed}: port ${master_port}, PID ${pid}"
+    echo "    Log: ${run_dir}/out.log"
+}
+
+port_offset=0
+for seed in "${RLPD_SEEDS[@]}"; do
+    launch_job \
+        "rlpd/critic_utd${RLPD_CRITIC_UTD}" \
+        "${seed}" "$((BASE_PORT + port_offset))" "${RLPD_CONF}" \
+        "${RLPD_UPDATES_PER_ITER}" \
+        --conf_param "RlpdAlgorithm.critic_utd=${RLPD_CRITIC_UTD}"
+    ((port_offset += 1))
+done
+
+for seed in "${BAFC_SEEDS[@]}"; do
+    launch_job \
+        "bafcv3_tr2/fixed_pairingFalse_num_sampled_critic${BAFCV3_NUM_SAMPLED_CRITICS}/critic_utd${BAFCV3_CRITIC_UTD}" \
+        "${seed}" "$((BASE_PORT + port_offset))" "${BAFCV3_TR2_CONF}" \
+        "${BAFCV3_UPDATES_PER_ITER}" \
+        --conf_param "TrainerConfig.debug_summaries=${BAFCV3_DEBUG_SUMMARIES}" \
+        --conf_param "TrainerConfig.rollout_skip_eval=True" \
+        --conf_param "TrainerConfig.rollout_skip_eval_interval=${TR2_ROLLOUT_SKIP_EVAL_INTERVAL}" \
+        --conf_param "BafcAlgorithmV3TR2.critic_utd=${BAFCV3_CRITIC_UTD}" \
+        --conf_param "BafcAlgorithmV3TR2.monitor_trust_metrics=True" \
+        --conf_param "BafcAlgorithmV3TR2.eval_trust_max=${TR2_EVAL_TRUST_MAX}" \
+        --conf_param "BafcAlgorithmV3TR2.enable_eval_trust_max_decay=${TR2_EVAL_TRUST_MAX_DECAY}" \
+        --conf_param "BafcAlgorithmV3TR2.trust_metric_num_feature_coords=${TR2_NUM_FEATURE_COORDS}" \
+        --conf_param "BafcAlgorithmV3TR2.trust_metric_update_interval=${TR2_METRIC_INTERVAL}" \
+        --conf_param "BafcAlgorithmV3TR2.eval_gate_max_consecutive_rollout_skips=${TR2_ROLLOUT_SKIP_CAP}" \
+        --conf_param "BafcAlgorithmV3TR2.freeze_eval_samples=${TR2_FREEZE_EVAL_SAMPLES}" \
+        --conf_param "BafcAlgorithmV3TR2.enable_eval_rollout_skip_gate=True" \
+        --conf_param "BafcAlgorithmV3TR2.enable_grad_actor_extend_gate=False" \
+        --conf_param "BafcAlgorithmV3TR2.enable_critic_reweighting=${TR2_ENABLE_CRITIC_REWEIGHTING}" \
+        --conf_param "BafcAlgorithmV3TR2.critic_reweighting_beta=${TR2_CRITIC_REWEIGHTING_BETA}" \
+        --conf_param "BafcAlgorithmV3TR2.critic_reweighting_ridge=${TR2_CRITIC_REWEIGHTING_RIDGE}" \
+        --conf_param "BafcAlgorithmV3TR2.critic_reweighting_solver_iters=${TR2_CRITIC_REWEIGHTING_SOLVER_ITERS}" \
+        --conf_param "BafcAlgorithmV3TR2.critic_reweighting_max_weight=${TR2_CRITIC_REWEIGHTING_MAX_WEIGHT}" \
+        --conf_param "bafcv3_tr2_actor_use_ln=${BAFCV3_ACTOR_USE_LN}" \
+        --conf_param "bafcv3_tr2_actor_critic_pairing=False" \
+        --conf_param "bafcv3_tr2_num_actor_critic=${BAFCV3_NUM_ACTOR_CRITIC}" \
+        --conf_param "bafcv3_tr2_num_sampled_critics_for_actor=${BAFCV3_NUM_SAMPLED_CRITICS}" \
+        --conf_param "bafcv3_tr2_use_random_critic_targets=True" \
+        --conf_param "bafcv3_tr2_num_sampled_critic_targets=${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}"
+    ((port_offset += 1))
+done
+
+for seed in "${BAFC_SEEDS[@]}"; do
+    launch_job \
+        "bafcv3/fixed_pairingFalse_num_sampled_critic${BAFCV3_NUM_SAMPLED_CRITICS}/critic_utd${BAFCV3_CRITIC_UTD}" \
+        "${seed}" "$((BASE_PORT + port_offset))" "${BAFCV3_CONF}" \
+        "${BAFCV3_UPDATES_PER_ITER}" \
+        --conf_param "TrainerConfig.debug_summaries=${BAFCV3_DEBUG_SUMMARIES}" \
+        --conf_param "BafcAlgorithmV3.critic_utd=${BAFCV3_CRITIC_UTD}" \
+        --conf_param "bafcv3_actor_use_ln=${BAFCV3_ACTOR_USE_LN}" \
+        --conf_param "bafcv3_actor_critic_pairing=False" \
+        --conf_param "bafcv3_num_actor_critic=${BAFCV3_NUM_ACTOR_CRITIC}" \
+        --conf_param "bafcv3_num_sampled_critics_for_actor=${BAFCV3_NUM_SAMPLED_CRITICS}" \
+        --conf_param "bafcv3_use_random_critic_targets=True" \
+        --conf_param "bafcv3_num_sampled_critic_targets=${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}"
+    ((port_offset += 1))
+done
+
+echo ""
 if [[ "${DRY_RUN}" == "True" ]]; then
-    printf 'CUDA_VISIBLE_DEVICES=%q MASTER_PORT=%q ' "${GPUS}" "${MASTER_PORT}"
-    printf '%q ' "${command[@]}"
-    printf '> %q 2>&1 &\n' "${RUN_DIR}/out.log"
-    exit 0
+    echo "Dry run complete; no jobs were launched."
+else
+    echo "Launched ${NUM_JOBS} 4-GPU jobs: ${PIDS[*]}"
+    echo "Launcher is not waiting for completion."
 fi
-
-if [[ -e "${RUN_DIR}" ]]; then
-    echo "Run directory already exists; refusing to overwrite it: ${RUN_DIR}" >&2
-    exit 1
-fi
-mkdir -p "${RUN_DIR}"
-
-CUDA_VISIBLE_DEVICES="${GPUS}" MASTER_PORT="${MASTER_PORT}" \
-    "${command[@]}" > "${RUN_DIR}/out.log" 2>&1 &
-
-PID=$!
-echo "Launched BAFCv3 seed ${SEED}: PID ${PID}"
-echo "Log: ${RUN_DIR}/out.log"
-echo "To monitor: tail -f ${RUN_DIR}/out.log"
+echo "To monitor RLPD: tail -f ${ROOT_DIR}/rlpd/*/seed_*/out.log"
+echo "To monitor BAFCv3: tail -f ${ROOT_DIR}/bafcv3/*/*/seed_*/out.log"
+echo "To monitor BAFCv3_TR2: tail -f ${ROOT_DIR}/bafcv3_tr2/*/*/seed_*/out.log"
+echo "Results: ${ROOT_DIR}"
