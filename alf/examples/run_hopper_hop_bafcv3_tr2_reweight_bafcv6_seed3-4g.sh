@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch hopper:hop BAFCv3_TR2 with critic reweighting and BAFCv6 on seed 3.
+# Launch hopper:hop BAFCv3_TR2 with critic reweighting and BAFCv6 on one seed.
 # BAFCv6 is the BAFCv3-style condition augmented with snapshot-feature critic
 # sample reweighting; unlike TR2, it has no trust-metric rollout gate.
 # Both jobs use all four configured GPUs through DDP and run in parallel.
@@ -16,6 +16,7 @@
 #       --gpus CSV           Comma-separated GPU ids (default: 0,1,2,3)
 #       --checkpoints N      Number of checkpoints (default: 10)
 #       --base-port PORT     First DDP master port (default: 29610)
+#       --seed SEED          Random seed for both jobs (default: 3)
 #       --dry-run            Print commands without launching jobs
 #   -h, --help               Show this help message
 #
@@ -93,6 +94,10 @@ while [[ $# -gt 0 ]]; do
             BASE_PORT="$2"
             shift 2
             ;;
+        --seed)
+            SEED="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=True
             shift
@@ -127,13 +132,17 @@ if [[ ! "${NUM_CHECKPOINTS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--checkpoints must be a positive integer, got: ${NUM_CHECKPOINTS}" >&2
     exit 1
 fi
+if [[ ! "${SEED}" =~ ^[0-9]+$ ]]; then
+    echo "--seed must be a nonnegative integer, got: ${SEED}" >&2
+    exit 1
+fi
 if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + 1 > 65535 )); then
     echo "--base-port must leave room for two valid ports, got: ${BASE_PORT}" >&2
     exit 1
 fi
 
 ENV_DIR="${ENV_NAME//:/_}"
-ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_tr2_reweight_bafcv6_seed3_4g"
+ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_tr2_reweight_bafcv6_seed${SEED}_4g"
 TR2_RUN_DIR="${ROOT_DIR}/bafcv3_tr2_reweight/fixed_pairingFalse_num_sampled_critic${NUM_SAMPLED_CRITICS_FOR_ACTOR}/critic_utd${CRITIC_UTD}/seed_${SEED}"
 V6_RUN_DIR="${ROOT_DIR}/bafcv6_reweight/fixed_pairingFalse_num_sampled_critic${NUM_SAMPLED_CRITICS_FOR_ACTOR}/critic_utd${CRITIC_UTD}/seed_${SEED}"
 
