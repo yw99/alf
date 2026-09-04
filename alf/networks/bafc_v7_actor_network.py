@@ -48,8 +48,10 @@ class BafcV7ActorNetwork(Network):
     """Parallel fully-connected actor exposing a squashed Normal policy.
 
     The actor group dimension is part of the distribution batch shape.  The
-    final policy feature for each actor is ``concat(mean, log(std))`` in the
-    pre-squash Normal coordinates.
+    policy fingerprint is selected by ``policy_feature_mode``. The legacy
+    ``mean_log_std`` mode concatenates the pre-squash Normal mean and log
+    standard deviation. ``action_quantiles`` concatenates the transformed
+    actions at pre-squash Normal quantiles ``[-1, 0, 1]``.
     """
 
     def __init__(self,
@@ -62,6 +64,7 @@ class BafcV7ActorNetwork(Network):
                  activation=torch.relu_,
                  kernel_initializer=None,
                  continuous_projection_net_ctor=None,
+                 policy_feature_mode="mean_log_std",
                  name="BafcV7ActorNetwork"):
         super().__init__(input_tensor_spec, name=name)
         if not isinstance(action_spec, BoundedTensorSpec):
@@ -72,6 +75,11 @@ class BafcV7ActorNetwork(Network):
             raise ValueError("n_groups must be a positive integer")
         if not isinstance(fc_layer_params, tuple) or not fc_layer_params:
             raise ValueError("fc_layer_params must be a non-empty tuple")
+        valid_policy_feature_modes = ("mean_log_std", "action_quantiles")
+        if policy_feature_mode not in valid_policy_feature_modes:
+            raise ValueError(
+                "policy_feature_mode must be one of "
+                f"{valid_policy_feature_modes}")
 
         if kernel_initializer is None:
             kernel_initializer = functools.partial(
@@ -110,15 +118,18 @@ class BafcV7ActorNetwork(Network):
 
         self._n_groups = n_groups
         self._action_spec = action_spec
+        self._policy_feature_mode = policy_feature_mode
         action_dim = action_spec.shape[0]
+        self._policy_feature_size = (
+            2 if policy_feature_mode == "mean_log_std" else 3) * action_dim
 
         # BAFC uses these properties only to infer actor-token sizes.  The
-        # projection feature is [mean, log_std], hence width 2 * action_dim.
+        # synthetic projection entries describe the selected policy feature.
         self.register_buffer(
             "_projection_weight_shape",
-            torch.zeros(n_groups, 2 * action_dim, input_size))
+            torch.zeros(n_groups, self._policy_feature_size, input_size))
         self.register_buffer("_projection_bias_shape",
-                             torch.zeros(n_groups, 2 * action_dim))
+                             torch.zeros(n_groups, self._policy_feature_size))
         self._weight_params = [m.weight for m in self._fc_layers] + [
             self._projection_weight_shape
         ]
@@ -141,6 +152,14 @@ class BafcV7ActorNetwork(Network):
     @property
     def action_spec(self):
         return self._action_spec
+
+    @property
+    def policy_feature_mode(self):
+        return self._policy_feature_mode
+
+    @property
+    def policy_feature_size(self):
+        return self._policy_feature_size
 
     @staticmethod
     def seeded_parameters(mean, std, seed, temporal_noise_mix: float):
@@ -168,6 +187,38 @@ class BafcV7ActorNetwork(Network):
         for transform in distribution.transforms:
             action = transform(action)
         return action
+
+    def transformed_quantiles(self,
+                              output: BafcV7ActorOutput,
+                              mean=None,
+                              std=None):
+        """Return transformed quantiles in deterministic ``[-1, 0, 1]`` order."""
+        if mean is None:
+            mean = output.mean
+        if std is None:
+            std = output.std
+        levels = mean.new_tensor((-1., 0., 1.)).reshape(
+            *((1, ) * (mean.ndim - 1)), 3, 1)
+        pre_squash = mean.unsqueeze(-2) + std.unsqueeze(-2) * levels
+        quantiles = self.apply_transforms(output.distribution, pre_squash)
+        return quantiles.flatten(start_dim=-2)
+
+    def make_policy_features(self,
+                             output: BafcV7ActorOutput,
+                             mean=None,
+                             std=None):
+        """Construct the configured differentiable policy fingerprint.
+
+        Optional ``mean`` and ``std`` tensors support seed-conditioned
+        fingerprints while reusing the base policy's exact action transforms.
+        """
+        if mean is None:
+            mean = output.mean
+        if std is None:
+            std = output.std
+        if self._policy_feature_mode == "mean_log_std":
+            return torch.cat((mean, std.log()), dim=-1)
+        return self.transformed_quantiles(output, mean=mean, std=std)
 
     def sample_base(self, output: BafcV7ActorOutput):
         return output.distribution.rsample()
@@ -200,12 +251,13 @@ class BafcV7ActorNetwork(Network):
             raise TypeError("BAFCv7 requires a Normal base distribution")
         mean = base_normal.loc
         std = base_normal.scale
-        log_std = torch.log(std.clamp_min(torch.finfo(std.dtype).tiny))
-        policy_features = torch.cat([mean, log_std], dim=-1)
+        provisional_output = BafcV7ActorOutput(
+            distribution=distribution, mean=mean, std=std)
+        policy_features = self.make_policy_features(provisional_output)
         # Match ActorFCNetwork's full_neurons convention by appending the
         # policy output after all hidden activations. Thus BAFC's "last_two"
         # means [final_hidden, policy_output]; here policy_output is the
-        # deterministic [mean, log_std] fingerprint rather than an action.
+        # configured deterministic policy fingerprint.
         neurons = hidden + [policy_features] if full_neurons else ()
         return BafcV7ActorOutput(
             distribution=distribution,

@@ -92,6 +92,7 @@ alf.config(
     critic_network_cls=critic_network_cls,
     num_sampled_critics_for_actor=1,
     num_actor_eval_samples=512,
+    policy_feature_mode="mean_log_std",
     eval_samples_init_method="normal",
     eval_samples_clipping=False,
     actor_eval_type="last_two",

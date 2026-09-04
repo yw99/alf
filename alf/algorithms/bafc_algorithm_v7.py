@@ -66,6 +66,12 @@ BafcV7LossInfo = namedtuple(
     "BafcV7LossInfo", ["actor", "critic"], default_value=())
 
 
+_CHECKPOINT_REVISION = 3
+_POLICY_FEATURE_MODE_IDS = {
+    "mean_log_std": 0,
+    "action_quantiles": 1,
+}
+
 @alf.configurable
 class BafcAlgorithmV7(OffPolicyAlgorithm):
     r"""Functional critic with an episode-seeded Gaussian actor.
@@ -96,6 +102,7 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
                  num_critics=10,
                  temporal_noise_mix=0.1,
                  training_policy="base",
+                 policy_feature_mode="mean_log_std",
                  actor_update_mode="paired",
                  num_sampled_critics_for_actor=1,
                  num_actor_eval_samples=512,
@@ -138,6 +145,10 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
             raise ValueError("temporal_noise_mix must be in (0, 1]")
         if training_policy not in ("base", "seeded"):
             raise ValueError("training_policy must be 'base' or 'seeded'")
+        valid_policy_feature_modes = ("mean_log_std", "action_quantiles")
+        if policy_feature_mode not in valid_policy_feature_modes:
+            raise ValueError("policy_feature_mode must be one of "
+                             f"{valid_policy_feature_modes}")
         if training_policy == "seeded" and num_actors != 1:
             raise ValueError(
                 "seeded training initially supports exactly one actor")
@@ -185,6 +196,7 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         self._num_critics = num_critics
         self._temporal_noise_mix = float(temporal_noise_mix)
         self._training_policy = training_policy
+        self._policy_feature_mode = policy_feature_mode
         self._actor_update_mode = actor_update_mode
         self._num_sampled_critics_for_actor = (
             num_sampled_critics_for_actor)
@@ -198,7 +210,8 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         actor_networks = actor_network_cls(
             input_tensor_spec=observation_spec,
             action_spec=action_spec,
-            n_groups=num_actors)
+            n_groups=num_actors,
+            policy_feature_mode=policy_feature_mode)
         if not isinstance(actor_networks, BafcV7ActorNetwork):
             raise TypeError(
                 "actor_network_cls must construct BafcV7ActorNetwork")
@@ -212,7 +225,7 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
             actor_eval_samples = 2 * torch.rand(
                 num_actor_eval_samples, observation_spec.shape[0]) - 1
 
-        policy_feature_size = 2 * action_spec.shape[0]
+        policy_feature_size = actor_networks.policy_feature_size
         if actor_eval_type == "last_two":
             actor_token_length = (
                 actor_networks.bias_params[-2].shape[1] + policy_feature_size)
@@ -306,6 +319,13 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
 
     def _save_runtime_state(self, destination, prefix):
         destination[self._runtime_key(
+            prefix, "revision")] = torch.tensor(
+                _CHECKPOINT_REVISION, dtype=torch.int64)
+        destination[self._runtime_key(
+            prefix, "policy_feature_mode")] = torch.tensor(
+                _POLICY_FEATURE_MODE_IDS[self._policy_feature_mode],
+                dtype=torch.int64)
+        destination[self._runtime_key(
             prefix, "training_started")] = torch.tensor(
                 self._training_started, dtype=torch.bool)
         destination[self._runtime_key(
@@ -340,6 +360,41 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
                               error_msgs,
                               visited=None):
         runtime_state = self._pop_runtime_state(state_dict, prefix)
+        revision = runtime_state.get("revision")
+        if revision is None:
+            if self._policy_feature_mode != "mean_log_std":
+                raise RuntimeError(
+                    "An unmarked legacy BAFCv7 checkpoint can only be loaded "
+                    "with policy_feature_mode='mean_log_std'.")
+        else:
+            saved_revision = int(revision.reshape(()).item())
+            if saved_revision == 2:
+                raise RuntimeError(
+                    "BAFCv7 entropy revision-2 checkpoints are incompatible "
+                    "with entropy-free revision 3. Start a fresh run.")
+            if saved_revision != _CHECKPOINT_REVISION:
+                raise RuntimeError(
+                    f"Unsupported BAFCv7 checkpoint revision "
+                    f"{saved_revision}; expected revision "
+                    f"{_CHECKPOINT_REVISION}.")
+            saved_mode_value = runtime_state.get("policy_feature_mode")
+            if saved_mode_value is None:
+                raise RuntimeError(
+                    "BAFCv7 revision-3 checkpoint is missing its encoded "
+                    "policy_feature_mode.")
+            saved_mode_id = int(saved_mode_value.reshape(()).item())
+            configured_mode_id = _POLICY_FEATURE_MODE_IDS[
+                self._policy_feature_mode]
+            if saved_mode_id != configured_mode_id:
+                saved_mode = next(
+                    (mode for mode, mode_id in
+                     _POLICY_FEATURE_MODE_IDS.items()
+                     if mode_id == saved_mode_id),
+                    f"unknown({saved_mode_id})")
+                raise RuntimeError(
+                    "BAFCv7 checkpoint fingerprint mode mismatch: saved "
+                    f"'{saved_mode}', configured "
+                    f"'{self._policy_feature_mode}'.")
         super()._load_from_state_dict(state_dict, prefix, local_metadata,
                                       strict, missing_keys, unexpected_keys,
                                       error_msgs, visited)
@@ -476,12 +531,8 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
             self._actor_networks.seeded_parameters(
                 output.mean[None], output.std[None], seed,
                 self._temporal_noise_mix))
-        policy_features = torch.cat([
-            conditional_mean,
-            torch.log(conditional_std.clamp_min(
-                torch.finfo(conditional_std.dtype).tiny))
-        ],
-                                    dim=-1)
+        policy_features = self._actor_networks.make_policy_features(
+            output, mean=conditional_mean, std=conditional_std)
         if self._actor_eval_type == "last_two":
             hidden = output.neurons[-2].unsqueeze(0).expand(
                 episode_seed.shape[0], *output.neurons[-2].shape)
@@ -585,7 +636,8 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         q_values, critic_state = self._all_critic_values(
             self._critic_networks, actor_encoding, observation, action, state)
         objective = self._actor_objective_values(q_values).sum()
-        dqda, dqde = nest_utils.grad((action, actor_features), objective)
+        dqda, dqde = nest_utils.grad(
+            (action, actor_features), objective, retain_graph=True)
 
         action_loss = self._surrogate_loss(dqda, action).sum(dim=-1)
         feature_losses = nest.map_structure(self._surrogate_loss, dqde,

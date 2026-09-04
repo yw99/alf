@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the dog:fetch RLPD/BAFCv3/BAFCv3_TR2 comparison on seeds 0 and 1.
+# Launch the dog:fetch RLPD/BAFCv3/BAFCv3_TR2 comparison on seeds 2 and 3.
 # Every job uses all four configured GPUs through DDP. The six jobs run in
 # parallel on unique torch.distributed master ports.
 #
@@ -42,7 +42,7 @@ NUM_CHECKPOINTS=10
 GPUS="0,1,2,3"
 BASE_PORT=29500
 DRY_RUN=False
-SEEDS=(0 1)
+SEEDS=(2 3)
 
 RLPD_CRITIC_UTD=10
 RLPD_UPDATES_PER_ITER=11

@@ -5,7 +5,7 @@
 #
 # The settings match the BAFCv3_TR2 condition in
 # run_quadruped_walk_rlpd_bafcv3_seed01-4g.sh. Results use the separate
-# bafcv3_tr2_no_cadence condition directory.
+# bafcv3_tr2_no_cadence/eval30_no_decay condition directory.
 #
 # Usage: bash run_quadruped_walk_bafcv3_tr2_seed01-4g.sh [options]
 #   -d, --dir BASE_DIR       Base results directory (default: /workspace/alf_results)
@@ -30,8 +30,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BAFCV3_TR2_CONF="${SCRIPT_DIR}/bafcv3_tr2_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
+# Make venv-installed helper executables (for example, Ninja) discoverable.
+export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
 
-ENV_NAME="dog:walk"
+# ENV_NAME="dog:walk"
+ENV_NAME="humanoid:walk"
 BASE_DIR="/workspace/alf_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
@@ -126,7 +129,7 @@ fi
 
 ENV_DIR="${ENV_NAME%%:*}"
 ROOT_DIR="${BASE_DIR}/${ENV_DIR}/rlpd_bafcv3_comparison_4g"
-CONDITION="bafcv3_tr2_no_cadence/fixed_pairingFalse_num_sampled_critic${BAFCV3_NUM_SAMPLED_CRITICS}/critic_utd${BAFCV3_CRITIC_UTD}"
+CONDITION="bafcv3_tr2_no_cadence/eval30_no_decay/fixed_pairingFalse_num_sampled_critic${BAFCV3_NUM_SAMPLED_CRITICS}/critic_utd${BAFCV3_CRITIC_UTD}"
 
 cat <<EOF
 Starting dog:walk BAFCv3_TR2 seeds 0 and 1
@@ -138,6 +141,7 @@ Starting dog:walk BAFCv3_TR2 seeds 0 and 1
   Seeds: ${SEEDS[*]}
   GPUs per job: ${GPUS}
   BAFCv3_TR2 pairing off, random targets: critic_utd=${BAFCV3_CRITIC_UTD}, num_sampled_critic=${BAFCV3_NUM_SAMPLED_CRITICS}
+  Eval trust max: ${TR2_EVAL_TRUST_MAX} (decay=${TR2_EVAL_TRUST_MAX_DECAY})
   Dry run: ${DRY_RUN}
 EOF
 echo ""

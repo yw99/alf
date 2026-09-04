@@ -1,5 +1,28 @@
 # BAFCv7 Stochastic Actor with Episode Seed Sampling
 
+## Revision 3 selectable fingerprints (current)
+
+BAFCv7 uses the original entropy-free BAFC actor and critic objectives and
+supports two deterministic policy fingerprints:
+
+- `mean_log_std` (the default) uses `[mu, log_sigma]` with width
+  `2 * action_dim`.
+- `action_quantiles` uses the transformed actions
+  `[a_{-1}, a_0, a_{+1}]` with width `3 * action_dim`.
+
+Both modes support base-policy and seed-conditioned encodings. Quantile
+construction uses the projection distribution's exact tanh/affine transforms
+without detaching, so functional actor gradients reach both projection heads.
+There is no entropy actor loss, entropy critic reward, learned temperature, or
+log-probability training state.
+
+Revision-3 checkpoints encode the fingerprint mode and load only into the same
+mode. Unmarked pre-entropy checkpoints remain loadable in `mean_log_std` mode;
+unmarked checkpoints in `action_quantiles`, mode-mismatched revision-3
+checkpoints, and entropy revision-2 checkpoints are rejected before tensor
+loading. New launchers write under
+`hopper_hop/bafcv7_policy_features_4g/{mode}`.
+
 ## Purpose
 
 Create a new algorithm, `BafcAlgorithmV7`, by copying the current BAFCv3
@@ -7,7 +30,7 @@ implementation and adding stochastic Gaussian actors with fixed per-episode
 seeds. BAFCv7 must be isolated from BAFCv3 and all existing algorithms and
 experiments.
 
-## Implementation status
+## Revision 1 implementation status (historical)
 
 The design is implemented in isolated BAFCv7 files:
 
@@ -223,6 +246,18 @@ At an actor-evaluation state `x`, use
 p_theta(x) = concat(mu_theta(x), log_sigma_theta(x)).
 ```
 
+This is the default `mean_log_std` mode and has width `2 * action_dim`.
+The alternative `action_quantiles` mode uses
+
+```text
+q_k(x) = T(mu_theta(x) + sigma_theta(x) * k),  k in {-1, 0, +1}
+p_theta(x) = concat(q_{-1}(x), q_0(x), q_{+1}(x)).
+```
+
+It has width `3 * action_dim`. The ordering is fixed, and the exact tanh and
+affine action transforms are applied differentiably without detaching the
+quantiles.
+
 With `actor_eval_type="last_two"`, the features at probe state `x_p` are
 
 ```text
@@ -236,8 +271,7 @@ This matches BAFCv3's indexing convention. For a two-hidden-layer
 `ActorFCNetwork`, its full output list is
 `[input, h^(1), h^(2), action]`, so BAFCv3's `[-2:]` selects
 `[h^(2), action]`. It does not select both hidden activations plus the
-action. BAFCv7 replaces that final deterministic action entry with
-`[mu, log_sigma]`, yielding `[h^(2), mu, log_sigma]`.
+action. BAFCv7 replaces that final action with the selected policy fingerprint.
 
 
 ### Seed-conditioned features
@@ -246,6 +280,14 @@ For a replay seed `e`, use
 
 ```text
 p_{theta,e}(x) = concat(mu_{theta,e}(x), log_sigma_{theta,e}(x))
+```
+
+In `action_quantiles` mode the seed-conditioned representation is
+
+```text
+q_k(x,e) = T(mu(x) + sigma(x) *
+             (sqrt(1 - lambda^2) * e + lambda * k))
+p_{theta,e}(x) = concat(q_{-1}(x,e), q_0(x,e), q_{+1}(x,e)).
 ```
 
 and
@@ -276,7 +318,7 @@ its own actor encoding. The implementation should flatten the replay-sample
 and actor dimensions into the transformer's batch dimension. No transformer
 network changes are required.
 
-### Why encode `log_sigma` instead of `sigma`
+### Why `mean_log_std` remains the default moments representation
 
 Both `[mu, sigma]` and `[mu, log_sigma]` uniquely determine a Gaussian when
 `sigma > 0`, so using `log_sigma` is not required for correctness. It is the
@@ -766,8 +808,14 @@ reuse a BAFCv3 result directory or checkpoint.
   parameters, actor-token widths, rollout state, and replay information differ.
 - The two BAFCv7 variants also have different actor counts and must use separate
   result and checkpoint directories.
-- Fail clearly on incompatible checkpoint shapes; do not truncate actor
-  features or silently drop seed state.
+- Revision-3 checkpoints store the selected fingerprint mode and reject a
+  different configured mode before parameter tensor loading.
+- Unmarked pre-entropy checkpoints are treated as legacy `mean_log_std`
+  checkpoints. They load only in that default mode, which preserves existing
+  legacy-run resumability.
+- Entropy revision-2 and other unsupported revisions fail with explicit
+  compatibility errors. Actor features are never truncated, and seed state is
+  never silently dropped.
 - Runtime episode seeds and actor IDs belong in ALF algorithm state so they are
   handled consistently by rollout and checkpoint state mechanisms.
 

@@ -13,7 +13,11 @@ from alf.tensor_specs import BoundedTensorSpec, TensorSpec
 
 class BafcV7ActorNetworkTest(alf.test.TestCase):
 
-    def _make_actor(self, num_actors=3, minimum=-1., maximum=1.):
+    def _make_actor(self,
+                    num_actors=3,
+                    minimum=-1.,
+                    maximum=1.,
+                    policy_feature_mode="mean_log_std"):
         projection = partial(
             NormalProjectionNetwork,
             state_dependent_std=True,
@@ -24,7 +28,8 @@ class BafcV7ActorNetworkTest(alf.test.TestCase):
                 (2, ), minimum=minimum, maximum=maximum),
             fc_layer_params=(16, 12),
             n_groups=num_actors,
-            continuous_projection_net_ctor=projection)
+            continuous_projection_net_ctor=projection,
+            policy_feature_mode=policy_feature_mode)
 
     def test_gaussian_parameters_features_and_selected_actor_shapes(self):
         actor = self._make_actor(num_actors=4)
@@ -32,6 +37,8 @@ class BafcV7ActorNetworkTest(alf.test.TestCase):
         self.assertEqual(output.mean.shape, (7, 4, 2))
         self.assertEqual(output.std.shape, (7, 4, 2))
         self.assertEqual(output.policy_features.shape, (7, 4, 4))
+        self.assertEqual(actor.policy_feature_mode, "mean_log_std")
+        self.assertEqual(actor.policy_feature_size, 4)
         self.assertEqual(output.neurons[-2].shape, (7, 4, 12))
         self.assertTensorEqual(output.neurons[-1], output.policy_features)
         self.assertEqual(output.distribution.batch_shape, (7, 4))
@@ -49,6 +56,63 @@ class BafcV7ActorNetworkTest(alf.test.TestCase):
         self.assertTensorClose(output.policy_features[..., :2], output.mean)
         self.assertTensorClose(output.policy_features[..., 2:],
                                output.std.log())
+
+
+    def test_action_quantile_values_width_order_and_asymmetric_transform(self):
+        actor = self._make_actor(
+            num_actors=2,
+            minimum=[-2., 1.],
+            maximum=[4., 5.],
+            policy_feature_mode="action_quantiles")
+        output = actor(torch.randn(3, 4))
+        self.assertEqual(actor.policy_feature_size, 6)
+        self.assertEqual(output.policy_features.shape, (3, 2, 6))
+        levels = output.mean.new_tensor([-1., 0., 1.]).reshape(1, 1, 3, 1)
+        midpoint = output.mean.new_tensor([1., 3.])
+        magnitude = output.mean.new_tensor([3., 2.])
+        expected = midpoint + magnitude * torch.tanh(
+            output.mean.unsqueeze(-2) + output.std.unsqueeze(-2) * levels)
+        self.assertTensorClose(output.policy_features,
+                               expected.flatten(start_dim=-2))
+
+        seed = output.mean.new_tensor([[0.25, -0.4], [0.7, 0.2],
+                                       [-0.1, 0.5]])[:, None, :]
+        mix = 0.6
+        persistent = math.sqrt(1. - mix**2)
+        conditional_mean, conditional_std = actor.seeded_parameters(
+            output.mean, output.std, seed, mix)
+        actual = actor.make_policy_features(
+            output, mean=conditional_mean, std=conditional_std)
+        coefficients = persistent * seed.unsqueeze(-2) + mix * levels
+        seeded_expected = midpoint + magnitude * torch.tanh(
+            output.mean.unsqueeze(-2) +
+            output.std.unsqueeze(-2) * coefficients)
+        self.assertTensorClose(actual, seeded_expected.flatten(start_dim=-2))
+        self.assertTensorEqual(
+            actual,
+            actor.make_policy_features(
+                output, mean=conditional_mean, std=conditional_std))
+
+    def test_both_policy_feature_modes_reach_mean_and_std_heads(self):
+        for mode in ("mean_log_std", "action_quantiles"):
+            with self.subTest(policy_feature_mode=mode):
+                actor = self._make_actor(
+                    num_actors=2, policy_feature_mode=mode)
+                output = actor(torch.randn(9, 4))
+                weights = torch.linspace(
+                    -0.7,
+                    1.3,
+                    output.policy_features.numel(),
+                    device=output.policy_features.device).reshape_as(
+                        output.policy_features)
+                (output.policy_features * weights).sum().backward()
+                projection = actor._projection_net
+                for gradient in (
+                        projection._means_projection_layer.weight.grad,
+                        projection._std_projection_layer.weight.grad):
+                    self.assertIsNotNone(gradient)
+                    self.assertTrue(torch.all(torch.isfinite(gradient)))
+                    self.assertGreater(gradient.abs().sum().item(), 0.)
 
     def test_seeded_action_has_mean_and_std_head_gradients(self):
         actor = self._make_actor(num_actors=2)
@@ -107,6 +171,49 @@ class BafcV7ActorNetworkTest(alf.test.TestCase):
         expected = midpoint + magnitude * torch.tanh(pre_squash)
         self.assertTensorClose(actual, expected)
 
+    def test_quantile_raw_scale_gradient_matches_analytic_formula(self):
+        actor = self._make_actor(
+            num_actors=1,
+            minimum=[-2., 1.],
+            maximum=[4., 5.],
+            policy_feature_mode="action_quantiles")
+        template = actor(torch.zeros(1, 4))
+        mean = template.mean.new_tensor([[[0.35, -0.25]]],
+                                        requires_grad=True)
+        raw_scale = template.mean.new_tensor([[[-0.4, 0.2]]],
+                                             requires_grad=True)
+        std = raw_scale.exp()
+        levels = mean.new_tensor([-1., 0., 1.]).reshape(1, 1, 3, 1)
+        weights = mean.new_tensor([[[[0.3, -0.7], [1.1, 0.2],
+                                     [-0.4, 0.9]]]])
+        magnitude = mean.new_tensor([3., 2.])
+
+        quantiles = actor.make_policy_features(
+            template, mean=mean, std=std).reshape(1, 1, 3, 2)
+        actual_base = torch.autograd.grad(
+            (quantiles * weights).sum(), raw_scale, retain_graph=True)[0]
+        base_u = mean.unsqueeze(-2) + std.unsqueeze(-2) * levels
+        expected_base = (weights * magnitude * (1. - torch.tanh(base_u)**2) *
+                         std.unsqueeze(-2) * levels).sum(dim=-2)
+        self.assertTensorClose(actual_base, expected_base)
+
+        seed = mean.new_tensor([[[0.25, -0.4]]])
+        mix = 0.6
+        persistent = math.sqrt(1. - mix**2)
+        conditional_mean, conditional_std = actor.seeded_parameters(
+            mean, std, seed, mix)
+        seeded_quantiles = actor.make_policy_features(
+            template, mean=conditional_mean,
+            std=conditional_std).reshape(1, 1, 3, 2)
+        actual_seeded = torch.autograd.grad(
+            (seeded_quantiles * weights).sum(), raw_scale)[0]
+        coefficient = persistent * seed.unsqueeze(-2) + mix * levels
+        seeded_u = mean.unsqueeze(-2) + std.unsqueeze(-2) * coefficient
+        expected_seeded = (weights * magnitude *
+                           (1. - torch.tanh(seeded_u)**2) *
+                           std.unsqueeze(-2) * coefficient).sum(dim=-2)
+        self.assertTensorClose(actual_seeded, expected_seeded)
+
     def test_requires_transformed_normal_projection(self):
         projection = partial(
             NormalProjectionNetwork,
@@ -119,6 +226,9 @@ class BafcV7ActorNetworkTest(alf.test.TestCase):
                 fc_layer_params=(8, 8),
                 continuous_projection_net_ctor=projection)
 
+    def test_invalid_policy_feature_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "policy_feature_mode"):
+            self._make_actor(policy_feature_mode="unknown")
 
 if __name__ == "__main__":
     alf.test.main()

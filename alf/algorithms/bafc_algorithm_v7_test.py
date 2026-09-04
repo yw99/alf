@@ -30,7 +30,13 @@ class _EncodingOnlyCritic(torch.nn.Module):
 
     def forward(self, inputs, state=()):
         actor_encoding, (_, action) = inputs
-        value = actor_encoding.sum(dim=-1) + 0. * action.sum(dim=-1)
+        weights = torch.arange(
+            1,
+            actor_encoding.shape[-1] + 1,
+            dtype=actor_encoding.dtype,
+            device=actor_encoding.device)
+        value = (actor_encoding * weights).sum(
+            dim=-1) + 0. * action.sum(dim=-1)
         return value, state
 
 
@@ -98,6 +104,71 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
             observation=torch.randn(batch_size, 4),
             prev_action=torch.zeros(batch_size, 2),
             env_id=torch.arange(batch_size))
+
+    def _backward_real_critic_loss(self, alg, actor_only=False):
+        time_length = 2
+        batch_size = 4
+        flat_size = time_length * batch_size
+        step_type = torch.tensor([StepType.FIRST] * batch_size +
+                                 [StepType.MID] * batch_size)
+        time_step = self._time_step(step_type)._replace(
+            reward=torch.randn(flat_size), discount=torch.ones(flat_size))
+        rollout_info = BafcV7Info(
+            action=2. * torch.rand(flat_size, 2) - 1.,
+            episode_seed=torch.randn(flat_size, 2),
+            rollout_actor_id=torch.zeros(flat_size, dtype=torch.int64))
+
+        if actor_only:
+            alg._train_mode = TrainMode.actor
+            alg._critic_update_counter = 1
+            alg._apply_train_mode_grad_flags()
+
+        train_info = alg.train_step(
+            time_step, self._state(alg, flat_size), rollout_info).info
+        train_info = alf.nest.map_structure(
+            lambda value: value.reshape(time_length, batch_size,
+                                        *value.shape[1:]), train_info)
+        loss_info = alg.calc_loss(train_info)
+        total_loss = loss_info.loss.mean() + loss_info.scalar_loss
+        total_loss.backward()
+
+        self.assertTrue(torch.isfinite(total_loss))
+        projection = alg._actor_networks._projection_net
+        for gradient in (
+                projection._means_projection_layer.weight.grad,
+                projection._std_projection_layer.weight.grad):
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.all(torch.isfinite(gradient)))
+            self.assertGreater(gradient.abs().sum().item(), 0.)
+
+        if not actor_only:
+            critic_gradients = [
+                parameter.grad
+                for parameter in alg._critic_networks.parameters()
+                if parameter.grad is not None
+            ]
+            self.assertGreater(len(critic_gradients), 0)
+            self.assertTrue(all(
+                torch.all(torch.isfinite(gradient))
+                for gradient in critic_gradients))
+
+    def _real_critic_cases(self):
+        return (
+            ("ensemble_base",
+             dict(
+                 num_actors=3,
+                 num_critics=3,
+                 training_policy="base",
+                 actor_update_mode="paired",
+                 temporal_noise_mix=0.1)),
+            ("single_seeded",
+             dict(
+                 num_actors=1,
+                 num_critics=3,
+                 training_policy="seeded",
+                 actor_update_mode="min_all",
+                 temporal_noise_mix=0.9)),
+        )
 
     def test_per_environment_seed_and_actor_id_reset_only_on_first(self):
         alg = self._make_alg(
@@ -282,6 +353,88 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
         self.assertGreater(encoding_grads[0].abs().sum().item(), 0.)
         self.assertGreater(encoding_grads[1].abs().sum().item(), 0.)
 
+    def test_policy_feature_surrogate_matches_direct_parameter_gradient(self):
+        for variant, variant_args in self._real_critic_cases():
+            for policy_feature_mode in ("mean_log_std", "action_quantiles"):
+                with self.subTest(
+                        variant=variant,
+                        policy_feature_mode=policy_feature_mode):
+                    alg = self._make_alg(
+                        actor_eval_type="output",
+                        policy_feature_mode=policy_feature_mode,
+                        **variant_args)
+                    alg._critic_networks = _EncodingOnlyCritic()
+                    observation = torch.randn(3, 4)
+                    seed = torch.randn(3, 2)
+                    parameters = [
+                        parameter
+                        for parameter in alg._actor_networks.parameters()
+                        if parameter.requires_grad
+                    ]
+
+                    action, _ = alg._training_action(observation, seed)
+                    encoding, features = alg._training_encoding(
+                        alg._actor_eval_samples, seed)
+                    _, actor_info = alg._actor_train_step(
+                        observation, action, encoding, features,
+                        torch.zeros(3, 2), ())
+                    surrogate_loss = actor_info.extra.eval_action_loss.mean()
+                    surrogate_gradients = torch.autograd.grad(
+                        surrogate_loss, parameters, allow_unused=True)
+
+                    direct_encoding, direct_features = alg._training_encoding(
+                        alg._actor_eval_samples, seed)
+                    direct_values, _ = alg._all_critic_values(
+                        alg._critic_networks, direct_encoding, observation,
+                        action.detach(), ())
+                    direct_objective = alg._actor_objective_values(
+                        direct_values).sum()
+                    feature_loss_count = alg._surrogate_loss(
+                        torch.zeros_like(direct_features[-1]),
+                        direct_features[-1]).numel()
+                    direct_gradients = torch.autograd.grad(
+                        -direct_objective / feature_loss_count,
+                        parameters,
+                        allow_unused=True)
+
+                    compared = 0
+                    for surrogate, direct in zip(surrogate_gradients,
+                                                 direct_gradients):
+                        if surrogate is None or direct is None:
+                            self.assertIs(surrogate, direct)
+                            continue
+                        self.assertTensorClose(surrogate, direct)
+                        compared += int(direct.abs().sum() > 0)
+                    self.assertGreater(compared, 0)
+
+    def test_real_critic_combined_update_backward(self):
+        for variant, variant_args in self._real_critic_cases():
+            for policy_feature_mode in ("mean_log_std", "action_quantiles"):
+                for actor_eval_type in ("last_two", "output"):
+                    with self.subTest(
+                            variant=variant,
+                            policy_feature_mode=policy_feature_mode,
+                            actor_eval_type=actor_eval_type):
+                        alg = self._make_alg(
+                            actor_eval_type=actor_eval_type,
+                            policy_feature_mode=policy_feature_mode,
+                            **variant_args)
+                        self._backward_real_critic_loss(alg)
+
+    def test_real_critic_actor_only_update_backward(self):
+        for variant, variant_args in self._real_critic_cases():
+            for policy_feature_mode in ("mean_log_std", "action_quantiles"):
+                for actor_eval_type in ("last_two", "output"):
+                    with self.subTest(
+                            variant=variant,
+                            policy_feature_mode=policy_feature_mode,
+                            actor_eval_type=actor_eval_type):
+                        alg = self._make_alg(
+                            actor_eval_type=actor_eval_type,
+                            policy_feature_mode=policy_feature_mode,
+                            **variant_args)
+                        self._backward_real_critic_loss(alg, actor_only=True)
+
     def test_td_target_uses_next_value_and_terminal_discount(self):
         loss = OneStepTDLoss(gamma=0.99)
         info = BafcV7Info(
@@ -293,6 +446,11 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
         target = loss.compute_td_target(info, target_value)
         self.assertTensorClose(target[0], torch.tensor([[19.8]]))
         self.assertTensorEqual(target[1], torch.tensor([[0.]]))
+        alg = self._make_alg()
+        self.assertFalse(hasattr(alg, "_log_alpha"))
+        self.assertNotIn("alpha", BafcV7Info._fields)
+        self.assertNotIn("log_pi", BafcV7Info._fields)
+
 
     def test_runtime_checkpoint_state_is_isolated_and_restored(self):
         alg = self._make_alg()
@@ -303,6 +461,8 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
         alg._apply_train_mode_grad_flags()
         state_dict = alg.state_dict()
         self.assertIn("_bafcv7_runtime.training_started", state_dict)
+        self.assertIn("_bafcv7_runtime.revision", state_dict)
+        self.assertIn("_bafcv7_runtime.policy_feature_mode", state_dict)
 
         restored = self._make_alg()
         restored.load_state_dict(state_dict)
@@ -315,6 +475,41 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
             for parameter in restored._actor_networks.parameters()))
         self.assertFalse(restored._actor_eval_samples.requires_grad)
 
+
+    def test_action_quantile_checkpoint_round_trip(self):
+        alg = self._make_alg(policy_feature_mode="action_quantiles")
+        state_dict = alg.state_dict()
+        restored = self._make_alg(policy_feature_mode="action_quantiles")
+        restored.load_state_dict(state_dict)
+        self.assertEqual(restored._policy_feature_mode, "action_quantiles")
+
+    def test_unmarked_legacy_checkpoint_loads_only_for_mean_log_std(self):
+        state_dict = self._make_alg().state_dict()
+        state_dict.pop("_bafcv7_runtime.revision")
+        state_dict.pop("_bafcv7_runtime.policy_feature_mode")
+        self._make_alg().load_state_dict(state_dict)
+
+        quantile_state = self._make_alg(
+            policy_feature_mode="action_quantiles").state_dict()
+        quantile_state.pop("_bafcv7_runtime.revision")
+        quantile_state.pop("_bafcv7_runtime.policy_feature_mode")
+        with self.assertRaisesRegex(RuntimeError, "unmarked legacy"):
+            self._make_alg(
+                policy_feature_mode="action_quantiles").load_state_dict(
+                    quantile_state)
+
+    def test_entropy_revision_two_checkpoint_is_rejected(self):
+        state_dict = self._make_alg().state_dict()
+        state_dict["_bafcv7_runtime.revision"] = torch.tensor(2)
+        with self.assertRaisesRegex(RuntimeError, "entropy revision-2"):
+            self._make_alg().load_state_dict(state_dict)
+
+    def test_revision_three_cross_mode_checkpoint_is_rejected_early(self):
+        state_dict = self._make_alg(
+            policy_feature_mode="action_quantiles").state_dict()
+        with self.assertRaisesRegex(RuntimeError, "fingerprint mode mismatch"):
+            self._make_alg().load_state_dict(state_dict)
+
     def test_configuration_validation(self):
         with self.assertRaisesRegex(ValueError, "temporal_noise_mix"):
             self._make_alg(temporal_noise_mix=0.)
@@ -326,6 +521,8 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
                 num_critics=3,
                 training_policy="base",
                 actor_update_mode="paired")
+        with self.assertRaisesRegex(ValueError, "policy_feature_mode"):
+            self._make_alg(policy_feature_mode="unknown")
 
 
 if __name__ == "__main__":
