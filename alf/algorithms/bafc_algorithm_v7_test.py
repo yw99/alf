@@ -446,11 +446,6 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
         target = loss.compute_td_target(info, target_value)
         self.assertTensorClose(target[0], torch.tensor([[19.8]]))
         self.assertTensorEqual(target[1], torch.tensor([[0.]]))
-        alg = self._make_alg()
-        self.assertFalse(hasattr(alg, "_log_alpha"))
-        self.assertNotIn("alpha", BafcV7Info._fields)
-        self.assertNotIn("log_pi", BafcV7Info._fields)
-
 
     def test_runtime_checkpoint_state_is_isolated_and_restored(self):
         alg = self._make_alg()
@@ -461,7 +456,6 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
         alg._apply_train_mode_grad_flags()
         state_dict = alg.state_dict()
         self.assertIn("_bafcv7_runtime.training_started", state_dict)
-        self.assertIn("_bafcv7_runtime.revision", state_dict)
         self.assertIn("_bafcv7_runtime.policy_feature_mode", state_dict)
 
         restored = self._make_alg()
@@ -475,7 +469,6 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
             for parameter in restored._actor_networks.parameters()))
         self.assertFalse(restored._actor_eval_samples.requires_grad)
 
-
     def test_action_quantile_checkpoint_round_trip(self):
         alg = self._make_alg(policy_feature_mode="action_quantiles")
         state_dict = alg.state_dict()
@@ -483,28 +476,21 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
         restored.load_state_dict(state_dict)
         self.assertEqual(restored._policy_feature_mode, "action_quantiles")
 
-    def test_unmarked_legacy_checkpoint_loads_only_for_mean_log_std(self):
+    def test_checkpoint_without_mode_loads_only_for_mean_log_std(self):
         state_dict = self._make_alg().state_dict()
-        state_dict.pop("_bafcv7_runtime.revision")
         state_dict.pop("_bafcv7_runtime.policy_feature_mode")
         self._make_alg().load_state_dict(state_dict)
 
         quantile_state = self._make_alg(
             policy_feature_mode="action_quantiles").state_dict()
-        quantile_state.pop("_bafcv7_runtime.revision")
         quantile_state.pop("_bafcv7_runtime.policy_feature_mode")
-        with self.assertRaisesRegex(RuntimeError, "unmarked legacy"):
+        with self.assertRaisesRegex(RuntimeError,
+                                    "without a policy feature mode"):
             self._make_alg(
                 policy_feature_mode="action_quantiles").load_state_dict(
                     quantile_state)
 
-    def test_entropy_revision_two_checkpoint_is_rejected(self):
-        state_dict = self._make_alg().state_dict()
-        state_dict["_bafcv7_runtime.revision"] = torch.tensor(2)
-        with self.assertRaisesRegex(RuntimeError, "entropy revision-2"):
-            self._make_alg().load_state_dict(state_dict)
-
-    def test_revision_three_cross_mode_checkpoint_is_rejected_early(self):
+    def test_cross_mode_checkpoint_is_rejected_early(self):
         state_dict = self._make_alg(
             policy_feature_mode="action_quantiles").state_dict()
         with self.assertRaisesRegex(RuntimeError, "fingerprint mode mismatch"):

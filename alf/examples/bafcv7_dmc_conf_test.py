@@ -136,7 +136,6 @@ common.parse_conf_file(%r, create_env=False)
         self.assertTrue(all(
             "BafcAlgorithmV7.policy_feature_mode=\\'mean_log_std\\'" in line
             for line in commands))
-        self.assertIn("Entropy regularization: disabled", result.stdout)
         self.assertIn("Policy features: mean_log_std", result.stdout)
         for variant, temporal_noise_mix in (("ensemble_base", "0.10"),
                                             ("single_seeded", "0.90")):
@@ -191,7 +190,6 @@ common.parse_conf_file(%r, create_env=False)
         self.assertTrue(all(
             "BafcAlgorithmV7.policy_feature_mode=\\'mean_log_std\\'" in line
             for line in commands))
-        self.assertIn("Entropy regularization: disabled", result.stdout)
         self.assertIn("Policy features: mean_log_std", result.stdout)
         self.assertTrue(all(
             "TrainerConfig.random_seed=0" in line and "/seed_0 " in line

@@ -75,6 +75,9 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertIn("server1", groups["dog_run"]["BAFCv6"][3])
         self.assertNotIn("BAFCv6", groups["humanoid"])
         self.assertNotIn("BAFCv6", groups["dog"])
+        self.assertEqual(set(groups["dog_trot"]), {"RLPD", "BAFCv3"})
+        for run_dirs in groups["dog_trot"].values():
+            self.assertEqual(len(run_dirs), 4)
         self.assertEqual(
             set(groups["humanoid_seed01"]),
             {"RLPD", "BAFCv3", "BAFC_TR", "BAFCv6"})
@@ -87,9 +90,10 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         groups = plotter.build_rlpd_ours_run_groups(
             "/ws", "/local", "/server1", "/server2")
         self.assertEqual(
-            set(groups), {"dog_fetch", "dog_run", "dog", "humanoid",
-                          "hopper_hop"})
-        for env in ("dog_fetch", "dog_run", "dog", "humanoid"):
+            set(groups), {"dog_fetch", "dog_run", "dog_trot", "dog",
+                          "humanoid", "hopper_hop"})
+        for env in ("dog_fetch", "dog_run", "dog_trot", "dog",
+                    "humanoid"):
             self.assertEqual(list(groups[env]), ["Ours", "RLPD"])
             self.assertNotIn("BAFCv6", groups[env])
             for run_dirs in groups[env].values():
@@ -106,6 +110,41 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertIn("critic_utd3", hopper["Ours"][2])
         for seed, path in enumerate(hopper["Ours"]):
             self.assertEqual(os.path.basename(path), "seed_%d" % seed)
+
+    def test_additional_run_mapping(self):
+        groups = plotter.build_additional_run_groups(
+            "/ws", "/local", "/server1", "/server2", "/server4")
+
+        hopper = groups["hopper_hop_ncritic"]
+        self.assertEqual(list(hopper),
+                         ["RLPD", "BAFC_nCritic1", "BAFC_nCritic8"])
+        for label, expected_fragment in (
+                ("RLPD", "critic_utd10"),
+                ("BAFC_nCritic1", "num_sampled_critic1"),
+                ("BAFC_nCritic8", "num_sampled_critic8")):
+            self.assertEqual([os.path.basename(path)
+                              for path in hopper[label]],
+                             ["seed_0", "seed_2", "seed_3"])
+            self.assertIn(expected_fragment, hopper[label][0])
+
+        aggregate = groups["humanoid_reweight"]
+        self.assertEqual(list(aggregate), ["RLPD", "BAFCv3_TR2_reweight"])
+        self.assertEqual(len(aggregate["RLPD"]), 4)
+        self.assertEqual(len(aggregate["BAFCv3_TR2_reweight"]), 4)
+        self.assertTrue(all("server4" in path for path in
+                            aggregate["BAFCv3_TR2_reweight"]))
+
+        individual = groups["humanoid_reweight_individual"]
+        self.assertEqual(len(individual), 8)
+        self.assertTrue(all(len(run_dirs) == 1
+                            for run_dirs in individual.values()))
+
+        seed0 = groups["hopper_hop_seed0_v7"]
+        self.assertEqual(list(seed0), ["BAFCv7", "RLPD",
+                                      "BAFC_nCritic1", "BAFC_nCritic8"])
+        self.assertTrue(all(len(run_dirs) == 1
+                            for run_dirs in seed0.values()))
+        self.assertIn("lambda010", seed0["BAFCv7"][0])
 
     def test_focused_colors_swap_rlpd_and_ours(self):
         self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["RLPD"],

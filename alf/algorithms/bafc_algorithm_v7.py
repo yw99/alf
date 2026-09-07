@@ -66,7 +66,6 @@ BafcV7LossInfo = namedtuple(
     "BafcV7LossInfo", ["actor", "critic"], default_value=())
 
 
-_CHECKPOINT_REVISION = 3
 _POLICY_FEATURE_MODE_IDS = {
     "mean_log_std": 0,
     "action_quantiles": 1,
@@ -319,9 +318,6 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
 
     def _save_runtime_state(self, destination, prefix):
         destination[self._runtime_key(
-            prefix, "revision")] = torch.tensor(
-                _CHECKPOINT_REVISION, dtype=torch.int64)
-        destination[self._runtime_key(
             prefix, "policy_feature_mode")] = torch.tensor(
                 _POLICY_FEATURE_MODE_IDS[self._policy_feature_mode],
                 dtype=torch.int64)
@@ -360,28 +356,13 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
                               error_msgs,
                               visited=None):
         runtime_state = self._pop_runtime_state(state_dict, prefix)
-        revision = runtime_state.get("revision")
-        if revision is None:
+        saved_mode_value = runtime_state.get("policy_feature_mode")
+        if saved_mode_value is None:
             if self._policy_feature_mode != "mean_log_std":
                 raise RuntimeError(
-                    "An unmarked legacy BAFCv7 checkpoint can only be loaded "
-                    "with policy_feature_mode='mean_log_std'.")
+                    "A BAFCv7 checkpoint without a policy feature mode can "
+                    "only be loaded with policy_feature_mode='mean_log_std'.")
         else:
-            saved_revision = int(revision.reshape(()).item())
-            if saved_revision == 2:
-                raise RuntimeError(
-                    "BAFCv7 entropy revision-2 checkpoints are incompatible "
-                    "with entropy-free revision 3. Start a fresh run.")
-            if saved_revision != _CHECKPOINT_REVISION:
-                raise RuntimeError(
-                    f"Unsupported BAFCv7 checkpoint revision "
-                    f"{saved_revision}; expected revision "
-                    f"{_CHECKPOINT_REVISION}.")
-            saved_mode_value = runtime_state.get("policy_feature_mode")
-            if saved_mode_value is None:
-                raise RuntimeError(
-                    "BAFCv7 revision-3 checkpoint is missing its encoded "
-                    "policy_feature_mode.")
             saved_mode_id = int(saved_mode_value.reshape(()).item())
             configured_mode_id = _POLICY_FEATURE_MODE_IDS[
                 self._policy_feature_mode]
