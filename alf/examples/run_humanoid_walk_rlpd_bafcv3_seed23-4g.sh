@@ -1,6 +1,7 @@
 #!/bin/bash
 # Launch the humanoid:walk RLPD/BAFCv3/BAFCv3_TR2 comparison on seeds 2 and 3.
-# Every job uses all four configured GPUs through DDP. The six jobs run in
+# By default each job uses four GPUs through DDP. --worker-gpus enables
+# explicit worker placement, including sharing GPUs. The six jobs run in
 # parallel on unique torch.distributed master ports.
 #
 # Conditions:
@@ -13,6 +14,8 @@
 #   -d, --dir BASE_DIR       Base results directory (default: /workspace/alf_results)
 #   -n, --steps NUM_STEPS    Total environment steps per job (default: 600000)
 #       --gpus CSV           Comma-separated GPU ids (default: 0,1,2,3)
+#       --worker-gpus CSV    Logical GPU index per DDP rank (default: auto)
+#                            Use auto for legacy allocation
 #       --checkpoints N      Number of checkpoints (default: 10)
 #       --base-port PORT     First DDP master port (default: 29500)
 #       --dry-run            Print commands without launching jobs
@@ -40,6 +43,7 @@ BASE_DIR="/workspace/alf_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
 GPUS="0,1,2,3"
+WORKER_GPUS="auto"
 BASE_PORT=29500
 DRY_RUN=False
 SEEDS=(2 3)
@@ -82,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpus)
             GPUS="$2"
+            shift 2
+            ;;
+        --worker-gpus)
+            WORKER_GPUS="$2"
             shift 2
             ;;
         --checkpoints)
@@ -132,6 +140,29 @@ if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + 5 > 65535 )); then
     exit 1
 fi
 
+WORKER_ARGS=()
+IFS=',' read -r -a GPU_IDS <<< "${GPUS}"
+NUM_WORKERS=${#GPU_IDS[@]}
+if [[ "${WORKER_GPUS}" != "auto" ]]; then
+    if [[ ! "${WORKER_GPUS}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "--worker-gpus must be logical GPU indices such as 0,1,2,0, or auto" >&2
+        exit 1
+    fi
+    IFS=',' read -r -a WORKER_IDS <<< "${WORKER_GPUS}"
+    for worker_gpu in "${WORKER_IDS[@]}"; do
+        # Reject overlong indices before arithmetic to avoid shell overflow.
+        if [[ ${#worker_gpu} -gt 8 ]] || (( 10#${worker_gpu} >= ${#GPU_IDS[@]} )); then
+            echo "--worker-gpus index ${worker_gpu} is outside --gpus ${GPUS}" >&2
+            exit 1
+        fi
+    done
+    NUM_WORKERS=${#WORKER_IDS[@]}
+    WORKER_ARGS=(--worker_gpus "${WORKER_GPUS}")
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+    export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+fi
+
 ENV_DIR="${ENV_NAME%%:*}"
 ROOT_DIR="${BASE_DIR}/${ENV_DIR}/rlpd_bafcv3_tr2_comparison_seed23_4g"
 
@@ -142,7 +173,9 @@ Starting humanoid:walk RLPD/BAFCv3/BAFCv3_TR2 comparison
   Num env steps: ${NUM_ENV_STEPS}
   Num checkpoints: ${NUM_CHECKPOINTS}
   Seeds: ${SEEDS[*]}
-  GPUs per job: ${GPUS}
+  Physical GPUs per job: ${GPUS}
+  DDP workers per job: ${NUM_WORKERS}
+  Worker GPU mapping (logical indices): ${WORKER_GPUS}
   RLPD: critic_utd=${RLPD_CRITIC_UTD}
   BAFCv3_TR2 pairing off, random targets: critic_utd=${BAFCV3_CRITIC_UTD}, num_sampled_critic=${BAFCV3_NUM_SAMPLED_CRITICS}
   BAFCv3 pairing off, random targets: critic_utd=${BAFCV3_CRITIC_UTD}, num_sampled_critic=${BAFCV3_NUM_SAMPLED_CRITICS}
@@ -174,10 +207,15 @@ launch_job() {
         --conf_param "make_ddp_performer.find_unused_parameters=True"
         --conf_param "create_environment.env_name='${ENV_NAME}'"
         "$@"
+        "${WORKER_ARGS[@]}"
         --distributed multi-gpu
     )
 
     if [[ "${DRY_RUN}" == "True" ]]; then
+        if [[ "${WORKER_GPUS}" != "auto" ]]; then
+            printf 'OMP_NUM_THREADS=%q MKL_NUM_THREADS=%q OPENBLAS_NUM_THREADS=%q ' \
+                "${OMP_NUM_THREADS}" "${MKL_NUM_THREADS}" "${OPENBLAS_NUM_THREADS}"
+        fi
         printf 'CUDA_VISIBLE_DEVICES=%q MASTER_PORT=%q ' "${GPUS}" "${master_port}"
         printf '%q ' "${command[@]}"
         printf '> %q 2>&1 &\n' "${run_dir}/out.log"
@@ -255,7 +293,7 @@ echo ""
 if [[ "${DRY_RUN}" == "True" ]]; then
     echo "Dry run complete; no jobs were launched."
 else
-    echo "Launched six 4-GPU jobs: ${PIDS[*]}"
+    echo "Launched six jobs (${NUM_WORKERS} DDP workers each): ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
 fi
 echo "To monitor RLPD: tail -f ${ROOT_DIR}/rlpd/*/seed_*/out.log"

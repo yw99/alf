@@ -45,6 +45,14 @@ In case you have multiple GPUs on the machine and you would like to
 train with all of them, specify --distributed multi-gpu. This will use
 PyTorch's DistributedDataParallel for training.
 
+To keep four workers while sharing three visible GPUs on a single Linux host::
+
+    CUDA_VISIBLE_DEVICES=0,1,2 python -m alf.bin.train --conf CONFIG \
+        --root_dir RESULTS --distributed=multi-gpu --worker_gpus=0,1,2,0
+
+The mapping uses indices into CUDA_VISIBLE_DEVICES, not physical GPU IDs.
+Explicit mapping spawns every rank; omit it to retain the legacy launch path.
+
 If instead of Gin configuration file, you want to use ALF python conf file, then
 replace the "--gin_file" option with "--conf", and "--gin_param" with "--conf_param".
 
@@ -62,6 +70,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from alf.utils import common
+from alf.utils.worker_gpu import (resolve_worker_gpus, run_workers,
+                                 temporary_environment, report_worker_failure)
 from alf.utils.per_process_context import PerProcessContext
 import alf.utils.external_configurables
 from alf.trainers import policy_trainer
@@ -89,6 +99,12 @@ def _define_flags():
         "has num_gpus_per_ddp_worker gpus assigned to it. N will be CUDA_VISIBLE_DEVICES // num_gpus_per_ddp_worker. "
         "Therefore, CUDA_VISIBLE_DEVICES % num_gpu_per_group must be 0. "
         "Only used if distributed is set to multi-gpu.")
+    flags.DEFINE_string(
+        'worker_gpus', None,
+        'Optional logical GPU index per DDP rank, e.g. 0,1,2,0 shares GPU 0. '
+        'Indices refer to the original CUDA_VISIBLE_DEVICES order. Requires '
+        'single-host multi-gpu mode and num_gpus_per_ddp_worker=1. All ranks '
+        '(including rank 0) run in spawned processes in this mode.')
     flags.DEFINE_bool('as_remote_trainer', False,
                       'Whether to run in a remote trainer mode.')
     flags.DEFINE_bool('as_remote_unroller', False,
@@ -219,7 +235,8 @@ def training_worker(rank: int,
                     world_size: int,
                     conf_file: str,
                     root_dir: str,
-                    paras_queue: mp.Queue = None):
+                    paras_queue: mp.Queue = None,
+                    flags_parsed: bool = False):
     """An executable instance that trains and evaluate the algorithm
 
     Args:
@@ -230,14 +247,21 @@ def training_worker(rank: int,
         root_dir (str): Path to the directory for writing logs/summaries/checkpoints.
         paras_queue (Queue): a shared Queue for checking the consistency of model parameters
             in different worker processes, if multi-gpu training is used.
+        flags_parsed: whether the mapped entrypoint already initialized flags
+            and logging.
     """
     try:
-        _setup_logging(log_dir=root_dir, rank=rank)
+        if not flags_parsed:
+            _setup_logging(log_dir=root_dir, rank=rank)
+        if flags_parsed:
+            logging.info('DDP rank %d/%d, PID %d: GPU %s -> cuda:0', rank,
+                         world_size, os.getpid(),
+                         os.environ['CUDA_VISIBLE_DEVICES'])
         _setup_device()
         if world_size > 1:
             # Specialization for distributed mode
             # Recover the flags when spawned as a sub process
-            if rank > 0:
+            if rank > 0 and not flags_parsed:
                 _define_flags()
                 FLAGS(sys.argv, known_only=True)
                 FLAGS.mark_as_parsed()
@@ -262,21 +286,75 @@ def training_worker(rank: int,
         # Parse the configuration file, which will also implicitly bring up the environments.
         common.parse_conf_file(conf_file)
         _train(root_dir=root_dir, rank=rank, world_size=world_size)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
+        if flags_parsed:
+            report_worker_failure(e)
         pass
     except Exception as e:
+        if flags_parsed:
+            report_worker_failure(e)
         if world_size >= 1:
             # If the training worker is running as a process in multiprocessing
             # environment, this will make sure that the exception raised in this
             # particular process is captured and shown.
             logging.exception(f'{mp.current_process().name} - {e}')
         raise e
+    except BaseException as e:
+        if flags_parsed and (not isinstance(e, SystemExit)
+                             or e.code not in (None, 0)):
+            report_worker_failure(e)
+        raise
     finally:
         # Note that each training worker will have its own child processes
         # running the environments. In the case when training worker process
         # finishes earlier (e.g. when it raises an exception), it will hang
         # instead of quitting unless all child processes are killed.
-        alf.close_env()
+        try:
+            alf.close_env()
+        except BaseException as e:
+            if flags_parsed:
+                report_worker_failure(e)
+            raise
+
+
+def _mapped_training_worker(rank, world_size, conf_file, root_dir, paras_queue):
+    """Fresh-process entrypoint, including rank zero, for explicit GPU maps."""
+    _define_flags()
+    FLAGS(sys.argv, known_only=True)
+    FLAGS.mark_as_parsed()
+    logging.use_absl_handler()
+    _setup_logging(log_dir=root_dir, rank=rank)
+    device = os.environ.get('CUDA_VISIBLE_DEVICES')
+    try:
+        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+            raise RuntimeError('expected exactly one usable CUDA device')
+        torch.empty(1, device='cuda:0')
+        torch.cuda.synchronize()
+    except Exception as exc:
+        error = RuntimeError(
+            f'DDP rank {rank}, assigned GPU {device}: CUDA validation failed')
+        report_worker_failure(error)
+        logging.exception('%s', error)
+        raise error from exc
+    try:
+        training_worker(rank, world_size, conf_file, root_dir, paras_queue,
+                        flags_parsed=True)
+    except BaseException as exc:
+        report_worker_failure(exc)
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _train_with_worker_gpus(devices, conf_file, root_dir):
+    # Keep the existing Gloo rendezvous allocation. In particular, do not use
+    # NCCL: multiple ranks in this mode may share a physical GPU.
+    with common.get_unused_port(12355) as port:
+        with temporary_environment(MASTER_ADDR='localhost',
+                                   MASTER_PORT=str(port)):
+            run_workers(devices, _mapped_training_worker, (conf_file, root_dir),
+                        with_queue=True)
 
 
 def training_worker_multi_node(local_rank: int,
@@ -341,6 +419,13 @@ def training_worker_multi_node(local_rank: int,
 
 
 def main(_):
+    # Resolve only explicit mappings: legacy launches retain their behavior.
+    devices = None
+    if FLAGS.worker_gpus is not None:
+        devices = resolve_worker_gpus(
+            FLAGS.worker_gpus, os.environ.get('CUDA_VISIBLE_DEVICES'),
+            torch.cuda.device_count(), FLAGS.distributed,
+            FLAGS.num_gpus_per_ddp_worker)
     root_dir = common.abs_path(FLAGS.root_dir)
     os.makedirs(root_dir, exist_ok=True)
 
@@ -354,6 +439,10 @@ def main(_):
         common.generate_alf_snapshot(common.alf_root(), conf_file, root_dir)
 
     # FLAGS.distributed is guaranteed to be one of the possible values.
+    if devices is not None:
+        _train_with_worker_gpus(devices, conf_file, root_dir)
+        return
+
     if FLAGS.distributed == 'none':
         training_worker(rank=0,
                         world_size=1,
