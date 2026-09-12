@@ -18,6 +18,31 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
     def test_initial_eval_trust_threshold(self):
         self.assertEqual(plotter.INITIAL_EVAL_TRUST_THRESHOLD, 30.0)
 
+    def test_parse_args_accepts_one_or_more_tasks(self):
+        with mock.patch("sys.argv", [
+                "plotter", "--tasks", "dog_stand", "humanoid_run",
+                "--task", "dog"]):
+            args = plotter._parse_args()
+        self.assertEqual(args.tasks, ["dog_stand", "humanoid_run", "dog"])
+
+    def test_main_only_plots_selected_task_family(self):
+        args = SimpleNamespace(
+            tasks=["dog_trot"], workspace_root="/ws",
+            local_results_root="/local", server_copy_root="/server1",
+            server2_copy_root="/server2", server4_copy_root="/server4",
+            output_root="/plots")
+        with mock.patch.object(plotter, "_parse_args", return_value=args), \
+                mock.patch.object(plotter, "plot_average_return") as plot, \
+                mock.patch.object(plotter, "plot_eval_trust_over_max") as trust, \
+                mock.patch.object(plotter, "plot_raw_eval_trust_metric") as raw:
+            plotter.main()
+
+        self.assertEqual(plot.call_count, 2)
+        self.assertEqual([call.args[0] for call in plot.call_args_list],
+                         ["dog_trot", "dog_trot"])
+        trust.assert_not_called()
+        raw.assert_not_called()
+
     def test_aggregate_interpolates_over_overlap_with_population_std(self):
         curves = [
             plotter.ScalarCurve(np.array([0., 2., 4.]),
@@ -57,7 +82,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
 
     def test_run_mapping_separates_four_seed_and_seed01_groups(self):
         groups = plotter.build_run_groups("/ws", "/local", "/server1",
-                                          "/server2")
+                                          "/server2", "/server4")
         for env in ("dog", "dog_fetch", "humanoid"):
             for label in ("RLPD", "BAFCv3", "BAFC_TR"):
                 self.assertEqual(len(groups[env][label]), 4)
@@ -78,6 +103,16 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertEqual(set(groups["dog_trot"]), {"RLPD", "BAFCv3"})
         for run_dirs in groups["dog_trot"].values():
             self.assertEqual(len(run_dirs), 4)
+        self.assertEqual(set(groups["dog_stand"]), {"RLPD", "BAFCv3"})
+        self.assertTrue(all("server1" in path for path in
+                            groups["dog_stand"]["RLPD"]))
+        self.assertTrue(all("server2" in path for path in
+                            groups["dog_stand"]["BAFCv3"]))
+        self.assertEqual(set(groups["humanoid_run"]), {"RLPD", "BAFCv3"})
+        self.assertTrue(all("server4" in path for path in
+                            groups["humanoid_run"]["RLPD"]))
+        for run_dirs in groups["humanoid_run"].values():
+            self.assertEqual(len(run_dirs), 4)
         self.assertEqual(
             set(groups["humanoid_seed01"]),
             {"RLPD", "BAFCv3", "BAFC_TR", "BAFCv6"})
@@ -88,12 +123,12 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
 
     def test_rlpd_ours_mapping_uses_requested_tasks_and_hopper_utds(self):
         groups = plotter.build_rlpd_ours_run_groups(
-            "/ws", "/local", "/server1", "/server2")
+            "/ws", "/local", "/server1", "/server2", "/server4")
         self.assertEqual(
-            set(groups), {"dog_fetch", "dog_run", "dog_trot", "dog",
-                          "humanoid", "hopper_hop"})
-        for env in ("dog_fetch", "dog_run", "dog_trot", "dog",
-                    "humanoid"):
+            set(groups), {"dog_fetch", "dog_run", "dog_stand", "dog_trot",
+                          "dog", "humanoid", "humanoid_run", "hopper_hop"})
+        for env in ("dog_fetch", "dog_run", "dog_stand", "dog_trot",
+                    "dog", "humanoid", "humanoid_run"):
             self.assertEqual(list(groups[env]), ["Ours", "RLPD"])
             self.assertNotIn("BAFCv6", groups[env])
             for run_dirs in groups[env].values():
@@ -140,17 +175,20 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
                             for run_dirs in individual.values()))
 
         seed0 = groups["hopper_hop_seed0_v7"]
-        self.assertEqual(list(seed0), ["BAFCv7", "RLPD",
-                                      "BAFC_nCritic1", "BAFC_nCritic8"])
+        self.assertEqual(list(seed0), ["BAFCv7", "RLPD", "Ours"])
         self.assertTrue(all(len(run_dirs) == 1
                             for run_dirs in seed0.values()))
         self.assertIn("lambda010", seed0["BAFCv7"][0])
+        self.assertIn("num_sampled_critic1", seed0["Ours"][0])
 
-    def test_focused_colors_swap_rlpd_and_ours(self):
+    def test_focused_colors_match_standard_algorithm_colors(self):
         self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["RLPD"],
-                         plotter.ALGORITHM_COLORS["Ours"])
-        self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["Ours"],
                          plotter.ALGORITHM_COLORS["RLPD"])
+        self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["Ours"],
+                         plotter.ALGORITHM_COLORS["Ours"])
+        self.assertEqual(plotter.ALGORITHM_COLORS["Ours"], "tab:blue")
+        self.assertEqual(plotter.ALGORITHM_COLORS["BAFCv3"], "tab:blue")
+        self.assertEqual(plotter.ALGORITHM_COLORS["RLPD"], "tab:orange")
 
     def test_environment_step_formatter_uses_k_suffix(self):
         self.assertEqual(plotter._format_environment_steps(0, None), "0")
