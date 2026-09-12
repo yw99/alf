@@ -1,12 +1,12 @@
 #!/bin/bash
-# Launch humanoid:run RLPD jobs on seeds 0, 1, 2, and 3. Every job uses
+# Launch humanoid:stand RLPD jobs on seeds 0, 1, 2, and 3. Every job uses
 # all four configured GPUs through DDP. The four jobs run in parallel on
 # unique torch.distributed master ports.
 #
 # This preserves the RLPD settings from
 # run_humanoid_walk_rlpd_bafcv3_seed23-4g.sh.
 #
-# Usage: bash run_humanoid_run_rlpd_seed0123-4g.sh [options]
+# Usage: bash run_humanoid_stand_rlpd_seed0123-4g.sh [options]
 #   -d, --dir BASE_DIR       Base results directory (default: /workspace/alf_results)
 #   -n, --steps NUM_STEPS    Total environment steps per job (default: 600000)
 #       --gpus CSV           Comma-separated GPU ids (default: 0,1,2,3)
@@ -16,7 +16,7 @@
 #   -h, --help               Show this help message
 #
 # Example:
-#   bash run_humanoid_run_rlpd_seed0123-4g.sh --dry-run
+#   bash run_humanoid_stand_rlpd_seed0123-4g.sh --dry-run
 
 set -euo pipefail
 
@@ -28,7 +28,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONF_FILE="${SCRIPT_DIR}/rlpd_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
-ENV_NAME="humanoid:run"
+ENV_NAME="humanoid:stand"
 BASE_DIR="/workspace/alf_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
@@ -104,7 +104,7 @@ if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + 3 > 65535 )); then
     exit 1
 fi
 
-ROOT_DIR="${BASE_DIR}/humanoid_run/rlpd_seed0123_4g_rerun_20260908/critic_utd${CRITIC_UTD}"
+ROOT_DIR="${BASE_DIR}/humanoid_stand/rlpd_seed0123_4g_rerun_20260908/critic_utd${CRITIC_UTD}"
 
 # Refuse to resume into or overwrite an existing experiment. Check every seed
 # before launching any jobs so a collision cannot result in a partial launch.
@@ -120,7 +120,7 @@ if [[ "${DRY_RUN}" != "True" ]]; then
 fi
 
 cat <<EOF
-Starting humanoid:run RLPD seeds 0, 1, 2, and 3
+Starting humanoid:stand RLPD seeds 0, 1, 2, and 3
   Environment: ${ENV_NAME}
   Root dir: ${ROOT_DIR}
   Num env steps: ${NUM_ENV_STEPS}
@@ -175,7 +175,7 @@ echo ""
 if [[ "${DRY_RUN}" == "True" ]]; then
     echo "Dry run complete; no jobs were launched."
 else
-    echo "Launched four humanoid:run RLPD 4-GPU jobs: ${PIDS[*]}"
+    echo "Launched four humanoid:stand RLPD 4-GPU jobs: ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
 fi
 echo "To monitor: tail -f ${ROOT_DIR}/seed_*/out.log"

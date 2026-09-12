@@ -47,7 +47,7 @@ BAFCV3_NUM_SAMPLED_CRITICS=8
 BAFCV3_NUM_SAMPLED_CRITIC_TARGETS=1
 BAFCV3_ACTOR_USE_LN=False
 BAFCV3_DEBUG_SUMMARIES=True
-TR2_EVAL_TRUST_MAX=30.0
+TR2_EVAL_TRUST_MAX=8.0
 TR2_EVAL_TRUST_MAX_DECAY=True
 TR2_NUM_FEATURE_COORDS=4
 TR2_METRIC_INTERVAL=8
@@ -126,7 +126,20 @@ fi
 
 ENV_DIR="${ENV_NAME%%:*}"
 ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_tr2_reweight_seed0123_4g"
-CONDITION="fixed_pairingFalse_num_sampled_critic${BAFCV3_NUM_SAMPLED_CRITICS}/critic_utd${BAFCV3_CRITIC_UTD}"
+CONDITION="eval_trust_max${TR2_EVAL_TRUST_MAX}_decay${TR2_EVAL_TRUST_MAX_DECAY}/fixed_pairingFalse_num_sampled_critic${BAFCV3_NUM_SAMPLED_CRITICS}/critic_utd${BAFCV3_CRITIC_UTD}"
+
+# Refuse to resume into or overwrite an existing experiment. Check every seed
+# before launching any jobs so a collision cannot result in a partial launch.
+if [[ "${DRY_RUN}" != "True" ]]; then
+    for seed in "${SEEDS[@]}"; do
+        run_dir="${ROOT_DIR}/${CONDITION}/seed_${seed}"
+        if [[ -e "${run_dir}" || -L "${run_dir}" ]]; then
+            echo "Refusing to reuse existing run directory: ${run_dir}" >&2
+            echo "Change the experiment settings/path or move the existing directory." >&2
+            exit 1
+        fi
+    done
+fi
 
 cat <<EOF
 Starting humanoid:walk BAFCv3_TR2 critic-reweighting seeds 0, 1, 2, and 3
