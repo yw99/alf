@@ -1,9 +1,8 @@
 # BAFCv7 Stochastic Actor with Episode Seed Sampling
 
-## Revision 3 selectable fingerprints (current)
+## Selectable policy fingerprints (current)
 
-BAFCv7 uses the original entropy-free BAFC actor and critic objectives and
-supports two deterministic policy fingerprints:
+BAFCv7 supports two deterministic policy fingerprints:
 
 - `mean_log_std` (the default) uses `[mu, log_sigma]` with width
   `2 * action_dim`.
@@ -13,14 +12,10 @@ supports two deterministic policy fingerprints:
 Both modes support base-policy and seed-conditioned encodings. Quantile
 construction uses the projection distribution's exact tanh/affine transforms
 without detaching, so functional actor gradients reach both projection heads.
-There is no entropy actor loss, entropy critic reward, learned temperature, or
-log-probability training state.
 
-Revision-3 checkpoints encode the fingerprint mode and load only into the same
-mode. Unmarked pre-entropy checkpoints remain loadable in `mean_log_std` mode;
-unmarked checkpoints in `action_quantiles`, mode-mismatched revision-3
-checkpoints, and entropy revision-2 checkpoints are rejected before tensor
-loading. New launchers write under
+Checkpoints encode the fingerprint mode and load only into the same mode.
+Older checkpoints without a mode remain loadable under `mean_log_std`; they
+are rejected under `action_quantiles`. New launchers write under
 `hopper_hop/bafcv7_policy_features_4g/{mode}`.
 
 ## Purpose
@@ -30,7 +25,7 @@ implementation and adding stochastic Gaussian actors with fixed per-episode
 seeds. BAFCv7 must be isolated from BAFCv3 and all existing algorithms and
 experiments.
 
-## Revision 1 implementation status (historical)
+## Implementation status
 
 The design is implemented in isolated BAFCv7 files:
 
@@ -56,8 +51,8 @@ The implementation compares two interpretations of seed sampling:
    policy.
 
 Initial collection remains the current independent uniform random action
-process. This version does not add correlated initial collection, OU/AR seed
-evolution, SAC entropy rewards, log-probability losses, or temperature learning.
+process. This version does not add correlated initial collection or OU/AR seed
+evolution.
 
 ## Existing network support
 
@@ -330,9 +325,7 @@ preferred representation for several reasons:
    change in `sigma` has equal spacing in log space.
 3. Very small standard deviations remain distinguishable instead of being
    compressed close to zero.
-4. Gaussian entropy, log density, and KL-related expressions naturally depend
-   on `log_sigma`.
-5. Seed conditioning becomes `log_sigma_e = log_sigma + log(lambda)`.
+4. Seed conditioning becomes `log_sigma_e = log_sigma + log(lambda)`.
 
 No information is lost by this choice. The log scale must remain clipped or be
 computed after clamping `sigma` to avoid negative infinity.
@@ -363,7 +356,7 @@ must remain in replay to reconstruct that encoding and sample its actions.
 
 ## Actor update
 
-The initial implementation optimizes expected return without an entropy term.
+The actor optimizes expected return.
 
 ### Variant 1: ensemble actors and base-policy objective
 
@@ -666,7 +659,7 @@ Do not modify:
 - `alf/algorithms/bafc_algorithm_v3.py`;
 - `ActorProjectionFCNetwork` behavior;
 - `NormalProjectionNetwork` behavior;
-- existing BAFC, SAC, or RLPD configuration files;
+- existing BAFC or RLPD configuration files;
 - existing experiment launchers.
 
 Import BAFCv7 classes directly from the new experiment configuration rather
@@ -734,8 +727,7 @@ The config deliberately has no default environment. The launcher supplies
 - state-dependent Normal standard deviation and existing DMC clipping;
 - observation normalization;
 - checkpointed replay buffers in variant-specific directories;
-- independent uniform initial collection;
-- no entropy reward or temperature optimization.
+- independent uniform initial collection.
 
 Create a dedicated four-GPU launcher for the two variants and four seeds. It
 must support `--dry-run`, use unique DDP ports, and place results in paths that
@@ -808,13 +800,10 @@ reuse a BAFCv3 result directory or checkpoint.
   parameters, actor-token widths, rollout state, and replay information differ.
 - The two BAFCv7 variants also have different actor counts and must use separate
   result and checkpoint directories.
-- Revision-3 checkpoints store the selected fingerprint mode and reject a
-  different configured mode before parameter tensor loading.
-- Unmarked pre-entropy checkpoints are treated as legacy `mean_log_std`
-  checkpoints. They load only in that default mode, which preserves existing
-  legacy-run resumability.
-- Entropy revision-2 and other unsupported revisions fail with explicit
-  compatibility errors. Actor features are never truncated, and seed state is
+- Checkpoints store the selected fingerprint mode and reject a different
+  configured mode before parameter tensor loading.
+- Older checkpoints without a fingerprint mode load only under the default
+  `mean_log_std` mode. Actor features are never truncated, and seed state is
   never silently dropped.
 - Runtime episode seeds and actor IDs belong in ALF algorithm state so they are
   handled consistently by rollout and checkpoint state mechanisms.
@@ -823,7 +812,6 @@ reuse a BAFCv3 result directory or checkpoint.
 
 - Correlated or marginally uniform initial collection.
 - OU/AR evolution of the episode seed.
-- Entropy rewards, learned temperature, or other SAC objective terms.
 - Beta, categorical, Gumbel, or Dirichlet seeded policies.
 - Dynamic or reordered action spaces requiring semantic action-ID mappings.
 - More than one actor in fully seed-conditioned training.
