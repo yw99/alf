@@ -19,6 +19,10 @@ set -euo pipefail
 
 # Use headless EGL rendering for dm_control unless explicitly overridden.
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+# Limit CPU thread pools across concurrent DDP workers unless explicitly overridden.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 # Use deterministic CUBLAS workspace for reproducibility unless explicitly overridden.
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 
@@ -112,6 +116,7 @@ Starting SAC on dog:walk for seeds 0, 1, 2, and 3
   Num checkpoints: ${NUM_CHECKPOINTS}
   Seeds: ${SEEDS[*]}
   GPUs per seed: ${GPUS}
+  CPU threads: OMP=${OMP_NUM_THREADS}, MKL=${MKL_NUM_THREADS}, OpenBLAS=${OPENBLAS_NUM_THREADS}
   Dry run: ${DRY_RUN}
 EOF
 echo ""
@@ -137,6 +142,8 @@ for i in "${!SEEDS[@]}"; do
     )
 
     if [[ "${DRY_RUN}" == "True" ]]; then
+        printf 'OMP_NUM_THREADS=%q MKL_NUM_THREADS=%q OPENBLAS_NUM_THREADS=%q ' \
+            "${OMP_NUM_THREADS}" "${MKL_NUM_THREADS}" "${OPENBLAS_NUM_THREADS}"
         printf 'CUDA_VISIBLE_DEVICES=%q MASTER_PORT=%q ' "${GPUS}" "${MASTER_PORT}"
         printf '%q ' "${COMMAND[@]}"
         printf '> %q 2>&1 &\n' "${RUN_DIR}/out.log"
