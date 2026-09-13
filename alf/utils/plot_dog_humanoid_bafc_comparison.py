@@ -14,8 +14,9 @@
 
 """Plot selected Dog and Humanoid tasks plus Hopper Hop BAFC experiments.
 
-The experiment selection intentionally combines runs copied from several hosts
-with runs produced locally. Run from the repository root, for example::
+The experiment selection combines runs copied from four hosts. Server 3 runs
+use shorthand directories under <workspace-root>/server3_copy.
+Run from the repository root, for example::
 
     python alf/utils/plot_dog_humanoid_bafc_comparison.py
     python alf/utils/plot_dog_humanoid_bafc_comparison.py --task dog_trot
@@ -24,8 +25,8 @@ For each environment, the script writes an AverageReturn comparison, including
 BAFCv6 where runs are available. It also writes BAFC_TR trust diagnostics for
 the three environments with BAFC_TR runs, the two-seed Humanoid comparison,
 and focused BAFCv3-vs-RLPD AverageReturn plots for Dog Fetch, Dog Run,
-Dog Stand, Dog Trot, Dog Walk, Humanoid Walk, Humanoid Run, and
-Hopper Hop. Curves are aligned on
+Dog Stand, Dog Trot, Dog Walk, Humanoid Walk, Humanoid Run, Humanoid Stand,
+and Hopper Hop. Curves are aligned on
 their overlapping
 environment-step range, linearly interpolated, and plotted as the unsmoothed
 across-seed mean with a population +/-1 standard deviation band.
@@ -53,7 +54,7 @@ EVAL_TRUST_OVER_MAX_TAG = "BafcAlgorithmV3TR2/eval_trust_over_max"
 EVAL_TRUST_METRIC_TAG = "BafcAlgorithmV3TR2/eval_trust_metric"
 INITIAL_EVAL_TRUST_THRESHOLD = 30.0
 PLOT_TASKS = ("dog", "dog_fetch", "dog_run", "dog_stand", "dog_trot",
-              "humanoid", "humanoid_run", "hopper_hop")
+              "humanoid", "humanoid_run", "humanoid_stand", "hopper_hop")
 
 _PLOTTED_TAGS = (
     RETURN_TAG,
@@ -201,26 +202,7 @@ def build_run_groups(
     """Return the fixed experiment mapping, with every list ordered by seed."""
     server4_copy_root = server4_copy_root or os.path.join(
         workspace_root, "server4_copy")
-    dog_local = os.path.join(local_results_root, "dog",
-                             "rlpd_bafcv3_comparison_4g")
-    dog_tr = os.path.join(
-        dog_local, "bafcv3_tr2_no_cadence_trust_max_decay",
-        "fixed_pairingFalse_num_sampled_critic8", "critic_utd11")
-
-    hum_common = os.path.join(
-        local_results_root, "humanoid",
-        "bafcv3_eval_samples_rlpd_comparison_4g",
-        "num_actor_critic10_num_sampled_critics_for_actor8_"
-        "num_sampled_critic_targets1", "critic_utd11")
-    hum_bafcv3 = os.path.join(
-        local_results_root, "humanoid",
-        "bafcv3_eval_samples_comparison_v2_4g",
-        "num_actor_critic10_num_sampled_critics_for_actor8_"
-        "num_sampled_critic_targets1", "critic_utd11",
-        "bafcv3_trainable_eval_samples_random_target")
-    humanoid_run_bafcv3 = os.path.join(
-        local_results_root, "humanoid_run", "bafcv3_seed0123_4g",
-        "fixed_pairingFalse_num_sampled_critic8", "critic_utd11")
+    server3_copy_root = os.path.join(workspace_root, "server3_copy")
 
     groups = {
         "dog": {
@@ -239,7 +221,8 @@ def build_run_groups(
                              "dog_bafc_trainable_rtT_s%d" % seed)
                 for seed in (2, 3)
             ],
-            "BAFC_TR": [os.path.join(dog_tr, "seed_%d" % seed)
+            "BAFC_TR": [os.path.join(server3_copy_root,
+                                     "dog_walk_bafcv3_tr2_decay_s%d" % seed)
                         for seed in range(4)],
         },
         "dog_fetch": {
@@ -334,13 +317,14 @@ def build_run_groups(
         },
         "humanoid": {
             "RLPD": [
-                os.path.join(hum_common, "rlpd_default", "seed_%d" % seed)
+                os.path.join(server3_copy_root, "humanoid_walk_rlpd_s%d" % seed)
                 for seed in (0, 1)
             ] + [
                 os.path.join(server2_copy_root, "hum_rlpd_s%d" % seed)
                 for seed in (2, 3)
             ],
-            "BAFCv3": [os.path.join(hum_bafcv3, "seed_%d" % seed)
+            "BAFCv3": [os.path.join(server3_copy_root,
+                                    "humanoid_walk_bafcv3_rtT_s%d" % seed)
                        for seed in (0, 1)] + [
                            os.path.join(server2_copy_root,
                                         "hum_bafcv3_s%d" % seed)
@@ -363,16 +347,29 @@ def build_run_groups(
                 for seed in range(4)
             ],
             "BAFCv3": [
-                os.path.join(humanoid_run_bafcv3, "seed_%d" % seed)
+                os.path.join(server3_copy_root, "humanoid_run_bafcv3_rtT_s%d" % seed)
+                for seed in range(4)
+            ],
+        },
+        "humanoid_stand": {
+            "RLPD": [
+                os.path.join(server4_copy_root,
+                             "humanoid_stand_rlpd_s%d" % seed)
+                for seed in range(4)
+            ],
+            "BAFCv3": [
+                os.path.join(server_copy_root,
+                             "humanoid_stand_bafcv3_rtT_s%d" % seed)
                 for seed in range(4)
             ],
         },
         "humanoid_seed01": {
             "RLPD": [
-                os.path.join(hum_common, "rlpd_default", "seed_%d" % seed)
+                os.path.join(server3_copy_root, "humanoid_walk_rlpd_s%d" % seed)
                 for seed in (0, 1)
             ],
-            "BAFCv3": [os.path.join(hum_bafcv3, "seed_%d" % seed)
+            "BAFCv3": [os.path.join(server3_copy_root,
+                                    "humanoid_walk_bafcv3_rtT_s%d" % seed)
                        for seed in (0, 1)],
             "BAFC_TR": [
                 os.path.join(server_copy_root,
@@ -386,9 +383,8 @@ def build_run_groups(
             ],
         },
     }
-    # Keep this argument in the public builder so callers can provide one root
-    # and derive all defaults in the same way as the CLI.
-    del workspace_root
+    # Retained for compatibility; local_results_root now only sets output defaults.
+    del local_results_root
     return groups
 
 
@@ -399,22 +395,19 @@ def build_rlpd_ours_run_groups(
     """Return RLPD/Ours groups for the focused comparison plots.
 
     Dog Fetch, Dog Run, Dog Stand, Dog Trot, Dog Walk (``dog``), Humanoid
-    Walk (``humanoid``), and Humanoid Run use seeds 0--3. Hopper Hop uses
+    Walk (``humanoid``), Humanoid Run, and Humanoid Stand use seeds 0--3. Hopper Hop uses
     seeds 0--2, with BAFCv3 critic UTD 11 for seeds 0--1 and critic UTD 3 for seed 2.
     """
     existing = build_run_groups(workspace_root, local_results_root,
                                 server_copy_root, server2_copy_root,
                                 server4_copy_root)
 
-    hopper_root = os.path.join(local_results_root, "hopper_hop",
-                               "rlpd_bafcv3_comparison_4g")
-    hopper_rlpd = os.path.join(hopper_root, "rlpd", "critic_utd10")
-    hopper_bafcv3 = os.path.join(
-        hopper_root, "bafcv3", "fixed_pairingFalse_num_sampled_critic8")
+    server3_copy_root = os.path.join(workspace_root, "server3_copy")
     hopper_ours = [
-        os.path.join(hopper_bafcv3, "critic_utd11", "seed_%d" % seed)
+        os.path.join(server3_copy_root, "hopper_hop_bafcv3_nCritic8_utd11_s%d" % seed)
         for seed in (0, 1)
-    ] + [os.path.join(hopper_bafcv3, "critic_utd3", "seed_2")]
+    ] + [os.path.join(server3_copy_root,
+                      "hopper_hop_bafcv3_nCritic8_utd3_focused_s2")]
 
     return {
         "dog_fetch": {
@@ -445,10 +438,14 @@ def build_rlpd_ours_run_groups(
             "Ours": existing["humanoid_run"]["BAFCv3"],
             "RLPD": existing["humanoid_run"]["RLPD"],
         },
+        "humanoid_stand": {
+            "Ours": existing["humanoid_stand"]["BAFCv3"],
+            "RLPD": existing["humanoid_stand"]["RLPD"],
+        },
         "hopper_hop": {
             "Ours": hopper_ours,
             "RLPD": [
-                os.path.join(hopper_rlpd, "seed_%d" % seed)
+                os.path.join(server3_copy_root, "hopper_hop_rlpd_s%d" % seed)
                 for seed in (0, 1, 2)
             ],
         },
@@ -463,18 +460,7 @@ def build_additional_run_groups(
     existing = build_run_groups(workspace_root, local_results_root,
                                 server_copy_root, server2_copy_root,
                                 server4_copy_root)
-    hopper_root = os.path.join(local_results_root, "hopper_hop",
-                               "rlpd_bafcv3_comparison_4g")
-    hopper_rlpd = os.path.join(hopper_root, "rlpd", "critic_utd10")
-    hopper_bafcv3 = os.path.join(hopper_root, "bafcv3")
-    ncritic_suffix = os.path.join("critic_utd3",
-                                  "num_updates_per_train_iter12")
-    hopper_ncritic1 = os.path.join(
-        hopper_bafcv3, "fixed_pairingFalse_num_sampled_critic1",
-        ncritic_suffix)
-    hopper_ncritic8 = os.path.join(
-        hopper_bafcv3, "fixed_pairingFalse_num_sampled_critic8",
-        ncritic_suffix)
+    server3_copy_root = os.path.join(workspace_root, "server3_copy")
     hopper_seeds = (0, 2, 3)
 
     humanoid_reweight = [
@@ -491,15 +477,17 @@ def build_additional_run_groups(
     return {
         "hopper_hop_ncritic": {
             "RLPD": [
-                os.path.join(hopper_rlpd, "seed_%d" % seed)
+                os.path.join(server3_copy_root, "hopper_hop_rlpd_s%d" % seed)
                 for seed in hopper_seeds
             ],
             "BAFC_nCritic1": [
-                os.path.join(hopper_ncritic1, "seed_%d" % seed)
+                os.path.join(server3_copy_root,
+                             "hopper_hop_bafcv3_nCritic1_utd3_updates12_s%d" % seed)
                 for seed in hopper_seeds
             ],
             "BAFC_nCritic8": [
-                os.path.join(hopper_ncritic8, "seed_%d" % seed)
+                os.path.join(server3_copy_root,
+                             "hopper_hop_bafcv3_nCritic8_utd3_updates12_s%d" % seed)
                 for seed in hopper_seeds
             ],
         },
@@ -514,8 +502,9 @@ def build_additional_run_groups(
                     server_copy_root,
                     "hopper_hop_bafcv7_ensemble_base_lambda010_s0")
             ],
-            "RLPD": [os.path.join(hopper_rlpd, "seed_0")],
-            "Ours": [os.path.join(hopper_ncritic1, "seed_0")],
+            "RLPD": [os.path.join(server3_copy_root, "hopper_hop_rlpd_s0")],
+            "Ours": [os.path.join(server3_copy_root,
+                                  "hopper_hop_bafcv3_nCritic1_utd3_updates12_s0")],
         },
     }
 
@@ -634,7 +623,8 @@ def _parse_args() -> argparse.Namespace:
               "Defaults to every task."))
     parser.add_argument("--workspace-root", default="/workspace")
     parser.add_argument("--local-results-root", default=None,
-                        help="Defaults to <workspace-root>/alf_results.")
+                        help="Output base directory; defaults to <workspace-root>/alf_results. "
+                             "Server 3 inputs use <workspace-root>/server3_copy.")
     parser.add_argument("--server-copy-root", default=None,
                         help="Defaults to <workspace-root>/server_copy.")
     parser.add_argument("--server2-copy-root", default=None,
@@ -674,7 +664,7 @@ def main() -> None:
         server2_copy_root, server4_copy_root)
 
     for env in ("dog", "dog_fetch", "dog_run", "dog_stand", "dog_trot",
-                "humanoid", "humanoid_run"):
+                "humanoid", "humanoid_run", "humanoid_stand"):
         if env in selected_tasks:
             plot_average_return(env, groups[env], output_root)
     for env in ("dog", "dog_fetch", "humanoid"):
@@ -691,7 +681,7 @@ def main() -> None:
             filename="humanoid_seed01_average_return_vs_env_steps.png")
 
     for env in ("dog_fetch", "dog_run", "dog_stand", "dog_trot", "dog",
-                "humanoid", "humanoid_run", "hopper_hop"):
+                "humanoid", "humanoid_run", "humanoid_stand", "hopper_hop"):
         if env not in selected_tasks:
             continue
         plot_average_return(

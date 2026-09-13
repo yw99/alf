@@ -20,10 +20,11 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
 
     def test_parse_args_accepts_one_or_more_tasks(self):
         with mock.patch("sys.argv", [
-                "plotter", "--tasks", "dog_stand", "humanoid_run",
+                "plotter", "--tasks", "dog_stand", "humanoid_stand",
                 "--task", "dog"]):
             args = plotter._parse_args()
-        self.assertEqual(args.tasks, ["dog_stand", "humanoid_run", "dog"])
+        self.assertEqual(args.tasks,
+                         ["dog_stand", "humanoid_stand", "dog"])
 
     def test_main_only_plots_selected_task_family(self):
         args = SimpleNamespace(
@@ -113,6 +114,13 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
                             groups["humanoid_run"]["RLPD"]))
         for run_dirs in groups["humanoid_run"].values():
             self.assertEqual(len(run_dirs), 4)
+        self.assertEqual(set(groups["humanoid_stand"]), {"RLPD", "BAFCv3"})
+        self.assertTrue(all("server4" in path for path in
+                            groups["humanoid_stand"]["RLPD"]))
+        self.assertTrue(all("server1" in path for path in
+                            groups["humanoid_stand"]["BAFCv3"]))
+        for run_dirs in groups["humanoid_stand"].values():
+            self.assertEqual(len(run_dirs), 4)
         self.assertEqual(
             set(groups["humanoid_seed01"]),
             {"RLPD", "BAFCv3", "BAFC_TR", "BAFCv6"})
@@ -126,9 +134,10 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
             "/ws", "/local", "/server1", "/server2", "/server4")
         self.assertEqual(
             set(groups), {"dog_fetch", "dog_run", "dog_stand", "dog_trot",
-                          "dog", "humanoid", "humanoid_run", "hopper_hop"})
+                          "dog", "humanoid", "humanoid_run",
+                          "humanoid_stand", "hopper_hop"})
         for env in ("dog_fetch", "dog_run", "dog_stand", "dog_trot",
-                    "dog", "humanoid", "humanoid_run"):
+                    "dog", "humanoid", "humanoid_run", "humanoid_stand"):
             self.assertEqual(list(groups[env]), ["Ours", "RLPD"])
             self.assertNotIn("BAFCv6", groups[env])
             for run_dirs in groups[env].values():
@@ -140,11 +149,11 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertEqual(list(hopper), ["Ours", "RLPD"])
         self.assertEqual(len(hopper["RLPD"]), 3)
         self.assertEqual(len(hopper["Ours"]), 3)
-        self.assertIn("critic_utd11", hopper["Ours"][0])
-        self.assertIn("critic_utd11", hopper["Ours"][1])
-        self.assertIn("critic_utd3", hopper["Ours"][2])
+        self.assertIn("nCritic8_utd11", hopper["Ours"][0])
+        self.assertIn("nCritic8_utd11", hopper["Ours"][1])
+        self.assertIn("nCritic8_utd3_focused", hopper["Ours"][2])
         for seed, path in enumerate(hopper["Ours"]):
-            self.assertEqual(os.path.basename(path), "seed_%d" % seed)
+            self.assertTrue(path.endswith("_s%d" % seed))
 
     def test_additional_run_mapping(self):
         groups = plotter.build_additional_run_groups(
@@ -154,12 +163,12 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertEqual(list(hopper),
                          ["RLPD", "BAFC_nCritic1", "BAFC_nCritic8"])
         for label, expected_fragment in (
-                ("RLPD", "critic_utd10"),
-                ("BAFC_nCritic1", "num_sampled_critic1"),
-                ("BAFC_nCritic8", "num_sampled_critic8")):
-            self.assertEqual([os.path.basename(path)
+                ("RLPD", "hopper_hop_rlpd"),
+                ("BAFC_nCritic1", "nCritic1_utd3_updates12"),
+                ("BAFC_nCritic8", "nCritic8_utd3_updates12")):
+            self.assertEqual([os.path.basename(path).rsplit("_", 1)[-1]
                               for path in hopper[label]],
-                             ["seed_0", "seed_2", "seed_3"])
+                             ["s0", "s2", "s3"])
             self.assertIn(expected_fragment, hopper[label][0])
 
         aggregate = groups["humanoid_reweight"]
@@ -179,7 +188,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertTrue(all(len(run_dirs) == 1
                             for run_dirs in seed0.values()))
         self.assertIn("lambda010", seed0["BAFCv7"][0])
-        self.assertIn("num_sampled_critic1", seed0["Ours"][0])
+        self.assertIn("nCritic1_utd3_updates12", seed0["Ours"][0])
 
     def test_focused_colors_match_standard_algorithm_colors(self):
         self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["RLPD"],
