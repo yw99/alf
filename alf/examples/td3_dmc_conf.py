@@ -24,6 +24,8 @@ from alf.optimizers import Adam
 
 alf.define_config('debug_mode', False)
 debug_mode = alf.get_config_value('debug_mode')
+alf.define_config('td3_critic_use_ln', False)
+critic_use_ln = alf.get_config_value('td3_critic_use_ln')
 
 # Enable find_unused_parameters for DDP (needed for multi-GPU training)
 alf.config('make_ddp_performer', find_unused_parameters=True)
@@ -53,7 +55,8 @@ actor_network_cls = partial(
 
 critic_network_cls = partial(
     alf.networks.CriticNetwork,
-    joint_fc_layer_params=hidden_layers)
+    joint_fc_layer_params=hidden_layers,
+    use_fc_ln=critic_use_ln)
 
 alf.config('Agent',
            optimizer=optimizer,

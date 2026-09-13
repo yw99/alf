@@ -92,6 +92,8 @@ class Td3Algorithm(OffPolicyAlgorithm):
                  ou_damping=0.15,
                  critic_loss_ctor=None,
                  num_critic_replicas=2,
+                 num_sampled_critic_targets: Optional[int] = None,
+                 actor_critic_aggregation: str = 'min',
                  target_update_tau=0.005,
                  target_update_period=1,
                  rollout_random_action=0.,
@@ -134,6 +136,11 @@ class Td3Algorithm(OffPolicyAlgorithm):
                 only useful if priority replay is enabled.
             num_critic_replicas (int): number of critics to be used. Default is 2
                 for TD3's twin critics.
+            num_sampled_critic_targets (int): number of target critics sampled
+                without replacement before taking their minimum. ``None`` uses
+                all critics, preserving standard TD3 behavior.
+            actor_critic_aggregation (str): how to aggregate critic values for
+                the actor update. Supported values are ``'min'`` and ``'mean'``.
             env (Environment): The environment to interact with. env is a batched
                 environment, which means that it runs multiple simulations
                 simultateously. ``env`` only needs to be provided to the root
@@ -233,6 +240,17 @@ class Td3Algorithm(OffPolicyAlgorithm):
 
         self._actor_network = actor_network
         self._num_critic_replicas = num_critic_replicas
+        if num_sampled_critic_targets is None:
+            num_sampled_critic_targets = num_critic_replicas
+        assert 1 <= num_sampled_critic_targets <= num_critic_replicas, (
+            "num_sampled_critic_targets must be between 1 and "
+            f"num_critic_replicas ({num_critic_replicas}), got "
+            f"{num_sampled_critic_targets}.")
+        assert actor_critic_aggregation in ('min', 'mean'), (
+            "actor_critic_aggregation must be either 'min' or 'mean', got "
+            f"{actor_critic_aggregation!r}.")
+        self._num_sampled_critic_targets = num_sampled_critic_targets
+        self._actor_critic_aggregation = actor_critic_aggregation
         self._critic_networks = critic_networks
 
         self._target_actor_network = actor_network.copy(
@@ -364,6 +382,8 @@ class Td3Algorithm(OffPolicyAlgorithm):
 
         target_q_values, target_critic_states = self._target_critic_networks(
             (inputs.observation, target_action), state=state.target_critics)
+        target_q_values = self._sample_critics(
+            target_q_values, self._num_sampled_critic_targets)
 
         if self.has_multidim_reward():
             sign = self.reward_weights.sign()
@@ -392,8 +412,10 @@ class Td3Algorithm(OffPolicyAlgorithm):
         if self.has_multidim_reward():
             # Multidimensional reward: [B, replicas, reward_dim]
             q_values = q_values * self.reward_weights
-        # min over replicas
-        q_value = q_values.min(dim=1)[0]
+        if self._actor_critic_aggregation == 'mean':
+            q_value = q_values.mean(dim=1)
+        else:
+            q_value = q_values.min(dim=1)[0]
 
         # This sum() will reduce all dims so q_value can be any rank
         dqda = nest_utils.grad(action, q_value.sum())
@@ -416,6 +438,15 @@ class Td3Algorithm(OffPolicyAlgorithm):
             loss=sum(nest.flatten(actor_loss)),
             extra=Td3ActorInfo(actor_loss=actor_loss))
         return AlgStep(output=action, state=state, info=info)
+
+    def _sample_critics(self, critic_values, num_sampled_critics):
+        """Sample critic replicas while keeping the batch dimension intact."""
+        if num_sampled_critics == self._num_critic_replicas:
+            return critic_values
+        critic_ids = torch.randperm(
+            self._num_critic_replicas,
+            device=critic_values.device)[:num_sampled_critics]
+        return critic_values.index_select(1, critic_ids)
 
     def _update_train_mode(self):
         """Update train mode based on actor/critic update counters."""

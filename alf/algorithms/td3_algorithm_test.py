@@ -30,10 +30,22 @@ from alf.networks import ActorNetwork, CriticNetwork
 
 class Td3AlgorithmTest(parameterized.TestCase, alf.test.TestCase):
     @parameterized.parameters(
-        dict(num_critic_replicas=1),
-        dict(num_critic_replicas=2),
+        dict(
+            num_critic_replicas=1,
+            num_sampled_critic_targets=None,
+            actor_critic_aggregation='min'),
+        dict(
+            num_critic_replicas=2,
+            num_sampled_critic_targets=None,
+            actor_critic_aggregation='min'),
+        dict(
+            num_critic_replicas=3,
+            num_sampled_critic_targets=1,
+            actor_critic_aggregation='mean'),
     )
-    def test_td3_algorithm(self, num_critic_replicas):
+    def test_td3_algorithm(self, num_critic_replicas,
+                           num_sampled_critic_targets,
+                           actor_critic_aggregation):
         """Test TD3 algorithm with different number of critic replicas."""
         num_env = 128
         steps_per_episode = 13
@@ -69,6 +81,8 @@ class Td3AlgorithmTest(parameterized.TestCase, alf.test.TestCase):
             env=env,
             config=config,
             num_critic_replicas=num_critic_replicas,
+            num_sampled_critic_targets=num_sampled_critic_targets,
+            actor_critic_aggregation=actor_critic_aggregation,
             target_noise_stddev=0.2,
             target_noise_clip=0.5,
             actor_optimizer=alf.optimizers.Adam(lr=1e-2),
@@ -124,6 +138,25 @@ class Td3AlgorithmTest(parameterized.TestCase, alf.test.TestCase):
 
         for _ in range(5):
             alg.train_iter()
+
+    def test_sample_one_critic(self):
+        """Sampling keeps one complete critic column across the batch."""
+        config = TrainerConfig(root_dir="dummy")
+        env = PolicyUnittestEnv(
+            2, 3, action_type=ActionType.Continuous)
+        alg = Td3Algorithm(
+            observation_spec=env._observation_spec,
+            action_spec=env._action_spec,
+            env=env,
+            config=config,
+            num_critic_replicas=3,
+            num_sampled_critic_targets=1,
+            actor_critic_aggregation='mean')
+
+        critic_values = torch.tensor([[1., 2., 3.], [11., 12., 13.]])
+        sampled = alg._sample_critics(critic_values, 1)
+        self.assertEqual(sampled.shape, (2, 1))
+        self.assertEqual((sampled[1] - sampled[0]).item(), 10.)
 
 
 if __name__ == '__main__':
