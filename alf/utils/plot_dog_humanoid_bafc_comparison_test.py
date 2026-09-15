@@ -183,7 +183,10 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
                           "humanoid_stand", "hopper_hop"})
         for env in ("dog_fetch", "dog_run", "dog_stand", "dog_trot",
                     "dog", "humanoid", "humanoid_run", "humanoid_stand"):
-            self.assertEqual(list(groups[env]), ["Ours", "RLPD"])
+            expected = ["Ours", "RLPD"]
+            if env == "humanoid":
+                expected.append("TD3+")
+            self.assertEqual(list(groups[env]), expected)
             self.assertNotIn("BAFCv6", groups[env])
             for run_dirs in groups[env].values():
                 self.assertEqual(len(run_dirs), 4)
@@ -236,7 +239,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertIn("nCritic1_utd3_updates12", seed0["Ours"][0])
 
     def test_focused_colors_match_standard_algorithm_colors(self):
-        self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["RLPD"],
+        self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["SAC+"],
                          plotter.ALGORITHM_COLORS["RLPD"])
         self.assertEqual(plotter.FOCUSED_ALGORITHM_COLORS["Ours"],
                          plotter.ALGORITHM_COLORS["Ours"])

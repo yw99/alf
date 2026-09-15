@@ -24,10 +24,12 @@ Run from the repository root, for example::
 For each environment, the script writes an AverageReturn comparison, including
 BAFCv6 where runs are available. It also writes BAFC_TR trust diagnostics for
 the three environments with BAFC_TR runs, the two-seed Humanoid comparison,
-and focused BAFCv3-vs-RLPD AverageReturn plots for Dog Fetch, Dog Run,
+and focused Ours-vs-SAC+ AverageReturn plots for Dog Fetch, Dog Run,
 Dog Stand, Dog Trot, Dog Walk, Humanoid Walk, Humanoid Run, Humanoid Stand,
 and Hopper Hop. Additional SAC/TD3/SAC+ comparisons use seeds 0--2,
-with TD3v2 labeled TD3 and RLPD labeled SAC+. SAC and TD3v2 are discovered
+with TD3v2 labeled TD3 and RLPD labeled SAC+. Humanoid Walk also includes
+TD3 from server8_copy, labeled TD3+, using seeds 0--3 in the focused
+comparison and seeds 0--2 in the baseline comparison. SAC and TD3v2 are discovered
 across server copies; the longest named training budget with all three seeds
 is preferred. Unavailable three-seed curves are reported and omitted.
 Curves are aligned on
@@ -85,10 +87,12 @@ BASELINE_ALGORITHM_COLORS = {
     "SAC": "tab:green",
     "TD3": "tab:red",
     "SAC+": ALGORITHM_COLORS["RLPD"],
+    "TD3+": "tab:purple",
 }
 
 FOCUSED_ALGORITHM_COLORS = {
-    "RLPD": ALGORITHM_COLORS["RLPD"],
+    "SAC+": ALGORITHM_COLORS["RLPD"],
+    "TD3+": BASELINE_ALGORITHM_COLORS["TD3+"],
     "Ours": ALGORITHM_COLORS["Ours"],
 }
 
@@ -404,7 +408,7 @@ def build_rlpd_ours_run_groups(
         workspace_root: str, local_results_root: str, server_copy_root: str,
         server2_copy_root: str,
         server4_copy_root: str | None = None) -> dict[str, dict[str, list[str]]]:
-    """Return RLPD/Ours groups for the focused comparison plots.
+    """Return RLPD/Ours groups, plus Humanoid Walk TD3+ from server8_copy.
 
     Dog Fetch, Dog Run, Dog Stand, Dog Trot, Dog Walk (``dog``), Humanoid
     Walk (``humanoid``), Humanoid Run, and Humanoid Stand use seeds 0--3. Hopper Hop uses
@@ -445,6 +449,11 @@ def build_rlpd_ours_run_groups(
         "humanoid": {
             "Ours": existing["humanoid"]["BAFCv3"],
             "RLPD": existing["humanoid"]["RLPD"],
+            "TD3+": [
+                os.path.join(workspace_root, "server8_copy",
+                             "humanoid_walk_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "humanoid_run": {
             "Ours": existing["humanoid_run"]["BAFCv3"],
@@ -518,6 +527,8 @@ def build_baseline_run_groups(
                 runs.append(paths[0])
             groups[task][label] = runs
         groups[task]["SAC+"] = rlpd_groups[task]["RLPD"][:3]
+        if "TD3+" in rlpd_groups[task]:
+            groups[task]["TD3+"] = rlpd_groups[task]["TD3+"][:3]
     return groups
 
 
@@ -774,7 +785,9 @@ def main() -> None:
         if env not in selected_tasks:
             continue
         plot_average_return(
-            env, rlpd_ours_groups[env], output_root, title="",
+            env, {"SAC+" if label == "RLPD" else label: runs
+                  for label, runs in rlpd_ours_groups[env].items()},
+            output_root, title="",
             xlabel="Environment Steps", ylabel="Average Episodic Return",
             colors=FOCUSED_ALGORITHM_COLORS, human_readable_x_ticks=True,
             filename="%s_rlpd_vs_ours_average_return_vs_env_steps.png" % env)
