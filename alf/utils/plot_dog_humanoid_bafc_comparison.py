@@ -14,7 +14,7 @@
 
 """Plot selected Dog and Humanoid tasks plus Hopper Hop BAFC experiments.
 
-The experiment selection combines runs copied from four hosts. Server 3 runs
+The experiment selection combines runs copied from server-copy directories. Server 3 runs
 use shorthand directories under <workspace-root>/server3_copy.
 Run from the repository root, for example::
 
@@ -26,7 +26,11 @@ BAFCv6 where runs are available. It also writes BAFC_TR trust diagnostics for
 the three environments with BAFC_TR runs, the two-seed Humanoid comparison,
 and focused BAFCv3-vs-RLPD AverageReturn plots for Dog Fetch, Dog Run,
 Dog Stand, Dog Trot, Dog Walk, Humanoid Walk, Humanoid Run, Humanoid Stand,
-and Hopper Hop. Curves are aligned on
+and Hopper Hop. Additional SAC/TD3/SAC+ comparisons use seeds 0--2,
+with TD3v2 labeled TD3 and RLPD labeled SAC+. SAC and TD3v2 are discovered
+across server copies; the longest named training budget with all three seeds
+is preferred. Unavailable three-seed curves are reported and omitted.
+Curves are aligned on
 their overlapping
 environment-step range, linearly interpolated, and plotted as the unsmoothed
 across-seed mean with a population +/-1 standard deviation band.
@@ -35,7 +39,9 @@ across-seed mean with a population +/-1 standard deviation band.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -73,6 +79,12 @@ ALGORITHM_COLORS = {
     "BAFC_nCritic1": "tab:blue",
     "BAFC_nCritic8": "tab:green",
     "BAFCv3_TR2_reweight": "tab:red",
+}
+
+BASELINE_ALGORITHM_COLORS = {
+    "SAC": "tab:green",
+    "TD3": "tab:red",
+    "SAC+": ALGORITHM_COLORS["RLPD"],
 }
 
 FOCUSED_ALGORITHM_COLORS = {
@@ -452,6 +464,63 @@ def build_rlpd_ours_run_groups(
     }
 
 
+def build_baseline_run_groups(
+        workspace_root: str, rlpd_groups: dict[str, dict[str, list[str]]],
+        server_roots: Iterable[str],
+        tasks: Iterable[str] = PLOT_TASKS) -> dict[str, dict[str, list[str]]]:
+    """Discover complete SAC/TD3v2 seed sets and reuse RLPD seeds 0--2.
+
+    Accept copied names such as ``dog_walk_td3v2_s0`` and
+    ``dog_fetch_sac_800k_s0``. Prefer the largest explicitly named budget
+    having all three seeds, without mixing budgets or counting copies twice.
+    Conflicting copies of the same run fail with their paths for inspection.
+    """
+    roots = sorted(set(os.path.realpath(root) for root in [
+        *glob.glob(os.path.join(workspace_root, "server*copy")),
+        *server_roots,
+    ]))
+    entries = [os.path.join(root, name) for root in roots
+               if os.path.isdir(root) for name in sorted(os.listdir(root))]
+    groups = {}
+    for task in tasks:
+        aliases = {"dog": ("dog", "dog_walk"),
+                   "humanoid": ("hum", "humanoid", "humanoid_walk")}.get(
+                       task, (task,))
+        groups[task] = {}
+        for algorithm, label in (("sac", "SAC"), ("td3v2", "TD3")):
+            pattern = re.compile(
+                r"(?:%s)_%s(?:_(\d+)([km]))?_s([012])$" %
+                ("|".join(map(re.escape, aliases)), algorithm))
+            candidates = {}
+            for path in entries:
+                match = pattern.fullmatch(os.path.basename(path))
+                if not match or not os.path.isdir(os.path.join(path, "train")):
+                    continue
+                amount, unit, seed = match.groups()
+                budget = (int(amount) * (1000 if unit == "k" else 1000000)
+                          if amount else 0)
+                candidates.setdefault(budget, {}).setdefault(
+                    int(seed), set()).add(os.path.realpath(path))
+            complete = [budget for budget, seeds in candidates.items()
+                        if set(seeds) == {0, 1, 2}]
+            if not complete:
+                print("%s: omitting %s; no complete seeds 0-2 in server copies"
+                      % (task, label))
+                continue
+            seeds = candidates[max(complete)]
+            runs = []
+            for seed in range(3):
+                paths = sorted(seeds[seed])
+                if len(paths) != 1:
+                    raise ValueError(
+                        "Ambiguous %s %s seed %d copies:%s" %
+                        (task, label, seed, _display_list(paths)))
+                runs.append(paths[0])
+            groups[task][label] = runs
+        groups[task]["SAC+"] = rlpd_groups[task]["RLPD"][:3]
+    return groups
+
+
 def build_additional_run_groups(
         workspace_root: str, local_results_root: str, server_copy_root: str,
         server2_copy_root: str,
@@ -631,6 +700,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Defaults to <workspace-root>/server2_copy.")
     parser.add_argument("--server4-copy-root", default=None,
                         help="Defaults to <workspace-root>/server4_copy.")
+    parser.add_argument("--server5-copy-root", default=None,
+                        help="Defaults to <workspace-root>/server5_copy.")
+    parser.add_argument("--server6-copy-root", default=None,
+                        help="Defaults to <workspace-root>/server6_copy.")
     parser.add_argument("--output-root", default=None,
                         help=("Defaults to <local-results-root>/"
                               "plots_dog_humanoid_bafc_comparison."))
@@ -662,6 +735,22 @@ def main() -> None:
     additional_groups = build_additional_run_groups(
         args.workspace_root, local_results_root, server_copy_root,
         server2_copy_root, server4_copy_root)
+
+    baseline_groups = build_baseline_run_groups(
+        args.workspace_root, rlpd_ours_groups,
+        [server_copy_root, server2_copy_root, server4_copy_root,
+         args.server5_copy_root or os.path.join(args.workspace_root, "server5_copy"),
+         args.server6_copy_root or os.path.join(args.workspace_root, "server6_copy")],
+        tasks=[task for task in PLOT_TASKS if task in selected_tasks])
+    for env, baseline in baseline_groups.items():
+        plot_average_return(
+            env, baseline, output_root,
+            title="%s (Seeds 0-2)" % {
+                "dog": "Dog Walk", "humanoid": "Humanoid Walk"
+            }.get(env, env.replace("_", " ").title()),
+            xlabel="Environment Steps", ylabel="Average Episodic Return",
+            colors=BASELINE_ALGORITHM_COLORS, human_readable_x_ticks=True,
+            filename="%s_sac_td3_sacplus_seed012_average_return_vs_env_steps.png" % env)
 
     for env in ("dog", "dog_fetch", "dog_run", "dog_stand", "dog_trot",
                 "humanoid", "humanoid_run", "humanoid_stand"):

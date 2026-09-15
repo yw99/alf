@@ -31,6 +31,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
             tasks=["dog_trot"], workspace_root="/ws",
             local_results_root="/local", server_copy_root="/server1",
             server2_copy_root="/server2", server4_copy_root="/server4",
+            server5_copy_root=None, server6_copy_root=None,
             output_root="/plots")
         with mock.patch.object(plotter, "_parse_args", return_value=args), \
                 mock.patch.object(plotter, "plot_average_return") as plot, \
@@ -38,11 +39,55 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
                 mock.patch.object(plotter, "plot_raw_eval_trust_metric") as raw:
             plotter.main()
 
-        self.assertEqual(plot.call_count, 2)
+        self.assertEqual(plot.call_count, 3)
         self.assertEqual([call.args[0] for call in plot.call_args_list],
-                         ["dog_trot", "dog_trot"])
+                         ["dog_trot", "dog_trot", "dog_trot"])
+        baseline = plot.call_args_list[0]
+        self.assertEqual(baseline.kwargs["colors"],
+                         plotter.BASELINE_ALGORITHM_COLORS)
+        self.assertEqual(len(baseline.args[1]["SAC+"]), 3)
+        self.assertIn("seed012", baseline.kwargs["filename"])
         trust.assert_not_called()
         raw.assert_not_called()
+
+    def test_baselines_discover_across_copies_and_prefer_complete_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            for seed in range(4):
+                for name, server in (("dog_walk_sac_600k", "server5_copy"),
+                                     ("dog_walk_sac_800k", "server5_copy"),
+                                     ("dog_walk_td3v2", "server%d_copy" % (seed + 2))):
+                    os.makedirs(os.path.join(root, server,
+                                             "%s_s%d" % (name, seed), "train"))
+            # An incomplete longer run must not replace a complete seed set.
+            os.makedirs(os.path.join(root, "server6_copy",
+                                     "dog_walk_sac_1m_s0", "train"))
+            rlpd = {"dog": {"RLPD": ["rlpd_s%d" % s for s in range(4)]}}
+            groups = plotter.build_baseline_run_groups(
+                root, rlpd, [], tasks=["dog"])
+            self.assertEqual(list(groups["dog"]), ["SAC", "TD3", "SAC+"])
+            self.assertEqual(groups["dog"]["SAC+"], rlpd["dog"]["RLPD"][:3])
+            for seed, path in enumerate(groups["dog"]["SAC"]):
+                self.assertTrue(path.endswith("dog_walk_sac_800k_s%d" % seed))
+            self.assertEqual(len(groups["dog"]["TD3"]), 3)
+            self.assertIn("server2_copy", groups["dog"]["TD3"][0])
+
+    def test_baselines_report_missing_and_reject_ambiguous_copies(self):
+        with tempfile.TemporaryDirectory() as root:
+            rlpd = {"humanoid": {"RLPD": ["s0", "s1", "s2", "s3"]}}
+            custom = os.path.join(root, "custom")
+            for seed in range(3):
+                os.makedirs(os.path.join(custom,
+                                         "humanoid_walk_sac_s%d" % seed, "train"))
+            with mock.patch("builtins.print") as report:
+                groups = plotter.build_baseline_run_groups(
+                    root, rlpd, [custom], tasks=["humanoid"])
+            self.assertEqual(list(groups["humanoid"]), ["SAC", "SAC+"])
+            self.assertIn("omitting TD3", report.call_args.args[0])
+            os.makedirs(os.path.join(root, "server6_copy",
+                                     "humanoid_walk_sac_s0", "train"))
+            with self.assertRaisesRegex(ValueError, "Ambiguous humanoid SAC seed 0"):
+                plotter.build_baseline_run_groups(
+                    root, rlpd, [custom], tasks=["humanoid"])
 
     def test_aggregate_interpolates_over_overlap_with_population_std(self):
         curves = [
