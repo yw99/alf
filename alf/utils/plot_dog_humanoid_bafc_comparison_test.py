@@ -45,8 +45,8 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         baseline = plot.call_args_list[0]
         self.assertEqual(baseline.kwargs["colors"],
                          plotter.BASELINE_ALGORITHM_COLORS)
-        self.assertEqual(len(baseline.args[1]["SAC+"]), 3)
-        self.assertIn("seed012", baseline.kwargs["filename"])
+        self.assertEqual(len(baseline.args[1]["SAC+"]), 4)
+        self.assertIn("seed0123", baseline.kwargs["filename"])
         trust.assert_not_called()
         raw.assert_not_called()
 
@@ -65,17 +65,34 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
             groups = plotter.build_baseline_run_groups(
                 root, rlpd, [], tasks=["dog"])
             self.assertEqual(list(groups["dog"]), ["SAC", "TD3", "SAC+"])
-            self.assertEqual(groups["dog"]["SAC+"], rlpd["dog"]["RLPD"][:3])
+            self.assertEqual(groups["dog"]["SAC+"], rlpd["dog"]["RLPD"][:4])
             for seed, path in enumerate(groups["dog"]["SAC"]):
                 self.assertTrue(path.endswith("dog_walk_sac_800k_s%d" % seed))
-            self.assertEqual(len(groups["dog"]["TD3"]), 3)
+            self.assertEqual(len(groups["dog"]["TD3"]), 4)
             self.assertIn("server2_copy", groups["dog"]["TD3"][0])
+
+    def test_baselines_match_unnamed_budget_from_saved_config(self):
+        with tempfile.TemporaryDirectory() as root:
+            for seed in range(4):
+                name = ("humanoid_walk_sac_600k_s%d" % seed if seed < 3
+                        else "humanoid_walk_sac_s3")
+                run = os.path.join(root, "server4_copy", name)
+                os.makedirs(os.path.join(run, "train"))
+                if seed == 3:
+                    with open(os.path.join(run, "alf_config.py"), "w") as f:
+                        f.write("alf.pre_config({'TrainerConfig.num_env_steps': 600000})")
+            rlpd = {"humanoid": {"RLPD": ["s0", "s1", "s2", "s3"]}}
+            groups = plotter.build_baseline_run_groups(
+                root, rlpd, [], tasks=["humanoid"])
+            self.assertEqual(len(groups["humanoid"]["SAC"]), 4)
+            self.assertTrue(groups["humanoid"]["SAC"][3].endswith(
+                "humanoid_walk_sac_s3"))
 
     def test_baselines_report_missing_and_reject_ambiguous_copies(self):
         with tempfile.TemporaryDirectory() as root:
             rlpd = {"humanoid": {"RLPD": ["s0", "s1", "s2", "s3"]}}
             custom = os.path.join(root, "custom")
-            for seed in range(3):
+            for seed in range(4):
                 os.makedirs(os.path.join(custom,
                                          "humanoid_walk_sac_s%d" % seed, "train"))
             with mock.patch("builtins.print") as report:
@@ -184,7 +201,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         for env in ("dog_fetch", "dog_run", "dog_stand", "dog_trot",
                     "dog", "humanoid", "humanoid_run", "humanoid_stand"):
             expected = ["Ours", "RLPD"]
-            if env == "humanoid":
+            if env in ("dog", "dog_stand", "humanoid", "humanoid_run", "humanoid_stand"):
                 expected.append("TD3+")
             self.assertEqual(list(groups[env]), expected)
             self.assertNotIn("BAFCv6", groups[env])

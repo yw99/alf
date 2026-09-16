@@ -22,16 +22,19 @@ Run from the repository root, for example::
     python alf/utils/plot_dog_humanoid_bafc_comparison.py --task dog_trot
 
 For each environment, the script writes an AverageReturn comparison, including
-BAFCv6 where runs are available. It also writes BAFC_TR trust diagnostics for
+BAFCv6 (labeled Ours_reweight) where runs are available. RLPD is labeled
+SAC+ throughout; algorithm colors are shared across plot families. It also writes BAFC_TR trust diagnostics for
 the three environments with BAFC_TR runs, the two-seed Humanoid comparison,
 and focused Ours-vs-SAC+ AverageReturn plots for Dog Fetch, Dog Run,
 Dog Stand, Dog Trot, Dog Walk, Humanoid Walk, Humanoid Run, Humanoid Stand,
-and Hopper Hop. Additional SAC/TD3/SAC+ comparisons use seeds 0--2,
-with TD3v2 labeled TD3 and RLPD labeled SAC+. Humanoid Walk also includes
-TD3 from server8_copy, labeled TD3+, using seeds 0--3 in the focused
-comparison and seeds 0--2 in the baseline comparison. SAC and TD3v2 are discovered
-across server copies; the longest named training budget with all three seeds
-is preferred. Unavailable three-seed curves are reported and omitted.
+and Hopper Hop. Additional SAC/TD3/SAC+ comparisons use seeds 0--3 where available,
+with TD3v2 labeled TD3 and RLPD labeled SAC+. Humanoid Walk, Run, and Stand
+also include TD3, labeled TD3+, using seeds 0--3 in both comparisons
+(server8, server4, and server3 copies). SAC and TD3v2 are discovered
+across server copies; the longest training budget with all four seeds
+is preferred. Unavailable four-seed curves are reported and omitted.
+Dog Walk and Stand also include four-seed TD3+ runs from server9_copy
+in both comparisons. Dog Walk plots are limited to 150,000 environment steps.
 Curves are aligned on
 their overlapping
 environment-step range, linearly interpolated, and plotted as the unsmoothed
@@ -71,30 +74,43 @@ _PLOTTED_TAGS = (
 )
 _SCALAR_CURVE_CACHE: dict[tuple[str, str], ScalarCurve] = {}
 
+ALGORITHM_LABELS = {"RLPD": "SAC+", "BAFCv6": "Ours_reweight"}
+
 ALGORITHM_COLORS = {
-    "RLPD": "tab:orange",
+    "SAC+": "tab:orange",
     "Ours": "tab:blue",
     "BAFCv3": "tab:blue",
-    "BAFC_TR": "tab:green",
-    "BAFCv6": "tab:red",
+    "SAC": "tab:green",
+    "TD3": "tab:red",
+    "TD3+": "tab:purple",
+    "BAFC_TR": "tab:brown",
+    "Ours_reweight": "tab:pink",
+    "BAFCv3_TR2_reweight": "tab:cyan",
     "BAFCv7": "tab:purple",
     "BAFC_nCritic1": "tab:blue",
     "BAFC_nCritic8": "tab:green",
-    "BAFCv3_TR2_reweight": "tab:red",
 }
+for alias, label in ALGORITHM_LABELS.items():
+    ALGORITHM_COLORS[alias] = ALGORITHM_COLORS[label]
 
 BASELINE_ALGORITHM_COLORS = {
-    "SAC": "tab:green",
-    "TD3": "tab:red",
-    "SAC+": ALGORITHM_COLORS["RLPD"],
-    "TD3+": "tab:purple",
+    label: ALGORITHM_COLORS[label] for label in ("SAC", "TD3", "SAC+", "TD3+")
+}
+FOCUSED_ALGORITHM_COLORS = {
+    label: ALGORITHM_COLORS[label] for label in ("SAC+", "TD3+", "Ours")
 }
 
-FOCUSED_ALGORITHM_COLORS = {
-    "SAC+": ALGORITHM_COLORS["RLPD"],
-    "TD3+": BASELINE_ALGORITHM_COLORS["TD3+"],
-    "Ours": ALGORITHM_COLORS["Ours"],
-}
+
+def _algorithm_label(label: str) -> tuple[str, int | None]:
+    """Resolve display aliases while retaining individual-seed information."""
+    match = re.fullmatch(r"(.+)_s(\d+)", label)
+    algorithm, seed = (match.group(1), int(match.group(2))) if match else (label, None)
+    return ALGORITHM_LABELS.get(algorithm, algorithm), seed
+
+
+def _display_algorithm_label(label: str) -> str:
+    algorithm, seed = _algorithm_label(label)
+    return algorithm if seed is None else "%s_s%d" % (algorithm, seed)
 
 
 @dataclass(frozen=True)
@@ -408,7 +424,7 @@ def build_rlpd_ours_run_groups(
         workspace_root: str, local_results_root: str, server_copy_root: str,
         server2_copy_root: str,
         server4_copy_root: str | None = None) -> dict[str, dict[str, list[str]]]:
-    """Return RLPD/Ours groups, plus Humanoid Walk TD3+ from server8_copy.
+    """Return RLPD/Ours groups with available Dog and Humanoid TD3+ runs.
 
     Dog Fetch, Dog Run, Dog Stand, Dog Trot, Dog Walk (``dog``), Humanoid
     Walk (``humanoid``), Humanoid Run, and Humanoid Stand use seeds 0--3. Hopper Hop uses
@@ -419,6 +435,8 @@ def build_rlpd_ours_run_groups(
                                 server4_copy_root)
 
     server3_copy_root = os.path.join(workspace_root, "server3_copy")
+    server4_copy_root = server4_copy_root or os.path.join(
+        workspace_root, "server4_copy")
     hopper_ours = [
         os.path.join(server3_copy_root, "hopper_hop_bafcv3_nCritic8_utd11_s%d" % seed)
         for seed in (0, 1)
@@ -437,6 +455,11 @@ def build_rlpd_ours_run_groups(
         "dog_stand": {
             "Ours": existing["dog_stand"]["BAFCv3"],
             "RLPD": existing["dog_stand"]["RLPD"],
+            "TD3+": [
+                os.path.join(workspace_root, "server9_copy",
+                             "dog_stand_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "dog_trot": {
             "Ours": existing["dog_trot"]["BAFCv3"],
@@ -445,6 +468,11 @@ def build_rlpd_ours_run_groups(
         "dog": {
             "Ours": existing["dog"]["BAFCv3"],
             "RLPD": existing["dog"]["RLPD"],
+            "TD3+": [
+                os.path.join(workspace_root, "server9_copy",
+                             "dog_walk_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "humanoid": {
             "Ours": existing["humanoid"]["BAFCv3"],
@@ -458,10 +486,18 @@ def build_rlpd_ours_run_groups(
         "humanoid_run": {
             "Ours": existing["humanoid_run"]["BAFCv3"],
             "RLPD": existing["humanoid_run"]["RLPD"],
+            "TD3+": [
+                os.path.join(server4_copy_root, "humanoid_run_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "humanoid_stand": {
             "Ours": existing["humanoid_stand"]["BAFCv3"],
             "RLPD": existing["humanoid_stand"]["RLPD"],
+            "TD3+": [
+                os.path.join(server3_copy_root, "humanoid_stand_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "hopper_hop": {
             "Ours": hopper_ours,
@@ -477,11 +513,14 @@ def build_baseline_run_groups(
         workspace_root: str, rlpd_groups: dict[str, dict[str, list[str]]],
         server_roots: Iterable[str],
         tasks: Iterable[str] = PLOT_TASKS) -> dict[str, dict[str, list[str]]]:
-    """Discover complete SAC/TD3v2 seed sets and reuse RLPD seeds 0--2.
+    """Discover four-seed SAC/TD3v2 sets and reuse available RLPD seeds.
+
+    RLPD uses seeds 0--3, except Hopper Hop which has seeds 0--2.
 
     Accept copied names such as ``dog_walk_td3v2_s0`` and
-    ``dog_fetch_sac_800k_s0``. Prefer the largest explicitly named budget
-    having all three seeds, without mixing budgets or counting copies twice.
+    ``dog_fetch_sac_800k_s0``. Prefer the largest training budget
+    having all four seeds, without mixing budgets or counting copies twice.
+    Unnamed budgets are read from saved alf_config.py when available.
     Conflicting copies of the same run fail with their paths for inspection.
     """
     roots = sorted(set(os.path.realpath(root) for root in [
@@ -498,7 +537,7 @@ def build_baseline_run_groups(
         groups[task] = {}
         for algorithm, label in (("sac", "SAC"), ("td3v2", "TD3")):
             pattern = re.compile(
-                r"(?:%s)_%s(?:_(\d+)([km]))?_s([012])$" %
+                r"(?:%s)_%s(?:_(\d+)([km]))?_s([0123])$" %
                 ("|".join(map(re.escape, aliases)), algorithm))
             candidates = {}
             for path in entries:
@@ -508,17 +547,27 @@ def build_baseline_run_groups(
                 amount, unit, seed = match.groups()
                 budget = (int(amount) * (1000 if unit == "k" else 1000000)
                           if amount else 0)
+                # Some copied run names omit the training budget. Read the
+                # saved literal configuration without executing experiment code.
+                config_path = os.path.join(path, "alf_config.py")
+                if not amount and os.path.isfile(config_path):
+                    with open(config_path) as config_file:
+                        config_budget = re.search(
+                            r"['\"]TrainerConfig\.num_env_steps['\"]\s*:\s*(\d+)",
+                            config_file.read())
+                    if config_budget:
+                        budget = int(config_budget.group(1))
                 candidates.setdefault(budget, {}).setdefault(
                     int(seed), set()).add(os.path.realpath(path))
             complete = [budget for budget, seeds in candidates.items()
-                        if set(seeds) == {0, 1, 2}]
+                        if set(seeds) == {0, 1, 2, 3}]
             if not complete:
-                print("%s: omitting %s; no complete seeds 0-2 in server copies"
+                print("%s: omitting %s; no complete seeds 0-3 in server copies"
                       % (task, label))
                 continue
             seeds = candidates[max(complete)]
             runs = []
-            for seed in range(3):
+            for seed in range(4):
                 paths = sorted(seeds[seed])
                 if len(paths) != 1:
                     raise ValueError(
@@ -526,9 +575,9 @@ def build_baseline_run_groups(
                         (task, label, seed, _display_list(paths)))
                 runs.append(paths[0])
             groups[task][label] = runs
-        groups[task]["SAC+"] = rlpd_groups[task]["RLPD"][:3]
+        groups[task]["SAC+"] = rlpd_groups[task]["RLPD"][:4]
         if "TD3+" in rlpd_groups[task]:
-            groups[task]["TD3+"] = rlpd_groups[task]["TD3+"][:3]
+            groups[task]["TD3+"] = rlpd_groups[task]["TD3+"][:4]
     return groups
 
 
@@ -591,9 +640,11 @@ def build_additional_run_groups(
 
 def _plot_aggregate(ax: plt.Axes, aggregate: AggregateCurve, label: str,
                     color: str | None = None) -> None:
-    color = color or ALGORITHM_COLORS[label]
+    algorithm, seed = _algorithm_label(label)
+    color = color or ALGORITHM_COLORS[algorithm]
+    linestyle = "-" if seed is None else ("-", "--", "-.", ":")[seed % 4]
     ax.plot(aggregate.steps, aggregate.mean, color=color, linewidth=2,
-            label=label)
+            label=_display_algorithm_label(label), linestyle=linestyle)
     ax.fill_between(aggregate.steps, aggregate.mean_minus_std,
                     aggregate.mean_plus_std, color=color, alpha=0.18,
                     linewidth=0)
@@ -603,7 +654,7 @@ def _print_summary(env: str, label: str, tag: str, seed_count: int,
                    aggregate: AggregateCurve) -> None:
     print("%s | %s | seeds=%d | %s | range=%d -> %d | "
           "final mean/std=%.6g / %.6g" %
-          (env, label, seed_count, tag, int(aggregate.steps[0]),
+          (env, _display_algorithm_label(label), seed_count, tag, int(aggregate.steps[0]),
            int(aggregate.steps[-1]), aggregate.mean[-1], aggregate.std[-1]))
 
 
@@ -641,6 +692,8 @@ def plot_average_return(env: str, groups: dict[str, list[str]],
                         colors: dict[str, str] | None = None,
                         human_readable_x_ticks: bool = False) -> str:
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
+    if env == "dog":
+        ax.set_xlim(0, 150_000)
     for label, run_dirs in groups.items():
         aggregate = aggregate_scalar(run_dirs, RETURN_TAG)
         color = colors[label] if colors is not None else None
@@ -659,6 +712,8 @@ def plot_eval_trust_over_max(env: str, bafc_tr_dirs: list[str],
                              output_root: str) -> str:
     aggregate = aggregate_scalar(bafc_tr_dirs, EVAL_TRUST_OVER_MAX_TAG)
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
+    if env == "dog":
+        ax.set_xlim(0, 150_000)
     _plot_aggregate(ax, aggregate, "BAFC_TR")
     ax.axhline(1.0, color="black", linestyle="--", linewidth=1.5,
                label="Threshold")
@@ -678,6 +733,8 @@ def plot_raw_eval_trust_metric(env: str, bafc_tr_dirs: list[str],
     """Plot raw evaluation trust against its non-decayed initial threshold."""
     aggregate = aggregate_scalar(bafc_tr_dirs, EVAL_TRUST_METRIC_TAG)
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
+    if env == "dog":
+        ax.set_xlim(0, 150_000)
     _plot_aggregate(ax, aggregate, "BAFC_TR")
     ax.axhline(initial_threshold,
                color="black",
@@ -754,14 +811,18 @@ def main() -> None:
          args.server6_copy_root or os.path.join(args.workspace_root, "server6_copy")],
         tasks=[task for task in PLOT_TASKS if task in selected_tasks])
     for env, baseline in baseline_groups.items():
+        seed_count = max(map(len, baseline.values()))
+        seed_suffix = "".join(map(str, range(seed_count)))
         plot_average_return(
             env, baseline, output_root,
-            title="%s (Seeds 0-2)" % {
+            title="%s (Seeds 0-%d)" % ({
                 "dog": "Dog Walk", "humanoid": "Humanoid Walk"
             }.get(env, env.replace("_", " ").title()),
+                seed_count - 1),
             xlabel="Environment Steps", ylabel="Average Episodic Return",
             colors=BASELINE_ALGORITHM_COLORS, human_readable_x_ticks=True,
-            filename="%s_sac_td3_sacplus_seed012_average_return_vs_env_steps.png" % env)
+            filename="%s_sac_td3_sacplus_seed%s_average_return_vs_env_steps.png" % (
+                env, seed_suffix))
 
     for env in ("dog", "dog_fetch", "dog_run", "dog_stand", "dog_trot",
                 "humanoid", "humanoid_run", "humanoid_stand"):
@@ -808,20 +869,14 @@ def main() -> None:
         plot_average_return(
             "humanoid_reweight", additional_groups["humanoid_reweight"],
             output_root,
-            title="Humanoid Walk RLPD vs BAFCv3 TR2 Reweight (Seeds 0-3)",
+            title="Humanoid Walk SAC+ vs BAFCv3 TR2 Reweight (Seeds 0-3)",
             filename=("humanoid_rlpd_vs_bafcv3_tr2_reweight_"
                       "average_return_vs_env_steps.png"))
-        individual_colors = {
-            label: plt.get_cmap("tab10")(index)
-            for index, label in enumerate(
-                additional_groups["humanoid_reweight_individual"])
-        }
         plot_average_return(
             "humanoid_reweight_individual",
             additional_groups["humanoid_reweight_individual"], output_root,
-            title=("Humanoid Walk RLPD vs BAFCv3 TR2 Reweight: "
+            title=("Humanoid Walk SAC+ vs BAFCv3 TR2 Reweight: "
                    "Individual Runs"),
-            colors=individual_colors,
             filename=("humanoid_rlpd_vs_bafcv3_tr2_reweight_individual_"
                       "average_return_vs_env_steps.png"))
 
