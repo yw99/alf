@@ -548,6 +548,12 @@ class Trainer(object):
             Args:
                 checkpointer (Checkpointer):
         """
+        rl_algorithm = getattr(self._algorithm, "_rl_algorithm", None)
+        if getattr(rl_algorithm, "_restart_options", None):
+            from alf.utils.bafcv3_restart import restore_trainer
+            restore_trainer(self, checkpointer)
+            self._checkpointer = checkpointer
+            return
         if checkpointer.has_checkpoint():
             # Some objects (e.g. ReplayBuffer) are constructed lazily in algorithm.
             # They only appear after one training iteration. So we need to run

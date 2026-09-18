@@ -34,7 +34,8 @@ also include TD3, labeled TD3+, using seeds 0--3 in both comparisons
 across server copies; the longest training budget with all four seeds
 is preferred. Unavailable four-seed curves are reported and omitted.
 Dog Walk and Stand also include four-seed TD3+ runs from server9_copy
-in both comparisons. Dog Walk plots are limited to 150,000 environment steps.
+in both comparisons, as do Dog Run and Trot from server3_copy.
+Dog Walk plots are limited to 150,000 environment steps.
 Curves are aligned on
 their overlapping
 environment-step range, linearly interpolated, and plotted as the unsmoothed
@@ -451,6 +452,10 @@ def build_rlpd_ours_run_groups(
         "dog_run": {
             "Ours": existing["dog_run"]["BAFCv3"],
             "RLPD": existing["dog_run"]["RLPD"],
+            "TD3+": [
+                os.path.join(server3_copy_root, "dog_run_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "dog_stand": {
             "Ours": existing["dog_stand"]["BAFCv3"],
@@ -464,6 +469,10 @@ def build_rlpd_ours_run_groups(
         "dog_trot": {
             "Ours": existing["dog_trot"]["BAFCv3"],
             "RLPD": existing["dog_trot"]["RLPD"],
+            "TD3+": [
+                os.path.join(server3_copy_root, "dog_trot_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "dog": {
             "Ours": existing["dog"]["BAFCv3"],

@@ -2,6 +2,10 @@
 
 Date: 2026-09-17 UTC.
 
+> Historical reboot handoff. Implementation subsequently resumed with GPUs
+> available. See [current implementation and usage](bafcv3_tr2_restart.md).
+> The rollback status below describes the earlier interruption only.
+
 ## Shutdown and rollback status
 
 Implementation was stopped at the user's request for a server reboot. The active

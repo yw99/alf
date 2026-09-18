@@ -201,7 +201,8 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         for env in ("dog_fetch", "dog_run", "dog_stand", "dog_trot",
                     "dog", "humanoid", "humanoid_run", "humanoid_stand"):
             expected = ["Ours", "RLPD"]
-            if env in ("dog", "dog_stand", "humanoid", "humanoid_run", "humanoid_stand"):
+            if env in ("dog", "dog_run", "dog_stand", "dog_trot", "humanoid",
+                       "humanoid_run", "humanoid_stand"):
                 expected.append("TD3+")
             self.assertEqual(list(groups[env]), expected)
             self.assertNotIn("BAFCv6", groups[env])

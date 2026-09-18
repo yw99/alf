@@ -121,6 +121,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                  trust_metric_num_feature_coords: int = 64,
                  trust_metric_update_interval: int = 1,
                  checkpoint_replay_buffer: bool = False,
+                 restart_options: Optional[dict] = None,
                  eval_trust_max: float = 2.0,
                  delta_trust_max: float = 2.0,
                  monitor_trust_metrics: bool = True,
@@ -308,6 +309,10 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._bootstrap_mask_prob = bootstrap_mask_prob
         self._bootstrap_mask_type = bootstrap_mask_type
         self._trust_cov_reg = trust_cov_reg
+        # Opt-in warm starts leave ordinary TR2 configuration unchanged.
+        self._restart_options = restart_options
+        self._restart_calibration = None
+        self._critic_phase_offset = 0
         self._trust_metric_num_obs = trust_metric_num_obs
         self._trust_metric_target_obs_cache_size = (
             trust_metric_target_obs_cache_size)
@@ -512,7 +517,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         return int(torch.as_tensor(value).reshape(()).item())
 
     def _save_bafc_runtime_state(self, destination, prefix):
+        if self._restart_calibration is not None:
+            destination[self._bafc_runtime_key(prefix, "restart_calibration")] = (
+                copy.deepcopy(self._restart_calibration))
         scalar_fields = dict(
+            critic_phase_offset=(self._critic_phase_offset, torch.int64),
             training_started=(self._training_started, torch.bool),
             train_mode=(self._train_mode.value, torch.int64),
             rollout_actor_id=(self._rollout_actor_id, torch.int64),
@@ -574,8 +583,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         if "train_mode" in runtime_state:
             self._train_mode = TrainMode(
                 self._bafc_scalar_int(runtime_state["train_mode"]))
+        if "restart_calibration" in runtime_state:
+            self._restart_calibration = copy.deepcopy(runtime_state["restart_calibration"])
+            self._eval_trust_max = self._restart_calibration["threshold"]
         int_fields = (
-            "rollout_actor_id", "actor_update_counter",
+            "critic_phase_offset", "rollout_actor_id", "actor_update_counter",
             "critic_update_counter", "completed_cycles_since_rollout",
             "trust_metric_update_counter",
             "eval_gate_consecutive_rollout_skips",
@@ -687,6 +699,8 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
             torch_rng_state=torch.get_rng_state())
         if torch.cuda.is_available():
             state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+            if self._restart_options:
+                state["restart_cuda_rng_state"] = torch.cuda.get_rng_state()
         return state
 
     def _load_rank_local_checkpoint_state(self, state):
@@ -731,8 +745,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         random.setstate(state["python_rng_state"])
         np.random.set_state(state["numpy_rng_state"])
         torch.set_rng_state(state["torch_rng_state"])
-        if "cuda_rng_state_all" in state and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
+        if torch.cuda.is_available():
+            if "restart_cuda_rng_state" in state:
+                torch.cuda.set_rng_state(state["restart_cuda_rng_state"])
+            elif "cuda_rng_state_all" in state:
+                torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
 
     def _set_actor_eval_samples_requires_grad(self, requires_grad):
         if self._freeze_eval_samples:
@@ -1891,7 +1908,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                     if not self._freeze_eval_samples:
                         self._actor_eval_samples.requires_grad_(True)
         elif self._train_mode == TrainMode.critic:
-            if self._critic_update_counter % self._critic_utd == 0:
+            if (self._critic_update_counter - self._critic_phase_offset) % self._critic_utd == 0:
                 if self._enable_grad_actor_extend_gate:
                     self._sync_reference_from_current()
                 self._train_mode = TrainMode.actor
@@ -2096,7 +2113,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
 
     def _distributed_rollout_skip_sync_enabled(self):
         return (
-            self._enable_eval_rollout_skip_gate
+            (self._enable_eval_rollout_skip_gate or getattr(self, "_restart_options", None))
             and self._rollout_skip_sync_mode != "async"
             and torch.distributed.is_available()
             and torch.distributed.is_initialized()
@@ -2140,7 +2157,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
 
     def _eval_trust_aggregate_logging_enabled(self):
         if not (self._debug_summaries
-                and self._enable_eval_rollout_skip_gate):
+                and (self._enable_eval_rollout_skip_gate or getattr(self, "_restart_options", None))):
             return False
         world_size = self._distributed_world_size()
         return (world_size == 1
@@ -2161,6 +2178,10 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         if self._distributed_rollout_skip_sync_enabled():
             rank_values = self._all_gather_control(local_value)
 
+        if getattr(self, "_restart_options", None):
+            if not torch.isfinite(rank_values).all() or (rank_values < 0).any():
+                raise RuntimeError("Invalid restart trust metric on one or more ranks")
+            self._restart_rank_metrics = rank_values.clone()
         self._last_eval_trust_rank_min = rank_values.min().clone()
         self._last_eval_trust_rank_avg = rank_values.mean().clone()
         self._last_eval_trust_rank_max = rank_values.max().clone()
@@ -2175,6 +2196,9 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
     def _record_eval_trust_aggregate_summaries(self):
         if not self._eval_trust_aggregate_logging_enabled():
             return
+        values = getattr(self, "_restart_rank_metrics", ())
+        for rank, value in enumerate(values):
+            self._record_debug_scalar("eval_trust_metric/rank_" + str(rank), value)
         for suffix in ("rank_min", "rank_avg", "rank_max", "effective"):
             self._record_debug_scalar(
                 "eval_trust_metric/" + suffix,
@@ -2224,6 +2248,8 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
 
         proposal["rollout_opportunity"] = True
         if not self._enable_eval_rollout_skip_gate:
+            return proposal
+        if getattr(self, "_restart_options", None) and self._restart_calibration is None:
             return proposal
 
         proposal["eval_trust"] = float(
@@ -2359,7 +2385,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
 
         if should_compute_trust_metrics:
             if isinstance(observation, torch.Tensor):
-                if self._enable_eval_rollout_skip_gate:
+                if self._enable_eval_rollout_skip_gate or self._restart_options:
                     self._last_eval_trust = self._compute_eval_trust_metric(
                         observation, behavior_action).detach()
                 else:
@@ -2369,7 +2395,7 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
                         self._last_eval_trust)
             else:
                 self._last_eval_trust = torch.ones_like(self._last_eval_trust)
-            if self._enable_eval_rollout_skip_gate:
+            if self._enable_eval_rollout_skip_gate or self._restart_options:
                 self._refresh_eval_trust_aggregates()
         self._update_target_critic()
         self._sync_snapshot_critic_from_current()
@@ -2378,6 +2404,13 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         self._record_debug_scalar('grad_trust_metric', self._last_grad_trust)
         eval_trust_max = self._current_eval_trust_max()
         self._record_debug_scalar('eval_trust_max', eval_trust_max)
+        if self._restart_options:
+            self._record_debug_scalar('threshold_eligible',
+                float(self._last_eval_trust_effective <= eval_trust_max))
+            self._record_debug_scalar('actor_update_count', self._actor_update_counter)
+            self._record_debug_scalar('critic_update_count', self._critic_update_counter)
+            self._record_debug_scalar('realized_skip_fraction',
+                self._rollout_skip_due_eval_gate_count / max(1, self._rollout_opportunity_count))
         self._record_debug_scalar('delta_trust_max', self._delta_trust_max)
         self._record_debug_scalar('eval_trust_over_max',
                                   self._last_eval_trust /

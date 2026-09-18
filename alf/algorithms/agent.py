@@ -387,6 +387,11 @@ class Agent(RLAlgorithm):
         return AlgStep(output=rl_step.output, state=new_state, info=info)
 
     def train_step(self, time_step: TimeStep, state, rollout_info):
+        if getattr(self._rl_algorithm, "_restart_options", None):
+            # A warm start may begin in critic-only mode. Actor/critic info
+            # have different empty leaves; infer the active schema each step
+            # without a dummy joint update to seed the lazy specification.
+            self._train_info_spec = None
         new_state = AgentState()
         info = AgentInfo(rewards=rollout_info.rewards)
         observation = time_step.observation
@@ -463,13 +468,20 @@ class Agent(RLAlgorithm):
     def _rank_local_checkpoint_state(self):
         get_state = getattr(self._rl_algorithm,
                             "_rank_local_checkpoint_state", None)
-        return get_state() if get_state is not None else None
+        state = get_state() if get_state is not None else None
+        if state is not None and getattr(self._rl_algorithm, "_restart_options", None):
+            state["restart_data_transformer"] = copy.deepcopy(
+                self._data_transformer.state_dict())
+        return state
 
     def _load_rank_local_checkpoint_state(self, state):
         load_state = getattr(self._rl_algorithm,
                              "_load_rank_local_checkpoint_state", None)
         if load_state is not None:
             load_state(state)
+        if state is not None and "restart_data_transformer" in state:
+            self._data_transformer.load_state_dict(
+                state["restart_data_transformer"], strict=True)
 
     def train_step_offline(self, time_step: TimeStep, state, rollout_info,
                            pre_train):

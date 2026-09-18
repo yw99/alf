@@ -75,7 +75,7 @@ def extract_sub_state_dict_from_checkpoint(checkpoint_prefix, checkpoint_path):
     # use ``cpu`` as the map location to avoid GPU RAM surge when loading a
     # model checkpoint.
     map_location = torch.device('cpu')
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
 
     if checkpoint_prefix != '':
         dict_key_and_prefix = checkpoint_prefix.split('.', maxsplit=1)
@@ -166,7 +166,7 @@ class Checkpointer(object):
         if ddp_rank is not None and ddp_rank >= 0:
             rank_path = f_path + f'-replay_buffer-rank{ddp_rank}'
             if os.path.exists(rank_path):
-                return torch.load(rank_path, map_location=map_location)
+                return torch.load(rank_path, map_location=map_location, weights_only=True)
             if ddp_rank > 0:
                 logging.warning(
                     "Replay buffer checkpoint %s is missing. Rank %s will "
@@ -174,7 +174,7 @@ class Checkpointer(object):
                 return {k: {} for k in self._modules.keys()}
 
         if os.path.exists(legacy_path):
-            return torch.load(legacy_path, map_location=map_location)
+            return torch.load(legacy_path, map_location=map_location, weights_only=True)
 
         if rank_path is not None:
             logging.warning(
@@ -372,11 +372,11 @@ class Checkpointer(object):
         # model checkpoint.
         map_location = torch.device('cpu')
 
-        checkpoint = torch.load(f_path, map_location=map_location)
+        checkpoint = torch.load(f_path, map_location=map_location, weights_only=True)
         checkpoint['global_step'] = checkpoint['global_step'].numpy()
         if including_optimizer:
             opt_checkpoint = torch.load(f_path + '-optimizer',
-                                        map_location=map_location)
+                                        map_location=map_location, weights_only=True)
             _merge_checkpoint(checkpoint, opt_checkpoint)
         if including_replay_buffer:
             replay_buffer_checkpoint = self._load_replay_buffer_checkpoint(
