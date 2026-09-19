@@ -15,6 +15,20 @@ from alf.utils import plot_dog_humanoid_bafc_comparison as plotter
 
 class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
 
+    def test_skip_frequency_uses_counter_deltas_and_environment_axis(self):
+        curve = plotter.ScalarCurve
+        steps = np.array([10., 20., 30., 40.])
+        result = plotter.rollout_skip_frequency(
+            curve(steps, np.array([75000., 76000., 76000., 77000.])),
+            curve(steps, np.array([100., 110., 120., 125.])),
+            curve(steps, np.array([200., 240., 250., 300.])))
+        np.testing.assert_allclose(result.steps, [75500., 76500.])
+        np.testing.assert_allclose(result.values, [40., 10.])
+        with self.assertRaisesRegex(ValueError, "Invalid or reset"):
+            plotter.rollout_skip_frequency(
+                curve(steps, steps), curve(steps, np.array([0., 2., 1., 4.])),
+                curve(steps, steps))
+
     def test_initial_eval_trust_threshold(self):
         self.assertEqual(plotter.INITIAL_EVAL_TRUST_THRESHOLD, 30.0)
 
@@ -201,7 +215,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         for env in ("dog_fetch", "dog_run", "dog_stand", "dog_trot",
                     "dog", "humanoid", "humanoid_run", "humanoid_stand"):
             expected = ["Ours", "RLPD"]
-            if env in ("dog", "dog_run", "dog_stand", "dog_trot", "humanoid",
+            if env in ("dog", "dog_fetch", "dog_run", "dog_stand", "dog_trot", "humanoid",
                        "humanoid_run", "humanoid_stand"):
                 expected.append("TD3+")
             self.assertEqual(list(groups[env]), expected)

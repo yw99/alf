@@ -20,6 +20,7 @@ Run from the repository root, for example::
 
     python alf/utils/plot_dog_humanoid_bafc_comparison.py
     python alf/utils/plot_dog_humanoid_bafc_comparison.py --task dog_trot
+    python alf/utils/plot_dog_humanoid_bafc_comparison.py --task dog_walk_tr2_resume
 
 For each environment, the script writes an AverageReturn comparison, including
 BAFCv6 (labeled Ours_reweight) where runs are available. RLPD is labeled
@@ -34,8 +35,13 @@ also include TD3, labeled TD3+, using seeds 0--3 in both comparisons
 across server copies; the longest training budget with all four seeds
 is preferred. Unavailable four-seed curves are reported and omitted.
 Dog Walk and Stand also include four-seed TD3+ runs from server9_copy
-in both comparisons, as do Dog Run and Trot from server3_copy.
-Dog Walk plots are limited to 150,000 environment steps.
+in both comparisons, as do Dog Fetch, Run, and Trot from server3_copy.
+Dog Walk plots are limited to 150,000 environment steps. A separate seeds 0--1
+comparison includes the TR2 resume study 20260917T054927Z; continuation curves
+start at their recorded absolute environment steps and use only seed overlap.
+A companion plot shows local rollout skip percentages between logged samples
+(roughly 1k environment steps), placed at interval midpoints, using counter
+differences rather than cumulative skip fractions.
 Curves are aligned on
 their overlapping
 environment-step range, linearly interpolated, and plotted as the unsmoothed
@@ -64,12 +70,18 @@ from tensorboard.backend.event_processing.event_accumulator import (
 RETURN_TAG = "Metrics_vs_EnvironmentSteps/AverageReturn"
 EVAL_TRUST_OVER_MAX_TAG = "BafcAlgorithmV3TR2/eval_trust_over_max"
 EVAL_TRUST_METRIC_TAG = "BafcAlgorithmV3TR2/eval_trust_metric"
+ENV_STEPS_TAG = "Metrics/EnvironmentSteps"
+SKIP_COUNT_TAG = "BafcAlgorithmV3TR2/rollout_skip_due_eval_gate_count"
+ROLLOUT_COUNT_TAG = "BafcAlgorithmV3TR2/rollout_opportunity_count"
 INITIAL_EVAL_TRUST_THRESHOLD = 30.0
 PLOT_TASKS = ("dog", "dog_fetch", "dog_run", "dog_stand", "dog_trot",
               "humanoid", "humanoid_run", "humanoid_stand", "hopper_hop")
 
 _PLOTTED_TAGS = (
     RETURN_TAG,
+    ENV_STEPS_TAG,
+    SKIP_COUNT_TAG,
+    ROLLOUT_COUNT_TAG,
     EVAL_TRUST_OVER_MAX_TAG,
     EVAL_TRUST_METRIC_TAG,
 )
@@ -448,6 +460,10 @@ def build_rlpd_ours_run_groups(
         "dog_fetch": {
             "Ours": existing["dog_fetch"]["BAFCv3"],
             "RLPD": existing["dog_fetch"]["RLPD"],
+            "TD3+": [
+                os.path.join(server3_copy_root, "dog_fetch_td3_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "dog_run": {
             "Ours": existing["dog_run"]["BAFCv3"],
@@ -717,6 +733,95 @@ def plot_average_return(env: str, groups: dict[str, list[str]],
                         human_readable_x_ticks=human_readable_x_ticks)
 
 
+def build_dog_walk_tr2_resume_groups(local_results_root: str):
+    """Share run selection and colors between return and skipping plots."""
+    groups, colors = {}, {}
+    study_root = os.path.join(local_results_root, "dog_walk",
+                              "bafcv3_tr2_restart", "20260917T054927Z")
+    for horizon, utd, color in ((75, 11, "tab:green"),
+                                 (105, 3, "tab:red"),
+                                 (105, 11, "tab:brown")):
+        label = "TR2: %dk, UTD %d, skipping on" % (horizon, utd)
+        groups[label] = [
+            os.path.join(study_root, "dog_walk_s%d_%dk_utd%d_on" %
+                         (seed, horizon, utd)) for seed in (0, 1)
+        ]
+        colors[label] = color
+    return groups, colors
+
+
+def rollout_skip_frequency(env_steps: ScalarCurve, skipped: ScalarCurve,
+                           opportunities: ScalarCurve) -> ScalarCurve:
+    """Local skip percentage at interval midpoints on the environment axis.
+
+    Match counters to recorded environment steps by summary step. Differences
+    exclude the unknown interval before the first common sample. Repeated
+    environment coordinates (no rollout) are collapsed to their latest counts.
+    """
+    common = np.intersect1d(env_steps.steps,
+                           np.intersect1d(skipped.steps, opportunities.steps))
+    if len(common) < 2:
+        raise ValueError("Need at least two matched rollout-counter samples")
+    env = env_steps.values[np.searchsorted(env_steps.steps, common)]
+    skip = skipped.values[np.searchsorted(skipped.steps, common)]
+    total = opportunities.values[np.searchsorted(opportunities.steps, common)]
+    if np.any(np.diff(env) < 0):
+        raise ValueError("Environment steps decreased in rollout counters")
+    keep = np.r_[np.diff(env) > 0, True]
+    env, skip, total = env[keep], skip[keep], total[keep]
+    delta_skip, delta_total = np.diff(skip), np.diff(total)
+    if (np.any(delta_skip < 0) or np.any(delta_total < delta_skip)):
+        raise ValueError("Invalid or reset rollout counters")
+    valid = delta_total > 0
+    if not np.any(valid):
+        raise ValueError("No rollout opportunities between logged samples")
+    return ScalarCurve(steps=((env[:-1] + env[1:]) / 2)[valid],
+                       values=100 * delta_skip[valid] / delta_total[valid])
+
+
+def plot_dog_walk_tr2_skip_frequency(local_results_root: str,
+                                    output_root: str) -> str:
+    """Plot interval skip frequency, averaged over seeds 0--1."""
+    groups, colors = build_dog_walk_tr2_resume_groups(local_results_root)
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
+    ax.set_xlim(0, 150_000)
+    ax.set_ylim(0, 100)
+    for label, runs in groups.items():
+        curves = []
+        for run in runs:
+            logdir = os.path.join(run, "train")
+            curves.append(rollout_skip_frequency(*[
+                _read_scalar_curve(logdir, tag) for tag in
+                (ENV_STEPS_TAG, SKIP_COUNT_TAG, ROLLOUT_COUNT_TAG)]))
+        aggregate = aggregate_curves(curves, runs, "Rollout skip frequency (%)")
+        _plot_aggregate(ax, aggregate, label, colors[label])
+        _print_summary("dog", label, "Rollout skip frequency (%)", 2, aggregate)
+    return _finish_plot(
+        fig, ax, "Dog Walk TR2 Rollout Skipping (Seeds 0–1)",
+        "Skipped rollout opportunities per logged interval (%)",
+        os.path.join(output_root,
+                     "dog_walk_tr2_resume_seed01_skip_frequency_vs_env_steps.png"),
+        xlabel="Environment Steps", human_readable_x_ticks=True)
+
+
+def plot_dog_walk_tr2_resume(
+        focused_groups: dict[str, list[str]], local_results_root: str,
+        output_root: str) -> str:
+    """Compare seeds 0--1, retaining absolute steps for TR2 continuations."""
+    groups = {"SAC+" if label == "RLPD" else label: runs[:2]
+              for label, runs in focused_groups.items()}
+    colors = dict(FOCUSED_ALGORITHM_COLORS)
+    resume_groups, resume_colors = build_dog_walk_tr2_resume_groups(local_results_root)
+    groups.update(resume_groups)
+    colors.update(resume_colors)
+    return plot_average_return(
+        "dog", groups, output_root,
+        title="Dog Walk TR2 Resume (Seeds 0–1)",
+        xlabel="Environment Steps", ylabel="Average Episodic Return",
+        colors=colors, human_readable_x_ticks=True,
+        filename="dog_walk_tr2_resume_seed01_average_return_vs_env_steps.png")
+
+
 def plot_eval_trust_over_max(env: str, bafc_tr_dirs: list[str],
                              output_root: str) -> str:
     aggregate = aggregate_scalar(bafc_tr_dirs, EVAL_TRUST_OVER_MAX_TAG)
@@ -764,7 +869,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--task", "--tasks", dest="tasks", nargs="+", action="extend",
-        choices=PLOT_TASKS,
+        choices=PLOT_TASKS + ("dog_walk_tr2_resume",),
         help=("Generate only the named task(s); may be repeated. "
               "Defaults to every task."))
     parser.add_argument("--workspace-root", default="/workspace")
@@ -791,7 +896,8 @@ def main() -> None:
     args = _parse_args()
     selected_tasks = set(args.tasks or PLOT_TASKS)
     print("plot tasks: %s" % ", ".join(
-        task for task in PLOT_TASKS if task in selected_tasks))
+        task for task in PLOT_TASKS + ("dog_walk_tr2_resume",)
+        if task in selected_tasks))
 
     local_results_root = args.local_results_root or os.path.join(
         args.workspace_root, "alf_results")
@@ -861,6 +967,11 @@ def main() -> None:
             xlabel="Environment Steps", ylabel="Average Episodic Return",
             colors=FOCUSED_ALGORITHM_COLORS, human_readable_x_ticks=True,
             filename="%s_rlpd_vs_ours_average_return_vs_env_steps.png" % env)
+
+    if {"dog", "dog_walk_tr2_resume"}.intersection(selected_tasks):
+        plot_dog_walk_tr2_resume(rlpd_ours_groups["dog"], local_results_root,
+                                 output_root)
+        plot_dog_walk_tr2_skip_frequency(local_results_root, output_root)
 
     if "hopper_hop" in selected_tasks:
         plot_average_return(
