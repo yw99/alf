@@ -386,6 +386,10 @@ class Agent(RLAlgorithm):
 
         return AlgStep(output=rl_step.output, state=new_state, info=info)
 
+    @property
+    def has_dynamic_train_info(self):
+        return self._rl_algorithm.has_dynamic_train_info
+
     def train_step(self, time_step: TimeStep, state, rollout_info):
         if getattr(self._rl_algorithm, "_restart_options", None):
             # A warm start may begin in critic-only mode. Actor/critic info

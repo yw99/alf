@@ -20,17 +20,18 @@ from unittest import mock
 import torch
 
 import alf
-from alf.algorithms.agent import Agent
+from alf.algorithms.agent import Agent, AgentInfo
 from alf.algorithms.bafc_algorithm_v3 import (BafcAlgorithmV3, BafcCriticInfo,
                                               BafcInfo)
 from alf.algorithms.config import TrainerConfig
 from alf.algorithms.rlpd_algorithm import TrainMode
-from alf.data_structures import LossInfo, StepType, TimeStep, make_experience
+from alf.data_structures import Experience, LossInfo, StepType, TimeStep, make_experience
 from alf.experience_replayers.replay_buffer import ReplayBuffer
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.nest import utils as nest_utils
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
 from alf.utils.checkpoint_utils import Checkpointer
+from alf.utils import dist_utils
 
 
 class _DummyProcess:
@@ -642,6 +643,135 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
             if "_bafc_runtime." in key:
                 del state_dict[key]
         return state_dict
+
+    def test_resumed_training_cycles(self):
+        # Exercise the same collectors that failed after successful loading.
+        for wrapped in (False, True):
+            for sequential in (False, True):
+                for mode in (TrainMode.actor, TrainMode.critic, None, "legacy"):
+                    if sequential and mode in (None, "legacy"):
+                        continue
+                    with self.subTest(wrapped=wrapped, sequential=sequential,
+                                      mode=mode):
+                        factory = self._make_agent if wrapped else self._make_alg
+                        source = factory(actor_utd=1, critic_utd=3)
+                        source_rl = source._rl_algorithm if wrapped else source
+                        if mode not in (None, "legacy"):
+                            source_rl._train_mode = mode
+                            source_rl._actor_update_counter = 3
+                            source_rl._critic_update_counter = 5
+                            source_rl._training_started = True
+                        restored = factory(actor_utd=1, critic_utd=3)
+                        checkpoint = source.state_dict()
+                        if mode == "legacy":
+                            checkpoint = self._without_runtime_state(checkpoint)
+                        restored.load_state_dict(checkpoint)
+                        rl = restored._rl_algorithm if wrapped else restored
+                        before_counters = (rl._actor_update_counter,
+                                           rl._critic_update_counter)
+                        inputs = TimeStep(
+                            step_type=torch.full((2, 2), int(StepType.MID),
+                                                 dtype=torch.int32),
+                            reward=torch.randn(2, 2), discount=torch.ones(2, 2),
+                            observation=torch.randn(2, 2, 4),
+                            prev_action=torch.zeros(2, 2, 2),
+                            env_id=torch.zeros(2, 2, dtype=torch.int64))
+                        info = BafcInfo(action=torch.zeros(2, 2, 2))
+                        if wrapped:
+                            info = AgentInfo(rl=info)
+                        exp = Experience(time_step=inputs,
+                                         action=torch.zeros(2, 2, 2),
+                                         rollout_info=info)
+                        restored._processed_experience_spec = dist_utils.extract_spec(
+                            exp, from_dim=2)
+                        restored._exp_contains_step_type = True
+                        collector = (restored._collect_train_info_sequentially
+                                     if sequential else
+                                     restored._collect_train_info_parallelly)
+                        optimizer = torch.optim.Adam(restored.parameters(), lr=1e-3)
+                        actor_before = [p.detach().clone() for p in
+                                        rl._actor_networks.parameters()]
+                        critic_before = [p.detach().clone() for p in
+                                         rl._critic_networks.parameters()]
+                        # Sequential collection calls train_step twice per update.
+                        for _ in range(12):
+                            optimizer.zero_grad(set_to_none=True)
+                            old_actor = rl._actor_update_counter
+                            old_critic = rl._critic_update_counter
+                            active_mode = rl._train_mode
+                            train_info = collector(exp)
+                            loss = restored.calc_loss(train_info)
+                            terms = [x.mean() for x in (loss.loss, loss.scalar_loss)
+                                     if isinstance(x, torch.Tensor)]
+                            total = sum(terms)
+                            self.assertTrue(torch.isfinite(total).all())
+                            total.backward()
+                            optimizer.step()
+                            rl_info = train_info.rl if wrapped else train_info
+                            rl.after_update(inputs, rl_info)
+                            calls = 2 if sequential else 1
+                            self.assertEqual(
+                                rl._actor_update_counter + rl._critic_update_counter,
+                                old_actor + old_critic + calls)
+                            if old_actor or old_critic:
+                                self.assertEqual(rl._actor_update_counter - old_actor,
+                                                 calls if active_mode == TrainMode.actor else 0)
+                            if old_actor:
+                                self.assertEqual(
+                                    all(p.requires_grad for p in rl._actor_networks.parameters()),
+                                    rl._train_mode == TrainMode.actor)
+                        self.assertGreater(rl._actor_update_counter, before_counters[0])
+                        self.assertGreater(rl._critic_update_counter, before_counters[1])
+                        self.assertTrue(any(not torch.equal(a, b) for a, b in
+                                            zip(actor_before, rl._actor_networks.parameters())))
+                        self.assertTrue(any(not torch.equal(a, b) for a, b in
+                                            zip(critic_before, rl._critic_networks.parameters())))
+
+    def test_target_updater_checkpoint_continuation(self):
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                kwargs = dict(target_critic_period=3,
+                              target_critic_tau=0.25,
+                              target_critic_use_ema=delayed)
+                source = self._make_alg(**kwargs)
+                source._update_target_critic()
+                source._update_target_critic()
+                with tempfile.TemporaryDirectory() as root:
+                    Checkpointer(root, algorithm=source).save(2)
+                    restored = self._make_alg(**kwargs)
+                    restored._replay_eval_observation_pool = torch.ones(3, 4)
+                    Checkpointer(root, algorithm=restored).load(2)
+                self.assertIsNone(restored._replay_eval_observation_pool)
+                self.assertEqual(restored._update_target_critic._counter, 2)
+                for _ in range(7):
+                    with torch.no_grad():
+                        for alg in (source, restored):
+                            for param in alg._critic_networks.parameters():
+                                param.add_(0.1)
+                            alg._update_target_critic()
+                    self.assertEqual(source._update_target_critic._counter,
+                                     restored._update_target_critic._counter)
+                    for a, b in zip(source._target_critic_networks.parameters(),
+                                    restored._target_critic_networks.parameters()):
+                        self.assertTensorEqual(a, b)
+
+    def test_target_updater_legacy_fallback(self):
+        source = self._make_alg()
+        state = source.state_dict()
+        del state['_bafc_runtime.target_updater_counter']
+        restored = self._make_alg()
+        restored._update_target_critic._counter = 5
+        restored.load_state_dict(state)
+        self.assertEqual(restored._update_target_critic._counter, 0)
+        with mock.patch('alf.algorithms.bafc_algorithm_v3.logging.warning') as warn:
+            restored = self._make_alg(target_critic_period=3)
+            restored.load_state_dict(state)
+            warn.assert_called_once()
+        restored = self._make_alg(target_critic_use_ema=True)
+        with self.assertRaisesRegex(RuntimeError, 'lacks intermediate'):
+            restored.load_state_dict(state)
+        with self.assertRaisesRegex(RuntimeError, 'lacks intermediate'):
+            restored.load_state_dict(self._without_runtime_state(state))
 
     def test_runtime_checkpoint_round_trip_and_legacy_fallback(self):
         alg = self._make_alg()

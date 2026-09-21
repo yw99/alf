@@ -360,6 +360,12 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             [self._critic_networks], [self._target_critic_networks],
             target_critic_tau, target_critic_period, target_critic_use_ema)
 
+    @property
+    def has_dynamic_train_info(self):
+        # Inactive actor/critic branches return empty leaves. This also applies
+        # when the first update after a checkpoint is a critic-only update.
+        return True
+
     def _bafc_runtime_key(self, prefix, name):
         return prefix + "_bafc_runtime." + name
 
@@ -375,6 +381,20 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         return torch.as_tensor(value).detach().clone()
 
     def _save_bafc_runtime_state(self, destination, prefix):
+        updater = self._update_target_critic
+        destination[self._bafc_runtime_key(
+            prefix, "target_updater_counter")] = self._bafc_scalar_tensor(
+                updater._counter)
+        if updater._delayed_update:
+            # TargetUpdater keeps these modules in an ordinary list, so they
+            # are not traversed by the normal module state_dict machinery.
+            destination[self._bafc_runtime_key(
+                prefix, "target_updater_recent_models")] = [
+                    {key: value.detach().clone()
+                     for key, value in model.state_dict().items()}
+                    for model in updater._recent_models
+                ]
+
         destination[self._bafc_runtime_key(
             prefix, "training_started")] = self._bafc_scalar_tensor(
                 self._training_started, dtype=torch.bool)
@@ -408,6 +428,27 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                    for key in state_dict.keys())
 
     def _restore_bafc_runtime_state(self, runtime_state):
+        updater = self._update_target_critic
+        updater._counter = self._bafc_scalar_int(
+            runtime_state.get("target_updater_counter", 0))
+        if "target_updater_counter" not in runtime_state and updater._period() > 1:
+            logging.warning(
+                "BAFCv3 checkpoint has no target-updater counter; resetting "
+                "only the target-update phase to zero. Training progress and "
+                "actor/critic counters are restored independently.")
+        if updater._delayed_update:
+            recent = runtime_state.get("target_updater_recent_models")
+            if recent is None:
+                raise RuntimeError(
+                    "BAFCv3 checkpoint lacks intermediate target-updater models "
+                    "required by target_critic_use_ema=True. Resume with the "
+                    "original non-delayed configuration if applicable, or use "
+                    "a checkpoint containing delayed target-updater state.")
+            if len(recent) != len(updater._recent_models):
+                raise RuntimeError("BAFCv3 target-updater model count mismatch")
+            for model, state in zip(updater._recent_models, recent):
+                model.load_state_dict(state, strict=True)
+
         if "training_started" in runtime_state:
             self._training_started = bool(
                 torch.as_tensor(
@@ -482,6 +523,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                               unexpected_keys,
                               error_msgs,
                               visited=None):
+        self._replay_eval_observation_pool = None
         runtime_state = self._pop_bafc_runtime_state(state_dict, prefix)
         legacy_actor_checkpoint = (
             not runtime_state and self._has_legacy_actor_checkpoint(
@@ -492,6 +534,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if runtime_state:
             self._restore_bafc_runtime_state(runtime_state)
         elif legacy_actor_checkpoint:
+            self._restore_bafc_runtime_state({})
             self._training_started = True
             self._apply_train_mode_grad_flags()
 

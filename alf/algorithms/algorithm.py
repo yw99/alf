@@ -819,6 +819,11 @@ class Algorithm(AlgorithmInterface):
         return self._train_state_spec
 
     @property
+    def has_dynamic_train_info(self):
+        """Whether train-info leaves can change between training updates."""
+        return False
+
+    @property
     def train_info_spec(self):
         """The spec for the ``AlgStep.info`` returned from ``train_step()``."""
         assert self._train_info_spec is not None, (
@@ -1817,7 +1822,7 @@ class Algorithm(AlgorithmInterface):
                     "the state but will simply keep updating it.")
             policy_step = self.train_step(exp.time_step, policy_state,
                                           exp.rollout_info)
-            if self._train_info_spec is None:
+            if self._train_info_spec is None or self.has_dynamic_train_info:
                 self._train_info_spec = dist_utils.extract_spec(
                     policy_step.info)
             info_list.append(
@@ -1846,7 +1851,7 @@ class Algorithm(AlgorithmInterface):
         policy_step = self.train_step(exp.time_step, policy_state,
                                       exp.rollout_info)
 
-        if self._train_info_spec is None:
+        if self._train_info_spec is None or self.has_dynamic_train_info:
             self._train_info_spec = dist_utils.extract_spec(policy_step.info)
         info = dist_utils.distributions_to_params(policy_step.info)
         info = alf.nest.map_structure(
