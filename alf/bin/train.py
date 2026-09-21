@@ -181,7 +181,9 @@ def _setup_remote_configs_if_needed():
         })
 
 
-def _train(root_dir, local_rank=-1, rank=0, world_size=1):
+@alf.configurable(whitelist=['trainer_class'])
+def _train(root_dir, local_rank=-1, rank=0, world_size=1,
+           trainer_class=policy_trainer.RLTrainer):
     """Launch the trainer after the conf file has been parsed. This function
     could be called by grid search after the config has been modified.
 
@@ -192,6 +194,8 @@ def _train(root_dir, local_rank=-1, rank=0, world_size=1):
             non-distributed training, this id should be 0.
         world_size (int): The number of processes in total. If set to 1, it is
             interpreted as "non distributed mode".
+        trainer_class: Optional RL trainer class; defaults to the ordinary
+            RLTrainer. Used by dedicated, opt-in resume entrypoints.
     """
     conf_file = common.get_conf_file()
     trainer_conf = policy_trainer.TrainerConfig(root_dir=root_dir,
@@ -214,8 +218,7 @@ def _train(root_dir, local_rank=-1, rank=0, world_size=1):
                 alg_wrapper_ctor = DistributedUnroller
         else:
             alg_wrapper_ctor = None
-        trainer = policy_trainer.RLTrainer(trainer_conf, ddp_rank,
-                                           alg_wrapper_ctor)
+        trainer = trainer_class(trainer_conf, ddp_rank, alg_wrapper_ctor)
     elif trainer_conf.ml_type == 'sl':
         # NOTE: SLTrainer does not support distributed training yet
         if world_size > 1:
