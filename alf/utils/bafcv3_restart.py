@@ -488,12 +488,11 @@ def quantile_rank_maxima(values, quantile):
     return maxima, calibrate_threshold(maxima, quantile)['eval_trust_max']
 
 
-def calibrate(agent, options, rank):
+def measure_calibration(agent, options, rank, seed_context=()):
+    """Measure a frozen policy without installing a threshold or changing state."""
     alg = agent._rl_algorithm
-    if alg._restart_calibration is not None:
-        raise ValueError('Refusing to recalibrate a calibrated checkpoint')
     source_hash = options['inputs'][options['source_checkpoint']]['sha256']
-    seed = stable_seed(source_hash, options['calibration_seed'], rank)
+    seed = stable_seed(source_hash, options['calibration_seed'], rank, *seed_context)
     before = collective_call(lambda: state_digest(agent.state_dict()))
     modes = {module: module.training for module in agent.modules()}
     values = []
@@ -540,6 +539,16 @@ def calibrate(agent, options, rank):
         box = [result if rank == 0 else None]
         dist.broadcast_object_list(box, src=0)
         result = box[0]
+    return result
+
+
+def calibrate(agent, options, rank):
+    alg = agent._rl_algorithm
+    if alg._restart_calibration is not None:
+        raise ValueError('Refusing to recalibrate a calibrated checkpoint')
+    result = measure_calibration(agent, options, rank)
+    threshold = result['threshold']
+    values = result['rank_values']
     alg._restart_calibration = result
     alg._eval_trust_max = threshold
     alg._last_eval_trust = torch.tensor(values[-1][rank], device=alg._actor_eval_samples.device)

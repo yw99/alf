@@ -58,6 +58,12 @@ def prepare(args):
                     calibration_seed=args.calibration_seed,
                     rollout_skipping=args.rollout_skipping == 'on',
                     final_env_steps_per_rank=args.final_env_steps_per_rank)
+    if getattr(args, 'auto_skip', None) is not None:
+        from alf.utils.bafcv3_auto_skip import validate_settings
+        validate_settings(args.auto_skip)
+        if settings['rollout_skipping']:
+            raise ValueError('Automatic activation must start with skipping off')
+        settings['auto_skip'] = args.auto_skip
     validate_options(settings)
     inputs = fingerprint_inputs(source)
     key = settings_fingerprint(settings, inputs)
@@ -91,6 +97,9 @@ def prepare(args):
                   'alf/algorithms/bafc_algorithm_v3.py', 'alf/algorithms/bafc_algorithm_v3_tr2.py',
                   'alf/algorithms/agent.py', 'alf/trainers/policy_trainer.py',
                   'alf/experience_replayers/replay_buffer.py', 'alf/utils/checkpoint_utils.py']
+    if 'auto_skip' in settings:
+        code_files += ['alf/utils/bafcv3_auto_skip.py',
+                       'alf/bin/train_bafcv3_tr2_auto_skip.py']
     hints = preconfig(run / 'alf_config.py')
     for name in code_files:
         destination = root / 'code_snapshot' / name
@@ -266,10 +275,10 @@ def mapped_validation_worker(rank, world_size, options, rendezvous, smoke_iters,
                       [0] * WORLD_SIZE, smoke_env_steps)
 
 
-def main(argv=None):
+def main(argv=None, argument_parser=None):
     # Must precede CUDA initialization in every fresh training worker.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    args = parser().parse_args(argv)
+    args = (argument_parser or parser()).parse_args(argv)
     if not 0 <= args.smoke_train_iters <= 2 or (args.smoke_train_iters and not args.validate_only):
         raise ValueError('--smoke-train-iters requires --validate-only and a value in 0..2')
     gpu_indices = [int(i) for i in args.worker_gpus.split(',')]

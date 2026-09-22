@@ -23,7 +23,12 @@ Run from the repository root, for example::
     python alf/utils/plot_dog_humanoid_bafc_comparison.py --task dog_walk_tr2_resume
 
 For each environment, the script writes an AverageReturn comparison, including
-BAFCv6 (labeled Ours_reweight) where runs are available. RLPD is labeled
+BAFCv6 (labeled Ours_reweight) where runs are available. The main Dog and
+Humanoid Walk/Run comparisons show SAC+, TD3+, Ours, and Ours_reweight
+in that legend order, excluding TR2. Humanoid Run BAFCv6
+uses seeds 0--3 from <workspace-root>/server7_copy. Dog Fetch, Walk,
+Trot, and Stand BAFCv6 use seeds 0--3 from server2_copy, server9_copy,
+server_copy, and server9_copy, respectively. RLPD is labeled
 SAC+ throughout; algorithm colors are shared across plot families. It also writes BAFC_TR trust diagnostics for
 the three environments with BAFC_TR runs, the two-seed Humanoid comparison,
 and focused Ours-vs-SAC+ AverageReturn plots for Dog Fetch, Dog Run,
@@ -269,6 +274,11 @@ def build_run_groups(
             "BAFC_TR": [os.path.join(server3_copy_root,
                                      "dog_walk_bafcv3_tr2_decay_s%d" % seed)
                         for seed in range(4)],
+            "BAFCv6": [
+                os.path.join(workspace_root, "server9_copy",
+                             "dog_walk_bafcv6_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "dog_fetch": {
             "RLPD": [
@@ -297,6 +307,11 @@ def build_run_groups(
                 os.path.join(server_copy_root,
                              "dog_fetch_bafcv3_tr2_rtT_s%d" % seed)
                 for seed in (2, 3)
+            ],
+            "BAFCv6": [
+                os.path.join(server2_copy_root,
+                             "dog_fetch_bafcv6_s%d" % seed)
+                for seed in range(4)
             ],
         },
         "dog_run": {
@@ -339,6 +354,11 @@ def build_run_groups(
                              "dog_stand_bafcv3_rtT_s%d" % seed)
                 for seed in range(4)
             ],
+            "BAFCv6": [
+                os.path.join(workspace_root, "server9_copy",
+                             "dog_stand_bafcv6_s%d" % seed)
+                for seed in range(4)
+            ],
         },
         "dog_trot": {
             "RLPD": [
@@ -358,6 +378,11 @@ def build_run_groups(
                 os.path.join(server_copy_root,
                              "dog_trot_bafcv3_rtT_s%d" % seed)
                 for seed in (2, 3)
+            ],
+            "BAFCv6": [
+                os.path.join(server_copy_root,
+                             "dog_trot_bafcv6_s%d" % seed)
+                for seed in range(4)
             ],
         },
         "humanoid": {
@@ -384,6 +409,15 @@ def build_run_groups(
                              "hum_bafcv3_tr2_s%d" % seed)
                 for seed in (2, 3)
             ],
+            "BAFCv6": [
+                os.path.join(server_copy_root,
+                             "hum_bafcv6_trainable_rtT_s%d" % seed)
+                for seed in (0, 1)
+            ] + [
+                os.path.join(server2_copy_root,
+                             "humanoid_walk_bafcv6_s%d" % seed)
+                for seed in (2, 3)
+            ],
         },
         "humanoid_run": {
             "RLPD": [
@@ -393,6 +427,11 @@ def build_run_groups(
             ],
             "BAFCv3": [
                 os.path.join(server3_copy_root, "humanoid_run_bafcv3_rtT_s%d" % seed)
+                for seed in range(4)
+            ],
+            "BAFCv6": [
+                os.path.join(workspace_root, "server7_copy",
+                             "humanoid_run_bafcv6_s%d" % seed)
                 for seed in range(4)
             ],
         },
@@ -709,6 +748,17 @@ def _finish_plot(fig: plt.Figure, ax: plt.Axes, title: str, ylabel: str,
     return output_path
 
 
+def build_comparison_group(runs: dict[str, list[str]],
+                           td3_runs: list[str]) -> dict[str, list[str]]:
+    """Select the main comparison curves in a shared legend order, without TR2."""
+    return {
+        "SAC+": runs["RLPD"],
+        "TD3+": td3_runs,
+        "Ours": runs["BAFCv3"],
+        "Ours_reweight": runs["BAFCv6"],
+    }
+
+
 def plot_average_return(env: str, groups: dict[str, list[str]],
                         output_root: str, title: str | None = None,
                         filename: str | None = None,
@@ -942,7 +992,11 @@ def main() -> None:
     for env in ("dog", "dog_fetch", "dog_run", "dog_stand", "dog_trot",
                 "humanoid", "humanoid_run", "humanoid_stand"):
         if env in selected_tasks:
-            plot_average_return(env, groups[env], output_root)
+            comparison = groups[env]
+            if env != "humanoid_stand":
+                comparison = build_comparison_group(
+                    comparison, rlpd_ours_groups[env]["TD3+"])
+            plot_average_return(env, comparison, output_root)
     for env in ("dog", "dog_fetch", "humanoid"):
         if env not in selected_tasks:
             continue

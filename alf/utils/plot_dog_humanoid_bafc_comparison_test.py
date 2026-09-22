@@ -60,6 +60,10 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertEqual(baseline.kwargs["colors"],
                          plotter.BASELINE_ALGORITHM_COLORS)
         self.assertEqual(len(baseline.args[1]["SAC+"]), 4)
+        comparison = plot.call_args_list[1].args[1]
+        self.assertEqual(list(comparison),
+                         ["SAC+", "TD3+", "Ours", "Ours_reweight"])
+        self.assertTrue(all(len(runs) == 4 for runs in comparison.values()))
         self.assertIn("seed0123", baseline.kwargs["filename"])
         trust.assert_not_called()
         raw.assert_not_called()
@@ -175,17 +179,26 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
         self.assertIn("server2", groups["dog_run"]["BAFCv6"][1])
         self.assertIn("server1", groups["dog_run"]["BAFCv6"][2])
         self.assertIn("server1", groups["dog_run"]["BAFCv6"][3])
-        self.assertNotIn("BAFCv6", groups["humanoid"])
-        self.assertNotIn("BAFCv6", groups["dog"])
-        self.assertEqual(set(groups["dog_trot"]), {"RLPD", "BAFCv3"})
+        self.assertEqual(groups["humanoid"]["BAFCv6"], [
+            "/server1/hum_bafcv6_trainable_rtT_s0",
+            "/server1/hum_bafcv6_trainable_rtT_s1",
+            "/server2/humanoid_walk_bafcv6_s2",
+            "/server2/humanoid_walk_bafcv6_s3",
+        ])
+        for env in ("dog", "dog_fetch", "dog_trot", "dog_stand"):
+            self.assertEqual(len(groups[env]["BAFCv6"]), 4)
+        self.assertEqual(set(groups["dog_trot"]),
+                         {"RLPD", "BAFCv3", "BAFCv6"})
         for run_dirs in groups["dog_trot"].values():
             self.assertEqual(len(run_dirs), 4)
-        self.assertEqual(set(groups["dog_stand"]), {"RLPD", "BAFCv3"})
+        self.assertEqual(set(groups["dog_stand"]),
+                         {"RLPD", "BAFCv3", "BAFCv6"})
         self.assertTrue(all("server1" in path for path in
                             groups["dog_stand"]["RLPD"]))
         self.assertTrue(all("server2" in path for path in
                             groups["dog_stand"]["BAFCv3"]))
-        self.assertEqual(set(groups["humanoid_run"]), {"RLPD", "BAFCv3"})
+        self.assertEqual(set(groups["humanoid_run"]),
+                         {"RLPD", "BAFCv3", "BAFCv6"})
         self.assertTrue(all("server4" in path for path in
                             groups["humanoid_run"]["RLPD"]))
         for run_dirs in groups["humanoid_run"].values():

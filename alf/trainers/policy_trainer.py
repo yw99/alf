@@ -833,6 +833,11 @@ class RLTrainer(Trainer):
             iter_num += 1
             self._trainer_progress.update(iter_num, total_time_steps)
 
+            rl_algorithm = getattr(self._algorithm, '_rl_algorithm', None)
+            if getattr(rl_algorithm, '_auto_skip_controller', None) is not None:
+                from alf.utils.bafcv3_auto_skip import after_iteration
+                after_iteration(self._algorithm)
+
             if self._need_to_evaluate(iter_num):
                 self._eval()
                 self._num_evals_performed += 1

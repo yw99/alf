@@ -312,6 +312,11 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         # Opt-in warm starts leave ordinary TR2 configuration unchanged.
         self._restart_options = restart_options
         self._restart_calibration = None
+        self._auto_skip_controller = None
+        if restart_options and restart_options.get('auto_skip') is not None:
+            from alf.utils.bafcv3_auto_skip import AutoSkipController
+            self._auto_skip_controller = AutoSkipController(
+                restart_options['auto_skip'], restart_options['final_env_steps_per_rank'])
         self._critic_phase_offset = 0
         self._trust_metric_num_obs = trust_metric_num_obs
         self._trust_metric_target_obs_cache_size = (
@@ -517,6 +522,9 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         return int(torch.as_tensor(value).reshape(()).item())
 
     def _save_bafc_runtime_state(self, destination, prefix):
+        if self._auto_skip_controller is not None:
+            destination[self._bafc_runtime_key(prefix, 'auto_skip')] = (
+                self._auto_skip_controller.state_dict())
         if self._restart_calibration is not None:
             destination[self._bafc_runtime_key(prefix, "restart_calibration")] = (
                 copy.deepcopy(self._restart_calibration))
@@ -615,6 +623,15 @@ class BafcAlgorithmV3TR2(OffPolicyAlgorithm):
         if "target_updater_counter" in runtime_state:
             self._update_target_critic._counter = self._bafc_scalar_int(
                 runtime_state["target_updater_counter"])
+
+        if self._auto_skip_controller is not None:
+            if 'auto_skip' not in runtime_state:
+                raise ValueError('Missing automatic skip checkpoint state')
+            self._auto_skip_controller.load_state_dict(runtime_state['auto_skip'])
+            calibration = self._auto_skip_controller.calibration
+            self._enable_eval_rollout_skip_gate = calibration is not None
+            if calibration is not None:
+                self._eval_trust_max = calibration['threshold']
 
         self._apply_train_mode_grad_flags()
 
