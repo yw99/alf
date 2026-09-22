@@ -29,6 +29,21 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
                 curve(steps, steps), curve(steps, np.array([0., 2., 1., 4.])),
                 curve(steps, steps))
 
+    def test_continuation_keeps_absolute_steps_and_replaces_overlap(self):
+        continuation = plotter.ScalarCurve(np.array([150., 200.]),
+                                           np.array([3., 4.]))
+        history = plotter.ScalarCurve(np.array([0., 100., 150., 175.]),
+                                      np.array([1., 2., 9., 9.]))
+        with mock.patch.object(plotter, "_read_scalar_curve",
+                               side_effect=[continuation, history]) as read:
+            curve = plotter._read_run_curve(
+                "/ws/server3_copy/dog_walk_bafcv3_extended800k_s0",
+                plotter.RETURN_TAG)
+        np.testing.assert_array_equal(curve.steps, [0., 100., 150., 200.])
+        np.testing.assert_array_equal(curve.values, [1., 2., 3., 4.])
+        self.assertEqual(read.call_args.args[0],
+                         "/ws/server2_copy/dog_bafcv3_s0/train")
+
     def test_initial_eval_trust_threshold(self):
         self.assertEqual(plotter.INITIAL_EVAL_TRUST_THRESHOLD, 30.0)
 

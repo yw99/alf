@@ -549,6 +549,13 @@ class Trainer(object):
                 checkpointer (Checkpointer):
         """
         rl_algorithm = getattr(self._algorithm, "_rl_algorithm", None)
+        # Opt-in algorithm-specific warm starts must not run a dummy update.
+        restore_restart = getattr(type(rl_algorithm),
+                                  "_restore_restart_checkpoint", None)
+        if restore_restart is not None:
+            restore_restart(rl_algorithm, self, checkpointer)
+            self._checkpointer = checkpointer
+            return
         if getattr(rl_algorithm, "_restart_options", None):
             from alf.utils.bafcv3_restart import restore_trainer
             restore_trainer(self, checkpointer)

@@ -41,7 +41,11 @@ across server copies; the longest training budget with all four seeds
 is preferred. Unavailable four-seed curves are reported and omitted.
 Dog Walk and Stand also include four-seed TD3+ runs from server9_copy
 in both comparisons, as do Dog Fetch, Run, and Trot from server3_copy.
-Dog Walk plots are limited to 150,000 environment steps. A separate seeds 0--1
+Dog Walk return plots show a 200,000-step horizon. BAFCv3 and RLPD use
+the extended800k and reconstruction800k runs from server3_copy; the SAC
+baseline prefers the four reconstruction800k runs from the same copy.
+Continuation curves prepend the matching original seed history at absolute steps.
+Trust and skip diagnostics retain a 150,000-step limit. A separate seeds 0--1
 comparison includes the TR2 resume study 20260917T054927Z; continuation curves
 start at their recorded absolute environment steps and use only seed overlap.
 A companion plot shows local rollout skip percentages between logged samples
@@ -235,13 +239,43 @@ def aggregate_curves(curves: list[ScalarCurve],
                           std=np.std(values, axis=0, ddof=0))
 
 
+def _read_run_curve(run_dir: str, tag: str) -> ScalarCurve:
+    """Prepend original history to the copied Dog Walk continuation logs."""
+    curve = _read_scalar_curve(os.path.join(run_dir, "train"), tag)
+    match = re.fullmatch(
+        r"dog_walk_(bafcv3_extended800k|rlpd_reconstruction800k|"
+        r"sac_reconstruction800k)_s([0123])", os.path.basename(run_dir))
+    if not match or curve.steps[0] == 0:
+        return curve
+    experiment, seed_text = match.groups()
+    seed = int(seed_text)
+    workspace_root = os.path.dirname(os.path.dirname(run_dir))
+    if experiment == "sac_reconstruction800k":
+        predecessor = os.path.join(workspace_root, "server3_copy",
+                                   "dog_walk_sac_s%d" % seed)
+    else:
+        server = "server2_copy" if seed < 2 else "server_copy"
+        if experiment == "rlpd_reconstruction800k":
+            name = "dog_rlpd_s%d" % seed
+        else:
+            name = ("dog_bafcv3_s%d" if seed < 2 else
+                    "dog_bafc_trainable_rtT_s%d") % seed
+        predecessor = os.path.join(workspace_root, server, name)
+    history = _read_scalar_curve(os.path.join(predecessor, "train"), tag)
+    # Continuations retain absolute steps and take precedence on overlap.
+    before_resume = history.steps < curve.steps[0]
+    return ScalarCurve(
+        steps=np.concatenate((history.steps[before_resume], curve.steps)),
+        values=np.concatenate((history.values[before_resume], curve.values)))
+
+
 def aggregate_scalar(run_dirs: list[str], tag: str) -> AggregateCurve:
     logdirs = [os.path.join(run_dir, "train") for run_dir in run_dirs]
     missing = [path for path in logdirs if not os.path.isdir(path)]
     if missing:
         raise ValueError("Missing required TensorBoard directories:%s" %
                          _display_list(missing))
-    curves = [_read_scalar_curve(logdir, tag) for logdir in logdirs]
+    curves = [_read_run_curve(run_dir, tag) for run_dir in run_dirs]
     return aggregate_curves(curves, logdirs, tag)
 
 
@@ -257,19 +291,14 @@ def build_run_groups(
     groups = {
         "dog": {
             "RLPD": [
-                os.path.join(server2_copy_root, "dog_rlpd_s%d" % seed)
-                for seed in (0, 1)
-            ] + [
-                os.path.join(server_copy_root, "dog_rlpd_s%d" % seed)
-                for seed in (2, 3)
+                os.path.join(server3_copy_root,
+                             "dog_walk_rlpd_reconstruction800k_s%d" % seed)
+                for seed in range(4)
             ],
             "BAFCv3": [
-                os.path.join(server2_copy_root, "dog_bafcv3_s%d" % seed)
-                for seed in (0, 1)
-            ] + [
-                os.path.join(server_copy_root,
-                             "dog_bafc_trainable_rtT_s%d" % seed)
-                for seed in (2, 3)
+                os.path.join(server3_copy_root,
+                             "dog_walk_bafcv3_extended800k_s%d" % seed)
+                for seed in range(4)
             ],
             "BAFC_TR": [os.path.join(server3_copy_root,
                                      "dog_walk_bafcv3_tr2_decay_s%d" % seed)
@@ -600,6 +629,15 @@ def build_baseline_run_groups(
                        task, (task,))
         groups[task] = {}
         for algorithm, label in (("sac", "SAC"), ("td3v2", "TD3")):
+            if task == "dog" and algorithm == "sac":
+                extended = [os.path.join(
+                    workspace_root, "server3_copy",
+                    "dog_walk_sac_reconstruction800k_s%d" % seed)
+                            for seed in range(4)]
+                if all(os.path.isdir(os.path.join(run, "train"))
+                       for run in extended):
+                    groups[task][label] = extended
+                    continue
             pattern = re.compile(
                 r"(?:%s)_%s(?:_(\d+)([km]))?_s([0123])$" %
                 ("|".join(map(re.escape, aliases)), algorithm))
@@ -768,7 +806,7 @@ def plot_average_return(env: str, groups: dict[str, list[str]],
                         human_readable_x_ticks: bool = False) -> str:
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
     if env == "dog":
-        ax.set_xlim(0, 150_000)
+        ax.set_xlim(0, 200_000)
     for label, run_dirs in groups.items():
         aggregate = aggregate_scalar(run_dirs, RETURN_TAG)
         color = colors[label] if colors is not None else None
