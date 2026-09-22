@@ -160,20 +160,22 @@ class V6RestartTest(unittest.TestCase):
         for seed in (0, 1):
             run = sources / f'dog_run_bafcv3_rtT_s{seed}' / 'train/algorithm'
             run.mkdir(parents=True)
-            for horizon in (120, 140, 160):
+            for horizon in (120, 140):
                 (run / f'ckpt-{horizon * 1001}').touch()
         output = root / 'output'
         script = Path(__file__).resolve().parents[1] / 'examples/run_dog_run_bafcv6_restart_6jobs-4g.sh'
         result = subprocess.run(['bash', str(script), '--dry-run', '--dir', str(output),
             '--source-base-dir', str(sources), '--run-id', 'test'], check=True, capture_output=True, text=True)
         commands = [shlex.split(line) for line in result.stdout.splitlines() if line.startswith('nohup ')]
-        self.assertEqual(len(commands), 6)
+        self.assertEqual(len(commands), 4)
         args = [parser().parse_args(cmd[4:cmd.index('<')]) for cmd in commands]
-        self.assertEqual(len({arg.root_dir for arg in args}), 6)
+        self.assertEqual(len({arg.root_dir for arg in args}), 4)
         self.assertEqual({Path(arg.source_checkpoint).name for arg in args},
-                         {'ckpt-120120', 'ckpt-140140', 'ckpt-160160'})
+                         {'ckpt-120120', 'ckpt-140140'})
         self.assertTrue(all(arg.final_env_steps_per_rank == 200000 and arg.resume for arg in args))
         self.assertTrue(all(arg.critic_reweighting_solver_iters == 1 for arg in args))
+        self.assertTrue(all(arg.critic_reweighting_max_weight == 6 for arg in args))
+        self.assertTrue(all(arg.critic_reweighting_num_target_obs == 64 and arg.critic_reweighting_target_obs_cache_size == 512 for arg in args))
         self.assertFalse(output.exists())
 
     def test_options(self):

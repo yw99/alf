@@ -65,22 +65,23 @@ and without `--prepare-only`. To resume a stopped V6 run, use the same command w
 `--resume`. Preparation checks input and configuration fingerprints and rejects
 changed settings. A new output must be empty and separate from the source run.
 
-## Six-job dog:run launcher
+## Four-job dog:run launcher
 
 ```bash
 bash alf/examples/run_dog_run_bafcv6_restart_6jobs-4g.sh --dry-run
 bash alf/examples/run_dog_run_bafcv6_restart_6jobs-4g.sh
 ```
 
-The second command starts six concurrent jobs, each using all four configured
-GPUs. It selects seeds 0/1 and checkpoints `ckpt-120120`, `ckpt-140140`, and
-`ckpt-160160`, verifies their actual environment steps (120k/140k/160k), and ends
+The second command starts four concurrent jobs, each using all four configured
+GPUs. It selects seeds 0/1 and checkpoints `ckpt-120120` and `ckpt-140140`, then
+verifies their actual environment steps (120k/140k), and ends
 at 200k per rank. Sources default to
 `/workspace/server2_copy/dog_run_bafcv3_rtT_s{seed}`.
 
 Options: `--dir`, `--run-id`, `--gpus`, `--source-base-dir`, and `--dry-run`.
 Results default to `/workspace/alf_results/dog_run/bafcv6_restart/<run-id>/`.
-All six inputs are preflighted and all manifests prepared before any launch.
+The launcher uses 64 target observations with a 512-observation cache.
+All four inputs are preflighted and all manifests prepared before any launch.
 Dry-run only prints commands and requires the selected source model paths to
 exist; it does not create files or inspect their tensor payloads. Full preflight
 also checks optimizer/replay shards and saved task/seed configuration.
@@ -146,4 +147,4 @@ bash -n alf/examples/run_dog_run_bafcv6_restart_6jobs-4g.sh
 Tests cover V3/V6 equivalence with reweighting disabled through a full 11/1 cycle,
 first-update activation, nonuniform weighted loss, optimizer remapping, replay
 boundaries, native metadata/RNG, missing-shard collective failures, ordinary
-trainer fallback, TR2 compatibility, and the six-command dry-run grid.
+trainer fallback, TR2 compatibility, and the four-command dry-run grid.
