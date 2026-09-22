@@ -46,7 +46,7 @@ cd "$REPO_ROOT"
 build_command() {
     local seed="$1" source
     if [[ "$ALGORITHM" == sac ]]; then
-        source="/workspace/server3_copy/dog_walk_sac_s$seed"
+        source="/workspace/alf_results/dog/sac_dmc_4g/seed_$seed"
     elif (( seed < 2 )); then
         source="/workspace/server2_copy/dog_rlpd_s$seed"
     else
