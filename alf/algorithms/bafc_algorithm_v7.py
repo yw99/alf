@@ -87,6 +87,12 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
     ``training_policy='base'`` uses the marginal, unconditioned actor for all
     training computations. ``training_policy='seeded'`` conditions training
     actions and actor fingerprints on the seed stored in replay.
+
+    ``eval_samples_source='trainable'`` (the default) learns the randomly
+    initialized observations used to encode actors. ``'frozen'`` keeps those
+    observations fixed throughout training while still training the actor and
+    encoder. Frozen samples are saved and restored in checkpoints, and cannot
+    be used with a separate ``eval_samples_optimizer``.
     """
 
     def __init__(self,
@@ -129,7 +135,8 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
                  debug_summaries=False,
                  name="BafcAlgorithmV7",
                  use_random_critic_targets=True,
-                 num_sampled_critic_targets=1):
+                 num_sampled_critic_targets=1,
+                 eval_samples_source="trainable"):
         del calculate_priority
         if not isinstance(action_spec, BoundedTensorSpec):
             raise TypeError("BAFCv7 requires a bounded continuous action spec")
@@ -172,6 +179,15 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
             raise ValueError(
                 "eval_samples_init_method must be 'normal' or 'uniform'")
 
+        if eval_samples_source not in ("trainable", "frozen"):
+            raise ValueError(
+                "eval_samples_source must be 'trainable' or 'frozen'")
+        if (eval_samples_source != "trainable"
+                and eval_samples_optimizer is not None):
+            raise ValueError(
+                "eval_samples_optimizer is only supported when "
+                "eval_samples_source='trainable'")
+
         if actor_utd is None and critic_utd is None:
             self._train_mode = TrainMode.standard
         else:
@@ -203,6 +219,7 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         self._num_sampled_critic_targets = num_sampled_critic_targets
         self._actor_eval_type = actor_eval_type
         self._num_actor_eval_samples = num_actor_eval_samples
+        self._eval_samples_source = eval_samples_source
         self._checkpoint_replay_buffer = checkpoint_replay_buffer
         self._dqda_clipping = dqda_clipping
 
@@ -274,7 +291,9 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         self._critic_networks = critic_networks
         self._target_critic_networks = critic_networks.copy(
             name="target_critic_networks")
-        self._actor_eval_samples = nn.Parameter(actor_eval_samples)
+        self._actor_eval_samples = nn.Parameter(
+            actor_eval_samples,
+            requires_grad=eval_samples_source == "trainable")
 
         if actor_optimizer is not None:
             self.add_optimizer(actor_optimizer, [actor_networks])
@@ -665,7 +684,8 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         for parameter in self._actor_networks.parameters():
             parameter.requires_grad_(actor_requires_grad)
         self._actor_eval_samples.requires_grad_(
-            standard_or_initial or self._train_mode == TrainMode.critic)
+            self._eval_samples_source == "trainable" and
+            (standard_or_initial or self._train_mode == TrainMode.critic))
 
     def _update_train_mode(self):
         if self._train_mode == TrainMode.actor:
@@ -683,8 +703,11 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         episode_seed = rollout_info.episode_seed
         action, action_state = self._training_action(inputs.observation,
                                                      episode_seed)
+        actor_eval_samples = self._actor_eval_samples
+        if self._eval_samples_source == "frozen":
+            actor_eval_samples = actor_eval_samples.detach()
         actor_encoding, actor_features = self._training_encoding(
-            self._actor_eval_samples, episode_seed)
+            actor_eval_samples, episode_seed)
 
         standard_or_initial = (
             self._train_mode == TrainMode.standard or

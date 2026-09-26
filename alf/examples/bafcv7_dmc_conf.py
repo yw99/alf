@@ -95,6 +95,7 @@ alf.config(
     policy_feature_mode="mean_log_std",
     eval_samples_init_method="normal",
     eval_samples_clipping=False,
+    eval_samples_source="trainable",
     actor_eval_type="last_two",
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,

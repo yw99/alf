@@ -105,7 +105,8 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
             prev_action=torch.zeros(batch_size, 2),
             env_id=torch.arange(batch_size))
 
-    def _backward_real_critic_loss(self, alg, actor_only=False):
+    def _backward_real_critic_loss(self, alg, actor_only=False,
+                                   critic_only=False):
         time_length = 2
         batch_size = 4
         flat_size = time_length * batch_size
@@ -118,8 +119,9 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
             episode_seed=torch.randn(flat_size, 2),
             rollout_actor_id=torch.zeros(flat_size, dtype=torch.int64))
 
-        if actor_only:
-            alg._train_mode = TrainMode.actor
+        if actor_only or critic_only:
+            alg._train_mode = (TrainMode.actor if actor_only
+                               else TrainMode.critic)
             alg._critic_update_counter = 1
             alg._apply_train_mode_grad_flags()
 
@@ -129,17 +131,20 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
             lambda value: value.reshape(time_length, batch_size,
                                         *value.shape[1:]), train_info)
         loss_info = alg.calc_loss(train_info)
-        total_loss = loss_info.loss.mean() + loss_info.scalar_loss
+        total_loss = loss_info.loss.mean()
+        if isinstance(loss_info.scalar_loss, torch.Tensor):
+            total_loss = total_loss + loss_info.scalar_loss
         total_loss.backward()
 
         self.assertTrue(torch.isfinite(total_loss))
-        projection = alg._actor_networks._projection_net
-        for gradient in (
-                projection._means_projection_layer.weight.grad,
-                projection._std_projection_layer.weight.grad):
-            self.assertIsNotNone(gradient)
-            self.assertTrue(torch.all(torch.isfinite(gradient)))
-            self.assertGreater(gradient.abs().sum().item(), 0.)
+        if not critic_only:
+            projection = alg._actor_networks._projection_net
+            for gradient in (
+                    projection._means_projection_layer.weight.grad,
+                    projection._std_projection_layer.weight.grad):
+                self.assertIsNotNone(gradient)
+                self.assertTrue(torch.all(torch.isfinite(gradient)))
+                self.assertGreater(gradient.abs().sum().item(), 0.)
 
         if not actor_only:
             critic_gradients = [
@@ -435,6 +440,90 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
                             **variant_args)
                         self._backward_real_critic_loss(alg, actor_only=True)
 
+    def test_eval_samples_initialization_and_default_updates(self):
+        for init_method in ("normal", "uniform"):
+            with self.subTest(init_method=init_method):
+                torch.manual_seed(123)
+                trainable = self._make_alg(
+                    eval_samples_init_method=init_method)
+                torch.manual_seed(123)
+                frozen = self._make_alg(
+                    eval_samples_init_method=init_method,
+                    eval_samples_source="frozen")
+                initial = trainable._actor_eval_samples.detach().clone()
+                self.assertTensorEqual(frozen._actor_eval_samples, initial)
+                self.assertTrue(trainable._actor_eval_samples.requires_grad)
+                self.assertFalse(frozen._actor_eval_samples.requires_grad)
+                optimizer = torch.optim.Adam(trainable.parameters(), lr=1e-3)
+                self._backward_real_critic_loss(trainable)
+                self.assertGreater(
+                    trainable._actor_eval_samples.grad.abs().sum().item(), 0.)
+                optimizer.step()
+                self.assertFalse(torch.equal(
+                    trainable._actor_eval_samples, initial))
+
+    def test_frozen_eval_samples_survive_optimizer_updates(self):
+        for variant, variant_args in self._real_critic_cases():
+            for feature_mode in ("mean_log_std", "action_quantiles"):
+                with self.subTest(variant=variant, feature_mode=feature_mode):
+                    alg = self._make_alg(
+                        eval_samples_source="frozen",
+                        policy_feature_mode=feature_mode,
+                        **variant_args)
+                    initial = alg._actor_eval_samples.detach().clone()
+                    optimizer = torch.optim.Adam(alg.parameters(), lr=1e-3)
+                    # Combined initial update, actor-only, then critic-only.
+                    for actor_only, critic_only in ((False, False),
+                                                    (True, False),
+                                                    (False, True)):
+                        optimizer.zero_grad(set_to_none=True)
+                        self._backward_real_critic_loss(
+                            alg, actor_only=actor_only, critic_only=critic_only)
+                        self.assertIsNone(alg._actor_eval_samples.grad)
+                        if not actor_only:
+                            encoder_gradients = [
+                                p.grad for p in alg._actor_encoder.parameters()
+                                if p.grad is not None
+                            ]
+                            self.assertTrue(any(
+                                g.abs().sum().item() > 0.
+                                for g in encoder_gradients))
+                        optimizer.step()
+                        self.assertTensorEqual(alg._actor_eval_samples, initial)
+                        alg.after_update(None, None)
+                        self.assertFalse(alg._actor_eval_samples.requires_grad)
+
+    def test_eval_samples_grad_flags_across_train_modes(self):
+        for source in ("trainable", "frozen"):
+            alg = self._make_alg(eval_samples_source=source)
+            for initial in (True, False):
+                alg._actor_update_counter = 0 if initial else 1
+                alg._critic_update_counter = 0 if initial else 1
+                for mode in (TrainMode.standard, TrainMode.actor,
+                             TrainMode.critic):
+                    with self.subTest(source=source, initial=initial, mode=mode):
+                        alg._train_mode = mode
+                        alg._apply_train_mode_grad_flags()
+                        self.assertEqual(
+                            alg._actor_eval_samples.requires_grad,
+                            source == "trainable" and
+                            (initial or mode != TrainMode.actor))
+
+    def test_frozen_eval_samples_checkpoint_compatibility(self):
+        for saved_source in ("trainable", "frozen"):
+            saved = self._make_alg(eval_samples_source=saved_source)
+            state_dict = saved.state_dict()
+            self.assertIn("_actor_eval_samples", state_dict)
+            for restored_source in ("trainable", "frozen"):
+                with self.subTest(saved=saved_source, restored=restored_source):
+                    restored = self._make_alg(
+                        eval_samples_source=restored_source)
+                    restored.load_state_dict(state_dict)
+                    self.assertTensorEqual(restored._actor_eval_samples,
+                                           saved._actor_eval_samples)
+                    self.assertEqual(restored._actor_eval_samples.requires_grad,
+                                     restored_source == "trainable")
+
     def test_td_target_uses_next_value_and_terminal_discount(self):
         loss = OneStepTDLoss(gamma=0.99)
         info = BafcV7Info(
@@ -497,6 +586,12 @@ class BafcAlgorithmV7Test(alf.test.TestCase):
             self._make_alg().load_state_dict(state_dict)
 
     def test_configuration_validation(self):
+        with self.assertRaisesRegex(ValueError, "eval_samples_source"):
+            self._make_alg(eval_samples_source="unknown")
+        with self.assertRaisesRegex(ValueError, "eval_samples_optimizer"):
+            self._make_alg(
+                eval_samples_source="frozen",
+                eval_samples_optimizer=alf.optimizers.Adam(lr=1e-3))
         with self.assertRaisesRegex(ValueError, "temporal_noise_mix"):
             self._make_alg(temporal_noise_mix=0.)
         with self.assertRaisesRegex(ValueError, "exactly one actor"):
