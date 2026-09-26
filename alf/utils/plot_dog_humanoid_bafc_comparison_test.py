@@ -15,6 +15,108 @@ from alf.utils import plot_dog_humanoid_bafc_comparison as plotter
 
 class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
 
+    def test_trust_selection_splices_one_winner_and_keeps_baseline_on_ties(self):
+        curve = plotter.ScalarCurve
+        baseline = curve(np.array([0., 120000., 160000., 199800.]),
+                         np.array([0., 10., 20., 30.]))
+        restart = curve(np.array([121000., 160000., 199800.]),
+                        np.array([11., 15., 40.]))
+        result, chosen, endpoint, scores = plotter.select_trust_restart(
+            baseline, {120000: restart})
+        self.assertEqual(chosen, 120000)
+        self.assertEqual(endpoint, 199800)
+        np.testing.assert_array_equal(result.steps,
+                                      [0., 120000., 121000., 160000., 199800.])
+        np.testing.assert_array_equal(result.values, [0., 10., 11., 15., 40.])
+        tied = curve(restart.steps, np.array([50., 50., 30.]))
+        result, chosen, _, _ = plotter.select_trust_restart(baseline, {120000: tied})
+        self.assertEqual(chosen, 200000)
+        np.testing.assert_array_equal(result.values, baseline.values)
+
+    def test_reweight_selection_uses_bafcv3_history_and_fallback(self):
+        baseline = plotter.ScalarCurve(np.array([0., 90000., 105000., 149850.]),
+                                       np.array([1., 2., 3., 10.]))
+        restart = plotter.ScalarCurve(np.array([91000., 149850.]),
+                                      np.array([4., 20.]))
+        paths = {"BAFCv3": ["base%d" % seed for seed in range(4)],
+                 "BAFCv6": ["unrelated%d" % seed for seed in range(4)]}
+        def read(logdir, tag):
+            if logdir.startswith("unrelated"):
+                return plotter.ScalarCurve(baseline.steps, np.zeros(4))
+            return baseline if logdir.startswith("base") else restart
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(plotter, "_read_scalar_curve", side_effect=read), \
+                mock.patch.object(plotter, "_plot_aggregate") as plot, \
+                mock.patch.object(plotter, "_finish_plot"):
+            plotter.plot_run_restart_selection("humanoid_run", paths, "/ws", root)
+        original, selected = [call.args[1] for call in plot.call_args_list]
+        before = selected.steps <= 90000
+        np.testing.assert_allclose(selected.mean[before],
+            np.interp(selected.steps[before], original.steps, original.mean))
+        plotter.plt.close("all")
+
+    def test_full_v6_selection_keeps_own_history_and_removes_markers(self):
+        baseline = plotter.ScalarCurve(np.array([0., 90000., 149850.]),
+                                       np.array([1., 2., 10.]))
+        full = plotter.ScalarCurve(baseline.steps, np.array([5., 15., 30.]))
+        paths = {"BAFCv3": ["base%d" % s for s in range(4)],
+                 "BAFCv6": ["full%d" % s for s in range(4)]}
+        def read(logdir, tag):
+            return full if logdir.startswith("full") else baseline
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(plotter, "_read_scalar_curve", side_effect=read), \
+                mock.patch.object(plotter, "_plot_aggregate") as plot, \
+                mock.patch.object(plotter.plt.Axes, "axvline") as marker, \
+                mock.patch.object(plotter, "_finish_plot") as finish:
+            plotter.plot_run_restart_selection("humanoid_run", paths, "/ws", root)
+        np.testing.assert_array_equal(plot.call_args_list[1].args[1].mean, full.values)
+        self.assertEqual(finish.call_args.kwargs["xlim"], (0, 150000))
+        marker.assert_not_called()
+        plotter.plt.close("all")
+
+    def test_dog_walk_pin_and_incomplete_candidates_preserve_full_horizon(self):
+        import json
+        def read(path, tag):
+            if path.startswith("full"):
+                return plotter.ScalarCurve(np.array([0., 149850.]), np.array([5., 99.]))
+            if path.startswith("base"):
+                return plotter.ScalarCurve(np.array([0., 199800.]), np.array([1., 40.]))
+            start = 75000. if "75k" in path else 105000.
+            return plotter.ScalarCurve(np.array([start, 199800.]), np.array([2., 20.]))
+        groups = {"BAFCv3": ["base%d" % s for s in range(4)],
+                  "BAFC_TR": ["full%d" % s for s in range(4)]}
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(plotter, "_read_run_curve", side_effect=read), \
+                mock.patch.object(plotter, "_plot_aggregate"), \
+                mock.patch.object(plotter, "_finish_plot"):
+            plotter.plot_run_restart_selection("dog", groups, "/ws", root)
+            with open(os.path.join(root, "dog_walk_trust_selection.json")) as f:
+                records = json.load(f)["seeds"]
+        self.assertTrue(all(r["selection_step"] == 199800 for r in records))
+        self.assertEqual(records[0]["selected"], "BAFCv3")
+        self.assertEqual(records[2]["selected"], "105k_utd11")
+        self.assertTrue(records[2]["forced_selection"])
+        self.assertNotIn("75k_utd11", records[2]["candidate_returns"])
+        self.assertTrue(all("0k_tr2" in r["excluded_incomplete_candidates"]
+                            for r in records))
+        plotter.plt.close("all")
+
+    def test_selection_window_interpolates_start_without_extrapolation(self):
+        curve = plotter.ScalarCurve(np.array([0., 100., 200.]),
+                                    np.array([0., 10., 20.]))
+        cropped = plotter._selection_window(curve, 120., 250.)
+        np.testing.assert_array_equal(cropped.steps, [120., 200.])
+        np.testing.assert_array_equal(cropped.values, [12., 20.])
+
+    def test_selection_plot_axis_overrides_task_default(self):
+        with tempfile.TemporaryDirectory() as root:
+            fig, ax = mock.Mock(), mock.Mock()
+            with mock.patch.object(plotter.plt, "close"):
+                plotter._finish_plot(fig, ax, "", "Return",
+                    os.path.join(root, "humanoid_run_trust_test.png"),
+                    xlim=(90000, 150000))
+            ax.set_xlim.assert_called_once_with(90000, 150000)
+
     def test_skip_frequency_uses_counter_deltas_and_environment_axis(self):
         curve = plotter.ScalarCurve
         steps = np.array([10., 20., 30., 40.])
@@ -63,6 +165,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
             server5_copy_root=None, server6_copy_root=None,
             output_root="/plots")
         with mock.patch.object(plotter, "_parse_args", return_value=args), \
+                mock.patch.object(plotter, "plot_dog_trot_trust") as trot_trust, \
                 mock.patch.object(plotter, "plot_average_return") as plot, \
                 mock.patch.object(plotter, "plot_eval_trust_over_max") as trust, \
                 mock.patch.object(plotter, "plot_raw_eval_trust_metric") as raw:
@@ -80,6 +183,7 @@ class PlotDogHumanoidBafcComparisonTest(alf.test.TestCase):
                          ["SAC+", "TD3+", "Ours", "Ours_reweight"])
         self.assertTrue(all(len(runs) == 4 for runs in comparison.values()))
         self.assertIn("seed0123", baseline.kwargs["filename"])
+        trot_trust.assert_called_once()
         trust.assert_not_called()
         raw.assert_not_called()
 
