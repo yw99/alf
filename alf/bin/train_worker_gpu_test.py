@@ -68,6 +68,24 @@ class TrainWorkerGpuTest(unittest.TestCase):
                                    ('TrainerConfig.num_env_steps', 150000)]:
                 self.assertEqual(alf.get_config_value(name), expected)
 
+    def test_master_port_context_honors_explicit_port(self):
+        with patch.dict(os.environ, {'MASTER_PORT': '29600'}), \
+             patch.object(train.common, 'get_unused_port') as allocate:
+            with train._master_port_context() as port:
+                self.assertEqual(port, 29600)
+            allocate.assert_not_called()
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(train.common, 'get_unused_port',
+                          return_value=nullcontext(12345)) as allocate:
+            with train._master_port_context() as port:
+                self.assertEqual(port, 12345)
+            allocate.assert_called_once_with(12355)
+        for invalid in ('0', '65536', 'not-a-port'):
+            with self.subTest(invalid=invalid), \
+                 patch.dict(os.environ, {'MASTER_PORT': invalid}):
+                with self.assertRaises(ValueError):
+                    train._master_port_context()
+
     def test_legacy_worker_allocation(self):
         for gpus, ngpu, expected in [('0,1,2,3', 1, 4), ('0,1,2,3', 2, 2),
                                      ('0,1,2', 1, 3)]:

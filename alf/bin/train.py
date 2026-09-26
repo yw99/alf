@@ -61,6 +61,7 @@ replace the "--gin_file" option with "--conf", and "--gin_param" with "--conf_pa
 from absl import app
 from absl import flags
 from absl import logging
+import contextlib
 import datetime
 import multiprocessing
 import os
@@ -350,10 +351,24 @@ def _mapped_training_worker(rank, world_size, conf_file, root_dir, paras_queue):
             dist.destroy_process_group()
 
 
+def _master_port_context():
+    """Honor an explicit rendezvous port for concurrent single-host jobs."""
+    requested = os.environ.get('MASTER_PORT')
+    if requested is None:
+        return common.get_unused_port(12355)
+    try:
+        port = int(requested)
+    except ValueError as exc:
+        raise ValueError(f'Invalid MASTER_PORT: {requested!r}') from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f'MASTER_PORT out of range: {port}')
+    return contextlib.nullcontext(port)
+
+
 def _train_with_worker_gpus(devices, conf_file, root_dir):
     # Keep the existing Gloo rendezvous allocation. In particular, do not use
     # NCCL: multiple ranks in this mode may share a physical GPU.
-    with common.get_unused_port(12355) as port:
+    with _master_port_context() as port:
         with temporary_environment(MASTER_ADDR='localhost',
                                    MASTER_PORT=str(port)):
             run_workers(devices, _mapped_training_worker, (conf_file, root_dir),
@@ -483,7 +498,7 @@ def main(_):
             # in different work processes.
             manager = mp.Manager()
             paras_queue = manager.Queue()
-            with common.get_unused_port(12355) as port:
+            with _master_port_context() as port:
                 # The other process will communicate with the authoritative
                 # process via network protocol on localhost:port.
                 os.environ['MASTER_PORT'] = str(port)

@@ -160,11 +160,46 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
     def test_eval_samples_source_validation_and_optimizer(self):
         with self.assertRaisesRegex(AssertionError, "eval_samples_source"):
             self._make_alg(eval_samples_source='unknown')
-        with self.assertRaisesRegex(AssertionError,
-                                    "eval_samples_optimizer"):
-            self._make_alg(
-                eval_samples_source='replay',
-                eval_samples_optimizer=alf.optimizers.Adam(lr=1e-3))
+        for source in ('replay', 'frozen'):
+            with self.subTest(source=source), self.assertRaisesRegex(
+                    AssertionError, "eval_samples_optimizer"):
+                self._make_alg(
+                    eval_samples_source=source,
+                    eval_samples_optimizer=alf.optimizers.Adam(lr=1e-3))
+
+    def test_frozen_eval_samples_remain_initialized_and_gradient_free(self):
+        alg = self._make_alg(
+            eval_samples_source='frozen', actor_utd=1, critic_utd=2)
+        samples = alg._actor_eval_samples
+        initial = samples.detach().clone()
+        detached_samples = alg._get_actor_eval_samples()
+        self.assertIsNot(detached_samples, samples)
+        self.assertFalse(detached_samples.requires_grad)
+        self.assertTensorEqual(detached_samples, samples)
+        self.assertIn('_actor_eval_samples', alg.state_dict())
+        self.assertFalse(samples.requires_grad)
+        # Even an accidental flag change cannot reconnect frozen samples to
+        # the training graph because the source getter explicitly detaches.
+        samples.requires_grad_(True)
+        self.assertFalse(alg._get_actor_eval_samples().requires_grad)
+        samples.requires_grad_(False)
+
+        for mode in (TrainMode.critic, TrainMode.actor):
+            alg._train_mode = mode
+            alg._actor_update_counter = 1
+            alg._critic_update_counter = 1
+            alg._apply_train_mode_grad_flags()
+            self.assertFalse(samples.requires_grad)
+            self.assertTensorEqual(samples, initial)
+
+        alg._train_mode = TrainMode.actor
+        alg._apply_train_mode_grad_flags()
+        output = alg._actor_networks(detached_samples)[0]
+        output.sum().backward()
+        self.assertIsNone(samples.grad)
+        self.assertTrue(any(p.grad is not None
+                            for p in alg._actor_networks.parameters()))
+        self.assertTensorEqual(samples, initial)
 
     def test_trainable_eval_samples_path_is_unchanged(self):
         optimizer = alf.optimizers.Adam(lr=1e-3)

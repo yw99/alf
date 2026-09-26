@@ -1,26 +1,32 @@
 #!/bin/bash
-# Launch dog:stand BAFCv3 on seeds 0, 1, 2, and 3. Every job uses all four
-# configured GPUs through DDP, with a unique torch.distributed master port.
+# Launch dog:stand BAFCv3 on seeds 0, 1, 2, and 3. Every job uses four
+# DDP ranks on four GPUs. Seeds 0-1 share the first four configured GPUs;
+# seeds 2-3 share the other four, so all eight GPUs are used concurrently.
+# Every job has a unique torch.distributed master port.
 #
 # BAFCv3 runs without actor-critic pairing, with K=8 critics per actor,
 # critic_utd=11, random critic TD targets, and frozen random eval samples.
 #
-# Usage: bash run_dog_stand_bafcv3_seed0123-4g.sh [options]
-#   -d, --dir BASE_DIR       Base results directory (default: /workspace/alf_results)
+# Usage: bash run_dog_stand_bafcv3_seed0123-8g-frozen.sh [options]
+#   -d, --dir BASE_DIR       Base results directory (default: /root/alf_results)
 #   -n, --steps NUM_STEPS    Total environment steps per job (default: 800000)
-#       --gpus CSV           Comma-separated GPU ids (default: 0,1,2,3)
+#       --gpus CSV           Eight distinct GPU ids, split into two groups of four
+#                            (default: 0,1,2,3,4,5,6,7)
 #       --checkpoints N      Number of checkpoints (default: 10)
-#       --base-port PORT     First DDP master port (default: 29500)
-#       --base-http-port PORT First HTTP port (default: 18060)
+#       --base-port PORT     First DDP master port (default: 29640)
+#       --base-http-port PORT First HTTP port (default: 18120)
 #       --dry-run            Print commands without launching jobs
 #   -h, --help               Show this help message
 #
 # Example:
-#   bash run_dog_stand_bafcv3_seed0123-4g.sh --dry-run
+#   bash run_dog_stand_bafcv3_seed0123-8g-frozen.sh --dry-run
 
 set -euo pipefail
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,12 +35,12 @@ BAFCV3_CONF="${SCRIPT_DIR}/bafcv3_dmc_conf.py"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 ENV_NAME="dog:stand"
-BASE_DIR="/workspace/alf_results"
+BASE_DIR="/root/alf_results"
 NUM_ENV_STEPS=800000
 NUM_CHECKPOINTS=10
-GPUS="0,1,2,3"
-BASE_PORT=29500
-BASE_HTTP_PORT=18060
+GPUS="0,1,2,3,4,5,6,7"
+BASE_PORT=29640
+BASE_HTTP_PORT=18120
 DRY_RUN=False
 SEEDS=(0 1 2 3)
 
@@ -110,6 +116,22 @@ if [[ ! "${NUM_CHECKPOINTS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--checkpoints must be a positive integer, got: ${NUM_CHECKPOINTS}" >&2
     exit 1
 fi
+if [[ ! "${GPUS}" =~ ^[0-9]+(,[0-9]+){7}$ ]]; then
+    echo "--gpus must list exactly eight GPU indices, got: ${GPUS}" >&2
+    exit 1
+fi
+IFS=',' read -r -a GPU_IDS <<< "${GPUS}"
+declare -A GPU_SEEN=()
+for gpu in "${GPU_IDS[@]}"; do
+    if [[ -n "${GPU_SEEN[$gpu]+x}" ]]; then
+        echo "--gpus must list eight distinct GPU indices; duplicate: ${gpu}" >&2
+        exit 1
+    fi
+    GPU_SEEN[$gpu]=1
+done
+GPU_GROUP_01="${GPU_IDS[0]},${GPU_IDS[1]},${GPU_IDS[2]},${GPU_IDS[3]}"
+GPU_GROUP_23="${GPU_IDS[4]},${GPU_IDS[5]},${GPU_IDS[6]},${GPU_IDS[7]}"
+
 for port in "${BASE_PORT}" "${BASE_HTTP_PORT}"; do
     if [[ ! "${port}" =~ ^[1-9][0-9]*$ ]] || (( port + 3 > 65535 )); then
         echo "Port base must leave room for four valid ports, got: ${port}" >&2
@@ -118,7 +140,7 @@ for port in "${BASE_PORT}" "${BASE_HTTP_PORT}"; do
 done
 
 ENV_DIR="${ENV_NAME//:/_}"
-ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_seed0123_4g_eval_samples_frozen"
+ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_seed0123_8g_4rank_frozen_eval_samples"
 CONDITION="fixed_pairingFalse_num_sampled_critic${BAFCV3_NUM_SAMPLED_CRITICS}/critic_utd${BAFCV3_CRITIC_UTD}"
 
 cat <<EOF
@@ -129,7 +151,10 @@ Starting dog:stand BAFCv3 on seeds 0, 1, 2, and 3
   Num env steps: ${NUM_ENV_STEPS}
   Num checkpoints: ${NUM_CHECKPOINTS}
   Seeds: ${SEEDS[*]}
-  GPUs per job: ${GPUS}
+  Physical GPUs in use: ${GPUS}
+  DDP ranks per job: 4
+  Seeds 0-1 GPUs: ${GPU_GROUP_01}
+  Seeds 2-3 GPUs: ${GPU_GROUP_23}
   critic_utd: ${BAFCV3_CRITIC_UTD}
   num_updates_per_train_iter: ${BAFCV3_UPDATES_PER_ITER}
   actor_critic_pairing: False
@@ -144,11 +169,27 @@ echo ""
 
 cd "${REPO_ROOT}"
 
+# Reserve a fresh output root atomically so the prior 8-rank results are never
+# resumed or mixed with these 4-rank runs. Dry runs write nothing.
+if [[ "${DRY_RUN}" == "True" ]]; then
+    if [[ -e "${ROOT_DIR}" || -L "${ROOT_DIR}" ]]; then
+        echo "Output already exists: ${ROOT_DIR}" >&2
+        exit 1
+    fi
+else
+    mkdir -p "${BASE_DIR}/${ENV_DIR}"
+    if ! mkdir "${ROOT_DIR}"; then
+        echo "Output already exists or cannot be created: ${ROOT_DIR}" >&2
+        exit 1
+    fi
+fi
+
 PIDS=()
 launch_job() {
     local seed="$1"
     local master_port="$2"
     local http_port="$3"
+    local job_gpus="$4"
     local run_dir="${ROOT_DIR}/${CONDITION}/seed_${seed}"
     local -a command=(
         "${PYTHON_BIN}" -m alf.bin.train
@@ -172,33 +213,39 @@ launch_job() {
         --conf_param "bafcv3_use_random_critic_targets=True"
         --conf_param "bafcv3_num_sampled_critic_targets=${BAFCV3_NUM_SAMPLED_CRITIC_TARGETS}"
         --distributed multi-gpu
+        --num_gpus_per_ddp_worker=1
     )
 
     if [[ "${DRY_RUN}" == "True" ]]; then
-        printf 'CUDA_VISIBLE_DEVICES=%q MASTER_PORT=%q ' "${GPUS}" "${master_port}"
+        printf 'CUDA_VISIBLE_DEVICES=%q MASTER_PORT=%q ' "${job_gpus}" "${master_port}"
         printf '%q ' "${command[@]}"
         printf '> %q 2>&1 &\n' "${run_dir}/out.log"
         return
     fi
 
     mkdir -p "${run_dir}"
-    CUDA_VISIBLE_DEVICES="${GPUS}" MASTER_PORT="${master_port}" \
+    CUDA_VISIBLE_DEVICES="${job_gpus}" MASTER_PORT="${master_port}" \
         "${command[@]}" > "${run_dir}/out.log" 2>&1 &
     local pid=$!
     PIDS+=("${pid}")
-    echo "  seed ${seed}: DDP port ${master_port}, HTTP port ${http_port}, PID ${pid}"
+    echo "  seed ${seed}: GPUs ${job_gpus}, DDP port ${master_port}, HTTP port ${http_port}, PID ${pid}"
     echo "    Log: ${run_dir}/out.log"
 }
 
 for seed_index in "${!SEEDS[@]}"; do
-    launch_job "${SEEDS[$seed_index]}" "$((BASE_PORT + seed_index))" "$((BASE_HTTP_PORT + seed_index))"
+    if (( seed_index < 2 )); then
+        job_gpus="${GPU_GROUP_01}"
+    else
+        job_gpus="${GPU_GROUP_23}"
+    fi
+    launch_job "${SEEDS[$seed_index]}" "$((BASE_PORT + seed_index))" "$((BASE_HTTP_PORT + seed_index))" "${job_gpus}"
 done
 
 echo ""
 if [[ "${DRY_RUN}" == "True" ]]; then
     echo "Dry run complete; no jobs were launched."
 else
-    echo "Launched four BAFCv3 4-GPU jobs: ${PIDS[*]}"
+    echo "Launched four BAFCv3 4-rank jobs across 8 GPUs: ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
 fi
 echo "To monitor: tail -f ${ROOT_DIR}/${CONDITION}/seed_*/out.log"

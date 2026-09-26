@@ -154,8 +154,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             eval_samples_source (str): source of the observations used to
                 encode actors for the functional critic. ``'trainable'`` keeps
                 the existing randomly initialized, trainable evaluation
-                samples. ``'replay'`` samples without replacement from the
-                transformed observations in the current training iteration.
+                samples. ``'frozen'`` keeps those same initialized samples
+                fixed throughout training. ``'replay'`` samples without
+                replacement from transformed observations in the current
+                training iteration.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -166,13 +168,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             r"{actor_eval_type} in not supported.")
         assert eval_samples_init_method in ['normal', 'uniform'], (
             r"init method {eval_samples_init_method} is not supported.")
-        assert eval_samples_source in ['trainable', 'replay'], (
-            "eval_samples_source must be either 'trainable' or 'replay', got "
-            f"{eval_samples_source!r}.")
+        assert eval_samples_source in ['trainable', 'frozen', 'replay'], (
+            "eval_samples_source must be 'trainable', 'frozen', or 'replay', "
+            f"got {eval_samples_source!r}.")
         assert (eval_samples_source == 'trainable'
                 or eval_samples_optimizer is None), (
-                    "eval_samples_optimizer is not supported when "
-                    "eval_samples_source='replay'.")
+                    "eval_samples_optimizer is only supported when "
+                    "eval_samples_source='trainable'.")
         assert bootstrap_mask_type in ['episode', 'step'], (
             r"bootstrap mask type {bootstrap_mask_type} is not supported.")
         assert 1 <= num_sampled_critics_for_actor <= num_actor_critic, (
@@ -560,6 +562,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             indices = torch.randperm(
                 pool.shape[0], device=pool.device)[:self._num_actor_eval_samples]
             return torch.index_select(pool, 0, indices)
+        if self._eval_samples_source == 'frozen':
+            # Keep the checkpointed parameter but never connect it to the
+            # training graph, including when training mode changes.
+            return self._actor_eval_samples.detach()
         return self._actor_eval_samples
 
     def _predict_action(self,
@@ -785,7 +791,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
         if actor_eval_samples is None:
-            actor_eval_samples = self._actor_eval_samples
+            actor_eval_samples = self._get_actor_eval_samples()
+        elif self._eval_samples_source == 'frozen':
+            actor_eval_samples = actor_eval_samples.detach()
         eval_action = self._actor_networks(
             actor_eval_samples,
             full_neurons=self._actor_eval_type != 'output')[0]
@@ -933,7 +941,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
         if actor_eval_samples is None:
-            actor_eval_samples = self._actor_eval_samples
+            actor_eval_samples = self._get_actor_eval_samples()
+        elif self._eval_samples_source == 'frozen':
+            actor_eval_samples = actor_eval_samples.detach()
         eval_action = self._actor_networks(
             actor_eval_samples,
             full_neurons=self._actor_eval_type != 'output')[0]
