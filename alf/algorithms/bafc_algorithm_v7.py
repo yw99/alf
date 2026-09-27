@@ -578,8 +578,16 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
                 actor_eval_samples, full_neurons=self._actor_eval_type == "last_two")
         # No replay inputs or encoder parameters belong in this key. Tensor
         # versions are host metadata, so checking them does not synchronize CUDA.
+        # The stock actor's projection-shape buffers are only metadata; their
+        # contents never enter forward(). DDP broadcasts bump their versions
+        # even when unchanged, which would otherwise invalidate every update.
+        # Continue tracking all other buffers in case they affect the output.
+        buffers = [
+            tensor for name, tensor in self._actor_networks.named_buffers()
+            if name not in ("_projection_weight_shape", "_projection_bias_shape")
+        ]
         tensors = [self._actor_eval_samples, *self._actor_networks.parameters(),
-                   *self._actor_networks.buffers()]
+                   *buffers]
         key = (tuple((id(t), t._version, t.device, t.dtype) for t in tensors),
                torch.is_autocast_enabled(), torch.get_autocast_dtype("cuda"))
         if key != self._probe_cache_key:

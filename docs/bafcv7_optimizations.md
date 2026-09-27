@@ -10,8 +10,11 @@ The algorithm constructor itself defaults all optimization flags to `False`.
 - `cache_frozen_probe_outputs`: reuse deterministic actor outputs on frozen
   probes between actor updates. Actor/probe tensor versions, identity, dtype,
   device, and autocast settings validate the cache. Actor updates, checkpoint
-  loads, and device/dtype changes invalidate it. No encoder outputs or replay
-  batches are cached across updates.
+  loads, and device/dtype changes invalidate it. The stock actor's two
+  projection-shape metadata buffers are excluded from the key: DDP broadcasts
+  change their tensor versions without changing probe outputs. Other actor
+  buffers remain tracked, and DDP buffer synchronization stays enabled. No
+  encoder outputs or replay batches are cached across updates.
 - `deduplicate_critic_episode_seeds`: encode each exact distinct episode seed
   once within a critic-only update, then differentiably gather into replay
   order. This preserves summed gradients to the encoder and trainable probes.
@@ -42,7 +45,10 @@ result paths, and GPU allocation are unchanged. The summary scalars
 Reference/optimized checks cover both variants, both policy feature modes,
 frozen/trainable probes, initial/critic/actor updates, duplicate/distinct seeds,
 clipping, normalization, selected gradients, cache invalidation, target updates,
-and strict model/optimizer checkpoint loading in both directions. Multi-update
+and strict model/optimizer checkpoint loading in both directions. A CPU Gloo
+DDP regression checks cache hits across buffer broadcasts and invalidation after
+actor/probe changes; the four-GPU smoke test also asserts cache reuse during its
+update/checkpoint sequence. Multi-update
 comparisons use float64 to avoid Adam amplifying float32 rounding in nearly-zero
 bias gradients; separate float32 tests check losses and gradients.
 

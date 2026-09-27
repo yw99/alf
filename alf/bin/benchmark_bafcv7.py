@@ -170,7 +170,17 @@ def _ddp_worker(rank, world, rendezvous, directory):
                     torch.manual_seed(1000 + rank * 100 + step)
                     batch = make_batch(alg, unique=1 + rank)
                     optimizer.zero_grad(set_to_none=True)
+                    critic_only = alg._critic_only()
+                    cached = alg._probe_cache
+                    hits, misses = alg._probe_cache_hits, alg._probe_cache_misses
                     loss = runner(batch)
+                    if critic_only:
+                        if cached is None:
+                            assert alg._probe_cache_misses == misses + 1
+                        else:
+                            assert alg._probe_cache is cached
+                            assert alg._probe_cache_hits == hits + 1
+                            assert alg._probe_cache_misses == misses
                     loss.backward()
                     assert torch.isfinite(loss)
                     # Include unused slots when checking synchronized gradients.
@@ -202,7 +212,9 @@ def _ddp_worker(rank, world, rendezvous, directory):
                         assert alg._probe_cache is None
                 dist.barrier()
                 if rank == 0:
-                    print(f'DDP passed: {variant} {mode}', flush=True)
+                    print(f'DDP passed: {variant} {mode}; '
+                          f'probe cache hits={alg._probe_cache_hits}, '
+                          f'misses={alg._probe_cache_misses}', flush=True)
                 del runner, optimizer, alg
         dist.barrier()
     finally:

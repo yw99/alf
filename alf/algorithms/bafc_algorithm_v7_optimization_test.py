@@ -1,14 +1,19 @@
 # Copyright (c) 2026 Horizon Robotics and ALF Contributors. All Rights Reserved.
 """Reference-equivalence tests for V7-only computation reuse."""
 import copy
+from datetime import timedelta
 import itertools
+from pathlib import Path
+import tempfile
 import unittest
 
 import torch
+import torch.distributed as dist
 import alf
 from alf.algorithms.rlpd_algorithm import TrainMode
 from alf.networks.bafc_v7_critic_network import BafcV7FuncCriticNetwork
 from alf.tensor_specs import TensorSpec
+from alf.utils.distributed import make_ddp_performer
 
 from alf.utils.bafcv7_benchmark_utils import (
     FLAGS, make_algorithm, make_batch, compute_loss)
@@ -147,6 +152,61 @@ class BafcV7OptimizationTest(unittest.TestCase):
         c = alg._probe_output(alg._actor_eval_samples)
         self.assertIsNotNone(c.mean.grad_fn)
         self.assertIsNone(alg._probe_cache)
+
+    @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(),
+                         "Gloo is required for DDP buffer broadcasts")
+    def test_probe_cache_survives_ddp_buffer_broadcasts(self):
+        # Even a single-rank DDP group broadcasts buffers before forward.
+        # Keep this regression runnable without CUDA or multiple processes.
+        with tempfile.TemporaryDirectory(prefix='bafcv7_cache_ddp_') as directory:
+            dist.init_process_group(
+                'gloo', init_method=(Path(directory) / 'rendezvous').as_uri(),
+                rank=0, world_size=1, timeout=timedelta(seconds=30))
+            try:
+                for variant, mode in itertools.product(
+                        ['ensemble_base', 'single_seeded'],
+                        ['mean_log_std', 'action_quantiles']):
+                    with self.subTest(variant=variant, mode=mode):
+                        alg = make_algorithm(True, variant, mode)
+                        runner = make_ddp_performer(
+                            alg, lambda a, b: compute_loss(a, b)[0],
+                            find_unused_parameters=True)
+                        alg._critic_update_counter = 1
+                        alg._apply_train_mode_grad_flags()
+
+                        def critic_update():
+                            alg.zero_grad(set_to_none=True)
+                            runner(make_batch(alg)).backward()
+                            return alg._probe_cache
+
+                        cached = critic_update()
+                        shape_buffer = alg._actor_networks._projection_weight_shape
+                        version = shape_buffer._version
+                        for _ in range(2):
+                            self.assertIs(critic_update(), cached)
+                        self.assertGreater(shape_buffer._version, version)
+                        self.assertEqual(alg._probe_cache_misses, 1)
+                        self.assertEqual(alg._probe_cache_hits, 2)
+
+                        # Real dependencies must still invalidate under DDP.
+                        with torch.no_grad():
+                            next(alg._actor_networks.parameters()).add_(.01)
+                        changed_actor = critic_update()
+                        self.assertIsNot(changed_actor, cached)
+                        with torch.no_grad():
+                            alg._actor_eval_samples.add_(.01)
+                        changed_probes = critic_update()
+                        self.assertIsNot(changed_probes, changed_actor)
+                        self.assertEqual(alg._probe_cache_misses, 3)
+                        expected = alg._actor_networks(
+                            alg._actor_eval_samples, full_neurons=True)
+                        self.assert_close(changed_probes.mean, expected.mean)
+                        self.assert_close(changed_probes.std, expected.std)
+                        self.assert_close(changed_probes.policy_features,
+                                          expected.policy_features)
+                        del runner, alg
+            finally:
+                dist.destroy_process_group()
 
     def test_dedup_counts_and_dropout_fallback(self):
         for dropout in [0., .1]:
