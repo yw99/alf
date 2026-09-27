@@ -47,6 +47,11 @@ alf.define_config('bafcv3_use_bootstrap_critics', False)
 use_bootstrap_critics = alf.get_config_value('bafcv3_use_bootstrap_critics')
 alf.define_config('bafcv3_num_attention_heads', 1)
 num_attention_heads = alf.get_config_value('bafcv3_num_attention_heads')
+alf.define_config('bafcv3_use_actor_id_encoding', False)
+use_actor_id_encoding = alf.get_config_value('bafcv3_use_actor_id_encoding')
+alf.define_config('bafcv3_detach_actor_policy_input', False)
+detach_actor_policy_input = alf.get_config_value(
+    'bafcv3_detach_actor_policy_input')
 alf.define_config('bafcv3_eval_samples_source', 'trainable')
 eval_samples_source = alf.get_config_value('bafcv3_eval_samples_source')
 
@@ -108,6 +113,8 @@ alf.config(
     eval_samples_init_method='normal',
     eval_samples_clipping=obs_normalizer_clipping,
     eval_samples_source=eval_samples_source,
+    use_actor_id_encoding=use_actor_id_encoding,
+    detach_actor_policy_input=detach_actor_policy_input,
     actor_eval_type='last_two',
     actor_encoding_dim=None,
     obs_action_encoding_dim=128,

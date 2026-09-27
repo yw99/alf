@@ -131,7 +131,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  num_sampled_critics_for_actor=1,
                  use_random_critic_targets=False,
                  num_sampled_critic_targets=1,
-                 eval_samples_source='trainable'):
+                 eval_samples_source='trainable',
+                 use_actor_id_encoding=False,
+                 detach_actor_policy_input=False):
         """
         Args:
 
@@ -158,6 +160,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 fixed throughout training. ``'replay'`` samples without
                 replacement from transformed observations in the current
                 training iteration.
+            use_actor_id_encoding (bool): replace functional policy encodings
+                with learned actor-ID embeddings (control A). Embeddings learn
+                from critic losses only; the original encoder and evaluation
+                samples remain frozen and unused. Resume with the same flag.
+            detach_actor_policy_input (bool): stop the policy-encoding gradient
+                during actor updates only (control B), retaining the ordinary
+                action gradient and unchanged functional critic training. This
+                is redundant when ``use_actor_id_encoding`` is True.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
@@ -175,6 +185,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 or eval_samples_optimizer is None), (
                     "eval_samples_optimizer is only supported when "
                     "eval_samples_source='trainable'.")
+        assert not use_actor_id_encoding or eval_samples_optimizer is None, (
+            "eval_samples_optimizer is unused with use_actor_id_encoding=True.")
         assert bootstrap_mask_type in ['episode', 'step'], (
             r"bootstrap mask type {bootstrap_mask_type} is not supported.")
         assert 1 <= num_sampled_critics_for_actor <= num_actor_critic, (
@@ -216,6 +228,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             self._actor_utd = actor_utd
             self._critic_utd = critic_utd
 
+        self._use_actor_id_encoding = use_actor_id_encoding
+        self._detach_actor_policy_input = detach_actor_policy_input
         self._num_actor_critic = num_actor_critic
         self._actor_critic_pairing = actor_critic_pairing
         self._num_sampled_critics_for_actor = num_sampled_critics_for_actor
@@ -307,14 +321,15 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             self.add_optimizer(actor_optimizer, [actor_networks])
         if critic_optimizer is not None and critic_networks is not None:
             self.add_optimizer(critic_optimizer, [critic_networks])
-        if actor_encoder_optimizer is not None:
+        if actor_encoder_optimizer is not None and not use_actor_id_encoding:
             self.add_optimizer(actor_encoder_optimizer, [actor_encoder])
         # Keep this parameter in replay mode so that initialization RNG,
         # checkpoint keys, and optimizer parameter layouts remain compatible
         # with existing BAFCv3 runs. It is frozen and unused in replay mode.
         self._actor_eval_samples = nn.Parameter(
             actor_eval_samples,
-            requires_grad=eval_samples_source == 'trainable')
+            requires_grad=(eval_samples_source == 'trainable'
+                           and not use_actor_id_encoding))
         if eval_samples_optimizer is not None:
             self.add_optimizer(eval_samples_optimizer, [self._actor_eval_samples])
 
@@ -359,6 +374,17 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._update_target_critic = _create_target_updater(
             [self._critic_networks], [self._target_critic_networks],
             target_critic_tau, target_critic_period, target_critic_use_ema)
+
+        if use_actor_id_encoding:
+            # Create this only after the existing networks (including targets)
+            # so shared network initialization and the default checkpoint keys
+            # are unchanged. Keep the unused encoder for checkpoint inspection.
+            self._actor_encoder.requires_grad_(False)
+            self._actor_id_embedding = nn.Embedding(num_actor_critic,
+                                                   actor_encoding_dim)
+            if actor_encoder_optimizer is not None:
+                self.add_optimizer(actor_encoder_optimizer,
+                                   [self._actor_id_embedding])
 
     @property
     def has_dynamic_train_info(self):
@@ -480,6 +506,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                                or self._train_mode == TrainMode.actor)
         eval_samples_requires_grad = (
             self._eval_samples_source == 'trainable'
+            and not self._use_actor_id_encoding
             and (standard_or_initial or self._train_mode == TrainMode.critic))
         for p in self._actor_networks.parameters():
             p.requires_grad_(actor_requires_grad)
@@ -564,7 +591,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
     def preprocess_experience(self, root_inputs: TimeStep, rollout_info,
                               batch_info):
         """Prepare replay evaluation observations from the training batch."""
-        if self._eval_samples_source != 'replay':
+        if self._use_actor_id_encoding or self._eval_samples_source != 'replay':
             return root_inputs, rollout_info
 
         # Invalidate first so a validation failure cannot leave a stale pool
@@ -816,6 +843,27 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 'actor_critic_aggregation/dqda_pairwise_cosine',
                 self._mean_pairwise_cosine(individual_dqda))
 
+    def _encode_actor_policies(self, actor_eval_samples=None):
+        """Return encodings in stable actor order and functional eval outputs."""
+        if self._use_actor_id_encoding:
+            return self._actor_id_embedding.weight, ()
+        if actor_eval_samples is None:
+            actor_eval_samples = self._get_actor_eval_samples()
+        elif self._eval_samples_source == 'frozen':
+            actor_eval_samples = actor_eval_samples.detach()
+        eval_action = self._actor_networks(
+            actor_eval_samples,
+            full_neurons=self._actor_eval_type != 'output')[0]
+        if self._actor_eval_type == 'exclude_input':
+            eval_action = eval_action[1:]
+        elif self._actor_eval_type == 'last_two':
+            eval_action = eval_action[-2:]
+
+        actor_tokens = self._tokenize_actor_out(eval_action)
+        actor_encoding = self._actor_encoder(actor_tokens)[0]
+
+        return actor_encoding, eval_action
+
     def _actor_train_step(self,
                           observation,
                           action,
@@ -833,20 +881,12 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         """
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        if actor_eval_samples is None:
-            actor_eval_samples = self._get_actor_eval_samples()
-        elif self._eval_samples_source == 'frozen':
-            actor_eval_samples = actor_eval_samples.detach()
-        eval_action = self._actor_networks(
-            actor_eval_samples,
-            full_neurons=self._actor_eval_type != 'output')[0]
-        if self._actor_eval_type == 'exclude_input':
-            eval_action = eval_action[1:]
-        elif self._actor_eval_type == 'last_two':
-            eval_action = eval_action[-2:]
-
-        actor_tokens = self._tokenize_actor_out(eval_action)
-        actor_encoding = self._actor_encoder(actor_tokens)[0]
+        actor_encoding, eval_action = self._encode_actor_policies(
+            actor_eval_samples)
+        action_only = (self._use_actor_id_encoding
+                       or self._detach_actor_policy_input)
+        if action_only:
+            actor_encoding = actor_encoding.detach()
 
         k = self._num_sampled_critics_for_actor
         batch_size = observation.shape[0]
@@ -886,7 +926,9 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         #################################################
         # need to exclude the input actor_eval_samples, since they don't requires_grad
         # for actor TrainMode
-        if self._actor_eval_type == 'full':
+        if action_only:
+            eval_action_in_graph = ()
+        elif self._actor_eval_type == 'full':
             eval_action_in_graph = eval_action[1:]
         else:
             eval_action_in_graph = eval_action
@@ -895,10 +937,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                         and alf.summary.should_record_summaries())
         need_individual_dqda = record_debug and k > 1
         dqda_input = matched_action if need_individual_dqda else action
-        dqda, dqde = nest_utils.grad(
-            (dqda_input, eval_action_in_graph),
-            q_value.sum() / k,
-            retain_graph=self._actor_eval_type != 'output')
+        if action_only:
+            dqda = nest_utils.grad(dqda_input, q_value.sum() / k)
+            dqde = ()
+        else:
+            dqda, dqde = nest_utils.grad(
+                (dqda_input, eval_action_in_graph),
+                q_value.sum() / k,
+                retain_graph=self._actor_eval_type != 'output')
 
         individual_dqda = None
         if need_individual_dqda:
@@ -935,13 +981,16 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             action_loss = action_loss * mask / self._bootstrap_mask_prob
         action_loss = action_loss.sum(-1)
 
-        # 2nd term of OPG: loss corresponding to input eval_action
-        eval_action_loss = nest.map_structure(
-            action_loss_fn, clipped_dqde, eval_action_in_graph)
-        # ALF workaround: reduce to scalar_loss and repeat to [T*B]
-        # Will be averaged to a scalar_loss in calc_loss
-        eval_action_loss = math_ops.add_n(eval_action_loss).mean().repeat(
-            action_loss.shape[0])
+        if action_only:
+            eval_action_loss = torch.zeros_like(action_loss)
+        else:
+            # 2nd term of OPG: loss corresponding to input eval_action
+            eval_action_loss = nest.map_structure(
+                action_loss_fn, clipped_dqde, eval_action_in_graph)
+            # ALF workaround: reduce to scalar_loss and repeat to [T*B]
+            # Will be averaged to a scalar_loss in calc_loss
+            eval_action_loss = math_ops.add_n(eval_action_loss).mean().repeat(
+                action_loss.shape[0])
 
         actor_info = LossInfo(
             loss=action_loss,
@@ -983,20 +1032,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                            actor_eval_samples=None):
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        if actor_eval_samples is None:
-            actor_eval_samples = self._get_actor_eval_samples()
-        elif self._eval_samples_source == 'frozen':
-            actor_eval_samples = actor_eval_samples.detach()
-        eval_action = self._actor_networks(
-            actor_eval_samples,
-            full_neurons=self._actor_eval_type != 'output')[0]
-        if self._actor_eval_type == 'exclude_input':
-            eval_action = eval_action[1:]
-        elif self._actor_eval_type == 'last_two':
-            eval_action = eval_action[-2:]
-
-        actor_tokens = self._tokenize_actor_out(eval_action)
-        actor_encoding = self._actor_encoder(actor_tokens)[0]  # [n_actor, d_enc]
+        actor_encoding, _ = self._encode_actor_policies(actor_eval_samples)
 
         ## Step 2: compute critics and target critics for training actor batch
         ##
@@ -1047,7 +1083,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 for p in self._actor_networks.parameters():
                     p.requires_grad_(False)
                 self._actor_eval_samples.requires_grad_(
-                    self._eval_samples_source == 'trainable')
+                    self._eval_samples_source == 'trainable'
+                    and not self._use_actor_id_encoding)
         elif self._train_mode == TrainMode.critic:
             if self._critic_update_counter % self._critic_utd == 0:
                 self._train_mode = TrainMode.actor
@@ -1060,7 +1097,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                    rollout_info: BafcInfo):
         assert not self._is_eval
         self._training_started = True
-        actor_eval_samples = self._get_actor_eval_samples()
+        actor_eval_samples = (None if self._use_actor_id_encoding else
+                              self._get_actor_eval_samples())
 
         # [T*B, n_actor, d_a]
         action, action_state = self._predict_action(
@@ -1106,14 +1144,15 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
         if self._debug_summaries and alf.summary.should_record_summaries():
             self._do_critic_summary = True
-            safe_mean_hist_summary('eval_samples', actor_eval_samples)
-            safe_mean_hist_summary('eval_samples/per_dim_mean',
-                                   actor_eval_samples.mean(dim=0))
-            safe_mean_hist_summary(
-                'eval_samples/per_dim_std',
-                actor_eval_samples.std(dim=0, unbiased=False))
-            safe_mean_hist_summary('eval_samples/per_sample_l2_norm',
-                                   actor_eval_samples.norm(dim=-1))
+            if actor_eval_samples is not None:
+                safe_mean_hist_summary('eval_samples', actor_eval_samples)
+                safe_mean_hist_summary('eval_samples/per_dim_mean',
+                                       actor_eval_samples.mean(dim=0))
+                safe_mean_hist_summary(
+                    'eval_samples/per_dim_std',
+                    actor_eval_samples.std(dim=0, unbiased=False))
+                safe_mean_hist_summary('eval_samples/per_sample_l2_norm',
+                                       actor_eval_samples.norm(dim=-1))
 
         info = BafcInfo(
             reward=inputs.reward,

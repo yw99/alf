@@ -158,6 +158,233 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
         alg._replay_buffer = replay_buffer
         return replay_buffer
 
+    def test_ablation_defaults_preserve_initialization_and_checkpoint(self):
+        torch.manual_seed(101)
+        implicit = self._make_alg()
+        rng = torch.get_rng_state()
+        torch.manual_seed(101)
+        explicit = self._make_alg(use_actor_id_encoding=False,
+                                  detach_actor_policy_input=False)
+        self.assertTensorEqual(rng, torch.get_rng_state())
+        self.assertEqual(set(implicit.state_dict()), set(explicit.state_dict()))
+        for key, value in implicit.state_dict().items():
+            self.assertTensorEqual(value, explicit.state_dict()[key])
+        explicit.load_state_dict(implicit.state_dict())
+        detached = self._make_alg(detach_actor_policy_input=True)
+        detached.load_state_dict(implicit.state_dict())
+        self.assertFalse(hasattr(implicit, '_actor_id_embedding'))
+
+    def test_actor_id_encoding_is_independent_and_critic_trainable(self):
+        for dimension in (None, 8):
+            with self.subTest(dimension=dimension):
+                torch.manual_seed(101)
+                reference = self._make_alg(actor_encoding_dim=dimension)
+                torch.manual_seed(101)
+                alg = self._make_alg(use_actor_id_encoding=True,
+                                     actor_encoding_dim=dimension,
+                                     eval_samples_source='replay')
+                for key, value in reference.state_dict().items():
+                    self.assertTensorEqual(value, alg.state_dict()[key])
+                embedding = alg._actor_id_embedding.weight
+                self.assertEqual(tuple(embedding.shape),
+                                 (3, 16 if dimension is None else dimension))
+                before = embedding.detach().clone()
+                # No replay pool or actor/encoder evaluation is needed for A.
+                with mock.patch.object(alg._actor_networks, 'forward',
+                                       side_effect=AssertionError('actor encoding')), \
+                     mock.patch.object(alg._actor_encoder, 'forward',
+                                       side_effect=AssertionError('encoder')):
+                    self.assertTensorEqual(alg._encode_actor_policies()[0], before)
+                    self.assertEqual(alg.preprocess_experience((), (), ()),
+                                     ((), ()))
+                    observation = torch.randn(4, 4)
+                    _, critic = alg._critic_train_step(
+                        observation, alg.get_initial_train_state(4).critic,
+                        BafcInfo(action=torch.randn(4, 2)), torch.randn(12, 2))
+                self.assertEqual(tuple(critic.critic.shape), (4, 3, 3))
+                optimizer = torch.optim.Adam([embedding], lr=1e-3)
+                critic.critic.square().mean().backward()
+                self.assertGreater(embedding.grad.abs().sum().item(), 0.)
+                optimizer.step()
+                self.assertFalse(torch.equal(before, embedding))
+                self.assertTrue(all(p.grad is None for p in
+                                    alg._actor_encoder.parameters()))
+                self.assertFalse(alg._actor_eval_samples.requires_grad)
+                with torch.no_grad():
+                    for param in alg._actor_networks.parameters():
+                        param.add_(1.)
+                self.assertTensorEqual(alg._encode_actor_policies()[0], embedding)
+
+    def test_actor_id_optimizer_and_checkpoint(self):
+        with self.assertRaisesRegex(AssertionError, 'eval_samples_optimizer'):
+            self._make_alg(use_actor_id_encoding=True,
+                           eval_samples_optimizer=alf.optimizers.Adam(lr=1e-3))
+        for own_optimizer in (False, True):
+            with self.subTest(own_optimizer=own_optimizer):
+                encoder_optimizer = (alf.optimizers.Adam(lr=1e-3)
+                                     if own_optimizer else None)
+                agent = self._make_agent(
+                    use_actor_id_encoding=True, actor_utd=1, critic_utd=2,
+                    actor_encoder_optimizer=encoder_optimizer)
+                agent._default_optimizer = alf.optimizers.Adam(lr=1e-3)
+                agent._setup_optimizers()
+                alg = agent._rl_algorithm
+                optimizer = encoder_optimizer or agent.default_optimizer
+                self.assertTrue(any(p is alg._actor_id_embedding.weight
+                                    for group in optimizer.param_groups
+                                    for p in group['params']))
+                alg._train_mode = TrainMode.actor
+                alg._actor_update_counter = 1
+                alg._critic_update_counter = 2
+                alg._update_train_mode()
+                self.assertEqual(alg._train_mode, TrainMode.critic)
+                alg._apply_train_mode_grad_flags()
+                self.assertFalse(alg._actor_eval_samples.requires_grad)
+                restored = self._make_alg(use_actor_id_encoding=True,
+                                          actor_utd=1, critic_utd=2)
+                restored.load_state_dict(alg.state_dict())
+                self.assertTensorEqual(alg._actor_id_embedding.weight,
+                                       restored._actor_id_embedding.weight)
+                self.assertFalse(restored._actor_eval_samples.requires_grad)
+                self.assertTrue(all(not p.requires_grad for p in
+                                    restored._actor_encoder.parameters()))
+                restored._update_train_mode()
+                self.assertEqual(restored._train_mode, TrainMode.actor)
+                self.assertFalse(restored._actor_eval_samples.requires_grad)
+
+    def test_ablations_preserve_action_gradient_and_summaries(self):
+        class MixedCritic(torch.nn.Module):
+            def forward(self, inputs, state=()):
+                encoding, (_, action) = inputs
+                return (2 * action.sum(-1) + encoding[..., 0], state)
+
+        for actor_id, detach in ((False, True), (True, False), (True, True)):
+            for pairing in (True, False):
+                for eval_type in ('full', 'exclude_input', 'last_two', 'output'):
+                    with self.subTest(actor_id=actor_id, detach=detach,
+                                      pairing=pairing, eval_type=eval_type):
+                        alg = self._make_alg(
+                            use_actor_id_encoding=actor_id,
+                            detach_actor_policy_input=detach,
+                            actor_critic_pairing=pairing,
+                            num_sampled_critics_for_actor=1 if pairing else 2,
+                            actor_eval_type=eval_type, debug_summaries=True,
+                            dqda_clipping=.1, use_bootstrap_actors=True)
+                        alg._critic_networks = MixedCritic()
+                        observation = torch.randn(2, 4)
+                        action = alg._actor_networks(observation)[0]
+                        mask = torch.tensor([[1., 0., 1.], [0., 1., 1.]])
+                        with mock.patch.object(alf.summary, 'should_record_summaries',
+                                               return_value=True), \
+                             mock.patch.object(alf.summary, 'scalar'), \
+                             mock.patch.object(alf.summary, 'histogram'), \
+                             mock.patch('alf.algorithms.bafc_algorithm_v3.'
+                                        'safe_mean_hist_summary') as summary:
+                            _, info = alg._actor_train_step(
+                                observation, action, torch.zeros(2, 2), mask, ())
+                        expected = (-.1 * mask.unsqueeze(-1).expand_as(action)
+                                    / alg._bootstrap_mask_prob)
+                        gradient = torch.autograd.grad(info.loss.sum(), action,
+                                                       retain_graph=True)[0]
+                        self.assertTensorClose(gradient, expected)
+                        self.assertTensorEqual(info.extra.eval_action_loss,
+                                               torch.zeros(2))
+                        (info.loss.mean() + info.extra.eval_action_loss.mean()).backward()
+                        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                                            for p in alg._actor_networks.parameters()))
+                        self.assertTrue(all(p.grad is None for p in
+                                            alg._actor_encoder.parameters()))
+                        if actor_id:
+                            self.assertIsNone(alg._actor_id_embedding.weight.grad)
+                        names = [call.args[0] for call in summary.call_args_list]
+                        self.assertIn('actor_gradients/dqda', names)
+                        self.assertFalse(any('dqde' in name for name in names))
+
+    def test_detach_removes_functional_actor_gradient(self):
+        observation = torch.randn(2, 4)
+        for detach in (False, True):
+            alg = self._make_alg(detach_actor_policy_input=detach,
+                                 actor_eval_type='output')
+            alg._critic_networks = _EncodingParallelCritic()
+            action = alg._actor_networks(observation)[0]
+            _, info = alg._actor_train_step(
+                observation, action, torch.zeros(2, 2), torch.ones(2, 3), ())
+            (info.loss.mean() + info.extra.eval_action_loss.mean()).backward()
+            nonzero = any(p.grad is not None and p.grad.abs().sum() > 0
+                          for p in alg._actor_networks.parameters())
+            self.assertEqual(bool(nonzero), not detach)
+
+    def test_detach_preserves_critic_losses_and_gradients(self):
+        observation = torch.randn(4, 4)
+        rollout_action = torch.randn(4, 2)
+        reward = torch.randn(2, 2)
+        results = []
+        for detach in (False, True):
+            torch.manual_seed(711)
+            alg = self._make_alg(detach_actor_policy_input=detach,
+                                 use_random_critic_targets=True)
+            target_action = alg._actor_networks(observation)[0].reshape(-1, 2)
+            _, critic = alg._critic_train_step(
+                observation, alg.get_initial_train_state(4).critic,
+                BafcInfo(action=rollout_action), target_action)
+            loss = alg._calc_critic_loss(BafcInfo(
+                reward=reward, discount=torch.full((2, 2), .99),
+                step_type=torch.full((2, 2), StepType.MID, dtype=torch.int64),
+                critic=BafcCriticInfo(
+                    critic=critic.critic.reshape(2, 2, 3, 3),
+                    target_critic=critic.target_critic.reshape(2, 2, 3))))
+            params = (tuple(alg._critic_networks.parameters())
+                      + tuple(alg._actor_encoder.parameters())
+                      + (alg._actor_eval_samples,))
+            grads = torch.autograd.grad(loss.loss.mean(), params)
+            results.append((critic.critic, critic.target_critic, loss.loss, grads))
+        for reference, detached in zip(alf.nest.flatten(results[0]),
+                                       alf.nest.flatten(results[1])):
+            self.assertTensorEqual(reference, detached)
+        self.assertGreater(results[1][-1][-1].abs().sum().item(), 0.)
+
+    def test_ablation_training_cycles(self):
+        for actor_id, detach in ((False, True), (True, False), (True, True)):
+            with self.subTest(actor_id=actor_id, detach=detach):
+                alg = self._make_alg(use_actor_id_encoding=actor_id,
+                                     detach_actor_policy_input=detach,
+                                     actor_utd=1, critic_utd=2,
+                                     debug_summaries=True)
+                inputs = TimeStep(
+                    step_type=torch.full((2, 2), StepType.MID, dtype=torch.int32),
+                    reward=torch.randn(2, 2), discount=torch.ones(2, 2),
+                    observation=torch.randn(2, 2, 4),
+                    prev_action=torch.zeros(2, 2, 2),
+                    env_id=torch.zeros(2, 2, dtype=torch.int64))
+                exp = Experience(time_step=inputs, action=torch.zeros(2, 2, 2),
+                                 rollout_info=BafcInfo(action=torch.zeros(2, 2, 2)))
+                alg._processed_experience_spec = dist_utils.extract_spec(exp, from_dim=2)
+                alg._exp_contains_step_type = True
+                optimizer = torch.optim.Adam(alg.parameters(), lr=1e-3)
+                for _ in range(7):
+                    optimizer.zero_grad(set_to_none=True)
+                    with mock.patch.object(alf.summary, 'should_record_summaries',
+                                           return_value=True), \
+                         mock.patch.object(alf.summary, 'scalar'), \
+                         mock.patch.object(alf.summary, 'histogram'):
+                        info = alg._collect_train_info_parallelly(exp)
+                    loss = alg.calc_loss(info)
+                    total = sum(x.mean() for x in (loss.loss, loss.scalar_loss)
+                                if isinstance(x, torch.Tensor))
+                    self.assertTrue(torch.isfinite(total))
+                    total.backward()
+                    if actor_id:
+                        if isinstance(info.actor.loss, torch.Tensor):
+                            self.assertTensorEqual(info.actor.extra.eval_action_loss,
+                                                   torch.zeros_like(info.actor.loss))
+                        self.assertTrue(all(p.grad is None for p in
+                                            alg._actor_encoder.parameters()))
+                        self.assertFalse(alg._actor_eval_samples.requires_grad)
+                    optimizer.step()
+                    alg.after_update(inputs, info)
+                self.assertGreater(alg._actor_update_counter, 0)
+                self.assertGreater(alg._critic_update_counter, 0)
+
     def test_eval_samples_source_validation_and_optimizer(self):
         with self.assertRaisesRegex(AssertionError, "eval_samples_source"):
             self._make_alg(eval_samples_source='unknown')
