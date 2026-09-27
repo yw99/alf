@@ -29,10 +29,9 @@ _ext = lazy_load_extension(name="fused_matmul_act",
 class StaticState:
     workspace = {}
     workspace_size = 1024 * 1024 * 8
-    bias_g = {
-        idx: torch.tensor([], dtype=torch.float16).cuda(idx)
-        for idx in range(torch.cuda.device_count())
-    }
+    # Importing ALF also imports this module in CPU-only coordinators.
+    # Allocate buffers only on the device actually used by a fused operation.
+    bias_g = {}
 
     @classmethod
     def get(cls, name: str, device: torch.device) -> Any:
@@ -42,6 +41,9 @@ class StaticState:
                                              dtype=torch.uint8,
                                              device=device).cuda(idx)
         if name == "bias":
+            if idx not in cls.bias_g:
+                cls.bias_g[idx] = torch.empty(
+                    (0, ), dtype=torch.float16, device=device).cuda(idx)
             return cls.bias_g[idx]
         if name == "workspace":
             return cls.workspace[idx]

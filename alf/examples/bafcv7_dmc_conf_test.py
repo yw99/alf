@@ -23,17 +23,22 @@ class BafcV7DmcConfigTest(alf.test.TestCase):
             self._repo_root /
             "alf/examples/run_hopper_hop_bafcv7_seed-4g.sh")
 
-    def _parse_variant(self, variant):
+    def _parse_variant(self, variant, optimized=True):
         code = """
 import json
 import alf
 from alf.utils import common
 alf.pre_config({
     "bafcv7_variant": %r,
+    "bafcv7_enable_optimizations": %r,
     "bafcv7_env_name": "hopper:hop",
 })
 common.parse_conf_file(%r, create_env=False)
 keys = [
+    "BafcAlgorithmV7.cache_frozen_probe_outputs",
+    "BafcAlgorithmV7.deduplicate_critic_episode_seeds",
+    "BafcAlgorithmV7.selective_critic_evaluation",
+    "BafcAlgorithmV7.share_critic_observation_encoding",
     "BafcAlgorithmV7.num_actors",
     "BafcAlgorithmV7.policy_feature_mode",
     "BafcAlgorithmV7.num_critics",
@@ -47,7 +52,7 @@ keys = [
     "TrainerConfig.num_env_steps",
 ]
 print(json.dumps({key: alf.get_config_value(key) for key in keys}))
-""" % (variant, str(self._config))
+""" % (variant, optimized, str(self._config))
         result = subprocess.run(
             [sys.executable, "-c", code],
             cwd=self._repo_root,
@@ -83,6 +88,28 @@ print(json.dumps({key: alf.get_config_value(key) for key in keys}))
             self.assertEqual(preset["BafcAlgorithmV7.policy_feature_mode"],
                              "mean_log_std")
             self.assertEqual(preset["TrainerConfig.num_env_steps"], 800000)
+
+    def test_optimization_switch_and_all_launchers(self):
+        keys = ["cache_frozen_probe_outputs", "deduplicate_critic_episode_seeds",
+                "selective_critic_evaluation", "share_critic_observation_encoding"]
+        for enabled in (True, False):
+            preset = self._parse_variant("single_seeded", optimized=enabled)
+            for key in keys:
+                self.assertEqual(preset["BafcAlgorithmV7." + key], enabled)
+            for launcher in sorted((self._repo_root / "alf/examples").glob("*bafcv7*.sh")):
+                with self.subTest(launcher=launcher.name, enabled=enabled):
+                    subprocess.run(["bash", "-n", str(launcher)], check=True)
+                    command = ["bash", str(launcher), "--dry-run"]
+                    if not enabled:
+                        command.append("--disable-optimizations")
+                    result = subprocess.run(command, cwd=self._repo_root,
+                        env=dict(os.environ, PYTHON_BIN=sys.executable),
+                        check=True, text=True, capture_output=True)
+                    commands = [line for line in result.stdout.splitlines()
+                                if " --root_dir " in line]
+                    self.assertTrue(commands)
+                    for line in commands:
+                        self.assertIn("bafcv7_enable_optimizations=" + str(enabled), line)
 
     def test_config_requires_launcher_environment(self):
         code = """

@@ -22,6 +22,7 @@ from alf.algorithms.data_transformer import ObservationNormalizer
 from alf.environments import suite_dmc
 from alf.environments.gym_wrappers import FrameSkip
 from alf.networks.bafc_v7_actor_network import BafcV7ActorNetwork
+from alf.networks.bafc_v7_critic_network import BafcV7FuncCriticNetwork
 from alf.optimizers import Adam
 from alf.utils.math_ops import clipped_exp
 
@@ -54,6 +55,9 @@ else:
         "bafcv7_variant must be 'ensemble_base' or 'single_seeded'; got "
         f"{variant!r}")
 
+alf.define_config("bafcv7_enable_optimizations", True)
+enable_optimizations = alf.get_config_value("bafcv7_enable_optimizations")
+
 hidden_layers = (256, 256)
 
 alf.config(
@@ -80,7 +84,7 @@ actor_network_cls = partial(
     fc_layer_params=(256, 256),
     use_ln=False)
 critic_network_cls = partial(
-    alf.networks.FuncCriticNetwork,
+    BafcV7FuncCriticNetwork if enable_optimizations else alf.networks.FuncCriticNetwork,
     obs_action_joint_fc_layer_params=hidden_layers,
     actor_obs_action_joint_fc_layer_params=(256, 256),
     use_fc_ln=True)
@@ -90,6 +94,10 @@ alf.config(
     "BafcAlgorithmV7",
     actor_network_cls=actor_network_cls,
     critic_network_cls=critic_network_cls,
+    cache_frozen_probe_outputs=enable_optimizations,
+    deduplicate_critic_episode_seeds=enable_optimizations,
+    selective_critic_evaluation=enable_optimizations,
+    share_critic_observation_encoding=enable_optimizations,
     num_sampled_critics_for_actor=1,
     num_actor_eval_samples=512,
     policy_feature_mode="mean_log_std",

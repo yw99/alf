@@ -14,6 +14,8 @@
 
 from absl.testing import parameterized
 import unittest
+import subprocess
+import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,6 +23,19 @@ import alf
 from time import perf_counter
 from alf.ext import fused_linear_act, relu_backward
 from alf.tensor_specs import torch_dtype_to_str
+
+
+class FusedLinearActImportTest(unittest.TestCase):
+
+    def test_import_does_not_initialize_cuda(self):
+        # Use a fresh interpreter: this test module already imports ALF.
+        subprocess.run([
+            sys.executable, "-c",
+            "import torch; "
+            "assert not torch.cuda.is_initialized(); "
+            "import alf; "
+            "assert not torch.cuda.is_initialized()"
+        ], check=True)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")

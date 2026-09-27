@@ -33,8 +33,10 @@ from alf.nest import nest
 import alf.nest.utils as nest_utils
 from alf.networks import FuncCriticNetwork, TransformerEncoder
 from alf.networks.bafc_v7_actor_network import BafcV7ActorNetwork
+from alf.networks.bafc_v7_critic_network import BafcV7ParallelCritic
+from alf.networks.projection_networks import NormalProjectionNetwork
 from alf.tensor_specs import BoundedTensorSpec, TensorSpec
-from alf.utils import checkpoint_utils, common, losses, math_ops
+from alf.utils import checkpoint_utils, common, dist_utils, losses, math_ops
 from alf.utils.schedulers import Scheduler
 
 
@@ -93,6 +95,13 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
     observations fixed throughout training while still training the actor and
     encoder. Frozen samples are saved and restored in checkpoints, and cannot
     be used with a separate ``eval_samples_optimizer``.
+
+    The four optimization switches default to False for a reference execution
+    path. ``cache_frozen_probe_outputs`` reuses actor outputs only between actor
+    updates; ``deduplicate_critic_episode_seeds`` shares deterministic encodings
+    within a critic update. ``selective_critic_evaluation`` and
+    ``share_critic_observation_encoding`` require the V7-specific critic network.
+    Unsupported custom networks automatically use the reference operations.
     """
 
     def __init__(self,
@@ -136,7 +145,11 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
                  name="BafcAlgorithmV7",
                  use_random_critic_targets=True,
                  num_sampled_critic_targets=1,
-                 eval_samples_source="trainable"):
+                 eval_samples_source="trainable",
+                 cache_frozen_probe_outputs=False,
+                 deduplicate_critic_episode_seeds=False,
+                 selective_critic_evaluation=False,
+                 share_critic_observation_encoding=False):
         del calculate_priority
         if not isinstance(action_spec, BoundedTensorSpec):
             raise TypeError("BAFCv7 requires a bounded continuous action spec")
@@ -286,6 +299,15 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
             debug_summaries=debug_summaries,
             name=name)
 
+        self._cache_frozen_probe_outputs = cache_frozen_probe_outputs
+        self._deduplicate_critic_episode_seeds = deduplicate_critic_episode_seeds
+        self._selective_critic_evaluation = selective_critic_evaluation
+        self._share_critic_observation_encoding = share_critic_observation_encoding
+        self._probe_cache = None
+        self._probe_cache_key = None
+        self._probe_cache_hits = 0
+        self._probe_cache_misses = 0
+        self._last_seed_counts = None
         self._actor_networks = actor_networks
         self._actor_encoder = actor_encoder
         self._critic_networks = critic_networks
@@ -374,6 +396,7 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
                               unexpected_keys,
                               error_msgs,
                               visited=None):
+        self._clear_probe_cache()
         runtime_state = self._pop_runtime_state(state_dict, prefix)
         saved_mode_value = runtime_state.get("policy_feature_mode")
         if saved_mode_value is None:
@@ -509,11 +532,70 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
             state=state._replace(action=action_state),
             info=info)
 
+    def _clear_probe_cache(self):
+        self._probe_cache = None
+        self._probe_cache_key = None
+
+    def _apply(self, fn, recurse=True):
+        self._clear_probe_cache()
+        return super()._apply(fn, recurse=recurse)
+
+    def _critic_only(self):
+        return (self._train_mode == TrainMode.critic and
+                (self._actor_update_counter > 0 or self._critic_update_counter > 0))
+
+    def _stock_deterministic_actor(self):
+        actor = self._actor_networks
+        if (type(actor) is not BafcV7ActorNetwork
+                or type(actor._projection_net) is not NormalProjectionNetwork):
+            return False
+        projection = actor._projection_net
+        std_transform = projection._std_transform
+        if isinstance(std_transform, functools.partial):
+            std_transform = std_transform.func
+        return (
+            projection._mean_transform is math_ops.identity
+            and std_transform in (nn.functional.softplus, math_ops.clipped_exp,
+                                  math_ops.identity, torch.exp)
+            and all(type(t) in (dist_utils.StableTanh, dist_utils.AffineTransform)
+                    for t in projection._transforms)
+            and all(type(layer) is alf.layers.ParallelFC
+                    and layer._bn is None
+                    and layer._activation in (torch.relu_, torch.relu, math_ops.identity)
+                    for layer in [*actor._fc_layers,
+                                  projection._means_projection_layer,
+                                  projection._std_projection_layer]))
+
+    def _probe_output(self, actor_eval_samples):
+        cacheable = (self._cache_frozen_probe_outputs and self._critic_only()
+                     and self._eval_samples_source == "frozen"
+                     and actor_eval_samples.shape == self._actor_eval_samples.shape
+                     and actor_eval_samples.data_ptr() == self._actor_eval_samples.data_ptr()
+                     and self._stock_deterministic_actor())
+        if not cacheable:
+            self._clear_probe_cache()
+            return self._actor_networks(
+                actor_eval_samples, full_neurons=self._actor_eval_type == "last_two")
+        # No replay inputs or encoder parameters belong in this key. Tensor
+        # versions are host metadata, so checking them does not synchronize CUDA.
+        tensors = [self._actor_eval_samples, *self._actor_networks.parameters(),
+                   *self._actor_networks.buffers()]
+        key = (tuple((id(t), t._version, t.device, t.dtype) for t in tensors),
+               torch.is_autocast_enabled(), torch.get_autocast_dtype("cuda"))
+        if key != self._probe_cache_key:
+            with torch.no_grad():
+                self._probe_cache = self._actor_networks(
+                    actor_eval_samples,
+                    full_neurons=self._actor_eval_type == "last_two")
+            self._probe_cache_key = key
+            self._probe_cache_misses += 1
+        else:
+            self._probe_cache_hits += 1
+        return self._probe_cache
+
     def _policy_encoding(self, actor_eval_samples, episode_seed=None):
-        """Encode either every base actor or every seed-conditioned actor."""
-        output = self._actor_networks(
-            actor_eval_samples,
-            full_neurons=self._actor_eval_type == "last_two")
+        """Encode every base actor or seed-conditioned actor for this update."""
+        output = self._probe_output(actor_eval_samples)
         if episode_seed is None:
             policy_features = output.policy_features
             if self._actor_eval_type == "last_two":
@@ -559,7 +641,31 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
     def _training_encoding(self, actor_eval_samples, episode_seed):
         if self._training_policy == "base":
             return self._policy_encoding(actor_eval_samples)
+        deduplicate = (
+            self._deduplicate_critic_episode_seeds and self._critic_only()
+            and self._stock_deterministic_actor()
+            and type(self._actor_encoder) is TransformerEncoder
+            and self._actor_encoder.saved_args.get("input_preprocessors") is None
+            and not any(isinstance(m, nn.Dropout) and m.p != 0
+                        or isinstance(m, nn.MultiheadAttention) and m.dropout != 0
+                        for m in self._actor_encoder.modules()))
+        if deduplicate:
+            seeds, inverse = torch.unique(episode_seed, dim=0, return_inverse=True)
+            self._last_seed_counts = (seeds.shape[0], episode_seed.shape[0])
+            if alf.summary.should_record_summaries():
+                with alf.summary.scope(self.name):
+                    alf.summary.scalar("unique_episode_seeds", seeds.shape[0])
+                    alf.summary.scalar("replay_seed_items", episode_seed.shape[0])
+            if seeds.shape[0] < episode_seed.shape[0]:
+                encoding, _ = self._policy_encoding(actor_eval_samples, seeds)
+                # Critic-only updates do not consume the actor feature surrogate.
+                return encoding.index_select(0, inverse), ()
         return self._policy_encoding(actor_eval_samples, episode_seed)
+
+    @staticmethod
+    def _fast_critic(network):
+        return (isinstance(network, BafcV7ParallelCritic)
+                and network.supports_v7_fast_paths)
 
     def _expand_encoding(self, actor_encoding, batch_size):
         if actor_encoding.ndim == 2:
@@ -571,6 +677,11 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         """Evaluate every critic on every actor-aligned policy input."""
         batch_size = observation.shape[0]
         actor_encoding = self._expand_encoding(actor_encoding, batch_size)
+        if (self._share_critic_observation_encoding
+                and self._fast_critic(critic_networks) and state == ()
+                and action.ndim == len(self._action_spec.shape) + 1):
+            return critic_networks.actor_critic_product(
+                actor_encoding, observation, action, share_observation=True), state
         observation = observation.unsqueeze(1).expand(
             batch_size, self._num_actors, *observation.shape[1:])
         if action.ndim == len(self._action_spec.shape) + 1:
@@ -633,9 +744,17 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
 
     def _actor_train_step(self, observation, action, actor_encoding,
                           actor_features, replay_action, state):
-        q_values, critic_state = self._all_critic_values(
-            self._critic_networks, actor_encoding, observation, action, state)
-        objective = self._actor_objective_values(q_values).sum()
+        if (self._selective_critic_evaluation and self._actor_update_mode == "paired"
+                and self._fast_critic(self._critic_networks) and state == ()):
+            encoding = self._expand_encoding(actor_encoding, observation.shape[0])
+            values = self._critic_networks.paired_actor_values(
+                encoding, observation, action)
+            critic_state = state
+            objective = values.sum()
+        else:
+            q_values, critic_state = self._all_critic_values(
+                self._critic_networks, actor_encoding, observation, action, state)
+            objective = self._actor_objective_values(q_values).sum()
         dqda, dqde = nest_utils.grad(
             (action, actor_features), objective, retain_graph=True)
 
@@ -665,10 +784,23 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
             self._critic_networks, actor_encoding, observation,
             rollout_info.action, state.critic)
         with torch.no_grad():
-            target_critics, target_critic_state = self._all_critic_values(
-                self._target_critic_networks, actor_encoding.detach(),
-                observation, target_action.detach(), state.target_critic)
-            target_critics = self._select_critic_targets(target_critics)
+            if (self._selective_critic_evaluation and self._use_random_critic_targets
+                    and self._num_sampled_critic_targets < self._num_critics
+                    and self._fast_critic(self._target_critic_networks)
+                    and state.target_critic == ()):
+                ids = torch.randperm(self._num_critics, device=observation.device)[
+                    :self._num_sampled_critic_targets]
+                encoding = self._expand_encoding(
+                    actor_encoding.detach(), observation.shape[0])
+                target_critics = self._target_critic_networks.selected_target_values(
+                    encoding, observation, target_action.detach(), ids)
+                target_critics = self._minimum_over_critics(target_critics)
+                target_critic_state = state.target_critic
+            else:
+                target_critics, target_critic_state = self._all_critic_values(
+                    self._target_critic_networks, actor_encoding.detach(),
+                    observation, target_action.detach(), state.target_critic)
+                target_critics = self._select_critic_targets(target_critics)
         new_state = BafcV7CriticState(
             critic=critic_state, target_critic=target_critic_state)
         return new_state, BafcV7CriticInfo(
@@ -793,5 +925,7 @@ class BafcAlgorithmV7(OffPolicyAlgorithm):
         return ["_target_critic_networks"]
 
     def after_update(self, root_inputs, info: BafcV7Info):
+        if self._train_mode != TrainMode.critic:
+            self._clear_probe_cache()
         self._update_train_mode()
         self._update_target_critic()

@@ -8,6 +8,7 @@
 #       --checkpoints N      Number of checkpoints (default: 10)
 #       --base-port PORT     First of four DDP ports (default: 29600)
 #       --policy-features M  mean_log_std or action_quantiles (default: mean_log_std)
+#       --disable-optimizations Use the reference BAFCv7 implementation
 #       --dry-run            Print all four commands without launching
 #   -h, --help               Show this help
 #
@@ -34,6 +35,7 @@ NUM_CHECKPOINTS=10
 GPUS="0,1,2,3"
 BASE_PORT=29600
 DRY_RUN=False
+ENABLE_OPTIMIZATIONS=True
 POLICY_FEATURES="mean_log_std"
 ACTOR_UTD=1
 CRITIC_UTD=3
@@ -73,6 +75,10 @@ while [[ $# -gt 0 ]]; do
         --policy-features)
             POLICY_FEATURES="$2"
             shift 2
+            ;;
+        --disable-optimizations)
+            ENABLE_OPTIMIZATIONS=False
+            shift
             ;;
         --dry-run)
             DRY_RUN=True
@@ -131,6 +137,7 @@ echo "  Seeds: ${SEEDS[*]}"
 echo "  Environment steps: ${NUM_ENV_STEPS}"
 echo "  GPUs per job: ${GPUS}"
 echo "  Threads: OMP=${OMP_NUM_THREADS}, MKL=${MKL_NUM_THREADS}, OPENBLAS=${OPENBLAS_NUM_THREADS}"
+echo "  Optimizations: ${ENABLE_OPTIMIZATIONS}"
 echo "  Dry run: ${DRY_RUN}"
 echo ""
 
@@ -146,6 +153,7 @@ for variant in "${VARIANTS[@]}"; do
             "${PYTHON_BIN}" -m alf.bin.train
             --conf "${CONF_FILE}"
             --root_dir "${run_dir}"
+            --conf_param "bafcv7_enable_optimizations=${ENABLE_OPTIMIZATIONS}"
             --conf_param "bafcv7_variant='${variant}'"
             --conf_param "BafcAlgorithmV7.temporal_noise_mix=${temporal_noise_mix}"
             --conf_param "BafcAlgorithmV7.policy_feature_mode='${POLICY_FEATURES}'"
