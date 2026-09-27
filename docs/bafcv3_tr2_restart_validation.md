@@ -138,3 +138,37 @@ early, and whether UTD 3 improves the actor remain questions for the six selecte
 baseline, UTD-3 runs change both the update schedule and rollout skipping; that
 comparison cannot isolate the effect of skipping alone. Compare returns at matched environment steps and report updates,
 skip fractions, and wall time separately.
+
+
+## Checkpoint compatibility restoration (2026-09-26)
+
+`bafc_algorithm_v3.py` and `agent.py` were restored byte-for-byte to `98783a3`.
+The new compatibility helper is imported and called only inside initial
+BAFCv3-to-TR2 migration; ordinary training and native TR2 resume are unchanged.
+
+Validation passed **162 unique tests**: 122 existing BAFCv3/TR2/restart/auto-skip
+checks, 35 Agent/framework/SAC/RLPD/TD3 checks, and five new compatibility tests.
+The new integration test exercises all four combinations of old/new source
+checkpoint format and critic UTD 3/11. It verifies real checkpoint loading,
+optimizer/replay/normalizer/progress preservation, counter transfer/fallback,
+both update phases, and save/restore followed by identical learning. The final
+compatibility/restart rerun passed all 20 tests, including snapshot inclusion.
+
+Separate deterministic CPU processes ran 12 training steps each for BAFCv3,
+ordinary TR2, SAC, RLPD, and TD3 against an isolated `git archive HEAD` baseline.
+Every recorded loss tensor, parameter hash, optimizer-state hash, full-state
+hash, update counter, and RNG-state hash matched exactly. Importing the helper
+also preserved RNG and ALF configuration state. These checks establish unchanged
+behavior for the tested configurations, not every possible training setup.
+
+The actual dog-run seed-0 `ckpt-120120` passed four-GPU automatic-skip validation
+with critic UTD 11, gate initially off, endpoint 200k, and the default 100-draw
+calibration. Each rank performed two real environment steps and two training
+iterations (22 critic and two actor updates). Initial and post-learning resume
+were exact, actor/critic parameters stayed synchronized, calibration was
+unchanged on resume, and source fingerprints were unchanged. No full experiment
+was launched. The calibrated threshold was `66.00847816467285`.
+
+Local evidence, test logs, per-rank reports, and the reproducible CPU comparison
+script are in ignored `artifacts/bafcv3-compat-validation/`. Large validation
+checkpoints remain in `/tmp/bafcv3-compat-validation/`.

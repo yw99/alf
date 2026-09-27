@@ -63,6 +63,20 @@ trainable actor evaluation samples, uniform non-recurrent replay, and
 `ObservationNormalizer`. Unsupported schemas fail rather than silently resetting
 state. Model, optimizer, and exactly replay ranks 0–3 are mandatory.
 
+### Source checkpoint compatibility
+
+Migration accepts both older BAFCv3 runtime checkpoints without a target-updater
+counter and newer checkpoints containing it. New counters are validated and
+restored; older checkpoints initialize it to zero. The migration audit records
+which protocol was used. The experiment requires `target_critic_period=1` and
+`target_critic_use_ema=False`; delayed EMA/intermediate updater models, other
+periods, malformed counters, and unknown runtime fields are rejected before
+loading model state.
+
+These rules live in `alf/utils/bafcv3_restart_compat.py` and apply only to initial
+BAFCv3-to-TR2 migration. Ordinary algorithm training and existing TR2 checkpoint
+resume retain their native behavior. Existing source checkpoints are not edited.
+
 ## Calibration and skipping
 
 Each repetition samples a fresh native replay minibatch and a target-cache subset.
