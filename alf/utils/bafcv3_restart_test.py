@@ -270,6 +270,9 @@ class RestartTest(unittest.TestCase):
         root = Path(self.tmp.name) / 'destination'
         args = parser().parse_args(['--source-checkpoint', str(model), '--root-dir', str(root), '--prepare-only'])
         prepared = prepare(args)
+        self.assertEqual(
+            (root / 'code_snapshot/alf/utils/bafcv3_restart_compat.py').read_bytes(),
+            Path(__file__).with_name('bafcv3_restart_compat.py').read_bytes())
         with self.assertRaisesRegex(ValueError, 'already exists'):
             prepare(args)
         args.resume = True

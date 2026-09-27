@@ -93,7 +93,8 @@ def prepare(args):
     shutil.copy2(run / 'alf_config.py', conf_dir / 'alf_config.py')
     shutil.copytree(run / 'config_files', conf_dir / 'config_files')
     repo = Path(__file__).resolve().parents[2]
-    code_files = ['alf/utils/bafcv3_restart.py', 'alf/bin/train_bafcv3_tr2_restart.py',
+    code_files = ['alf/utils/bafcv3_restart.py',
+                  'alf/utils/bafcv3_restart_compat.py', 'alf/bin/train_bafcv3_tr2_restart.py',
                   'alf/algorithms/bafc_algorithm_v3.py', 'alf/algorithms/bafc_algorithm_v3_tr2.py',
                   'alf/algorithms/agent.py', 'alf/trainers/policy_trainer.py',
                   'alf/experience_replayers/replay_buffer.py', 'alf/utils/checkpoint_utils.py']

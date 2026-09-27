@@ -350,6 +350,12 @@ def assert_equal_state(expected, actual, label):
 def migrate(agent, options, rank):
     source_path = options['source_checkpoint']
     checkpoint = load(source_path)
+    # Validate before constructing/loading either side of the migration.
+    from alf.utils.bafcv3_restart_compat import migrate_runtime_state
+    runtime_overrides, runtime_audit = migrate_runtime_state(
+        checkpoint['algorithm'],
+        target_critic_period=alf.get_config_value('BafcAlgorithmV3.target_critic_period'),
+        target_critic_use_ema=alf.get_config_value('BafcAlgorithmV3.target_critic_use_ema'))
     optimizer = load(source_path + '-optimizer')['algorithm']
     replay = load(source_path + f'-replay_buffer-rank{rank}')['algorithm']
     # The original BAFC constructor/config remains registered alongside TR2.
@@ -365,12 +371,6 @@ def migrate(agent, options, rank):
     del source
     target = agent.state_dict()
     original = checkpoint['algorithm']
-    known_runtime = {'training_started', 'train_mode', 'rollout_actor_id',
-                     'actor_update_counter', 'critic_update_counter',
-                     'reweighting_target_observation_cache'}
-    unknown = {k[len(_RUNTIME):] for k in original if k.startswith(_RUNTIME)} - known_runtime
-    if unknown:
-        raise ValueError(f'Unrecognized source runtime fields: {sorted(unknown)}')
     for name, value in original.items():
         if name.startswith(_RUNTIME):
             continue
@@ -392,12 +392,7 @@ def migrate(agent, options, rank):
                 break
         else:
             raise ValueError(f'Unexplained new state: {name}')
-    fields = ('training_started', 'train_mode', 'rollout_actor_id',
-              'actor_update_counter', 'critic_update_counter')
-    for name in fields:
-        if _RUNTIME + name not in original:
-            raise ValueError(f'Missing source runtime state: {name}')
-        target[_RUNTIME + name] = original[_RUNTIME + name]
+    target.update(runtime_overrides)
     target.update(mapped_opts)
     replay = materialize_replay(agent, replay)
     target.update(replay)
@@ -441,13 +436,13 @@ def migrate(agent, options, rank):
                  initialized_network_keys=added,
                  source_global_step=int(checkpoint['global_step']),
                  source_env_steps=int(checkpoint['trainer_progress']['_env_steps']),
+                 runtime_compatibility=runtime_audit,
                  reset=['simulator/partial episode', 'new TR2 gate/cadence controller',
-                        'unsaved target updater counter (source period is 1)',
                         'training RNG (deterministic new stream)'],
                  limitations=['Historical rank-local normalization unavailable; shared rank0 state used',
                               'Historical simulator and RNG state unavailable'])
-    if alf.get_config_value('BafcAlgorithmV3.target_critic_period') != 1:
-        raise ValueError('An unsaved target updater phase is unsupported for period != 1')
+    if runtime_audit['target_updater_counter_protocol'] != 'restored':
+        audit['reset'].append('target updater counter (legacy source, period is 1)')
     return checkpoint, audit
 
 
