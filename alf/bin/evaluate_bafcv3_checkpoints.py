@@ -231,7 +231,7 @@ def variant_configuration(settings):
             and not any(k.endswith(tag) for tag in excluded)}
 
 
-def load_model(run, model, device):
+def load_model(run, model, device, *, allow_frozen_eval_samples=False):
     import alf
     from alf.algorithms.bafc_algorithm_v3 import BafcAlgorithmV3
     from alf.algorithms.config import TrainerConfig
@@ -256,8 +256,11 @@ def load_model(run, model, device):
     alg = BafcAlgorithmV3(observation_spec=obs_spec,
                          action_spec=BoundedTensorSpec((action_dim,), minimum=-1., maximum=1.),
                          config=config)
-    if alg._eval_samples_source != 'trainable':
-        raise ValueError('Replay-sourced actor encodings need a separate diagnostic protocol')
+    allowed_sources = ('trainable', 'frozen') if allow_frozen_eval_samples else ('trainable',)
+    if alg._eval_samples_source not in allowed_sources:
+        raise ValueError(
+            f'Unsupported evaluation-sample source {alg._eval_samples_source!r}; '
+            f'this diagnostic supports {allowed_sources}')
     incompatible = alg.load_state_dict(s)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise ValueError(str(incompatible))
