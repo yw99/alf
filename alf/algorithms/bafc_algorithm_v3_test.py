@@ -163,7 +163,8 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
         implicit = self._make_alg()
         rng = torch.get_rng_state()
         torch.manual_seed(101)
-        explicit = self._make_alg(use_actor_id_encoding=False,
+        explicit = self._make_alg(use_single_layer_transformer_encoder=False,
+                                  use_actor_id_encoding=False,
                                   detach_actor_policy_input=False)
         self.assertTensorEqual(rng, torch.get_rng_state())
         self.assertEqual(set(implicit.state_dict()), set(explicit.state_dict()))
@@ -173,6 +174,192 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
         detached = self._make_alg(detach_actor_policy_input=True)
         detached.load_state_dict(implicit.state_dict())
         self.assertFalse(hasattr(implicit, '_actor_id_embedding'))
+
+    def test_single_layer_transformer_shapes_and_positions(self):
+        for eval_type in ('full', 'exclude_input', 'last_two', 'output'):
+            for dimension in (None, 8):
+                with self.subTest(eval_type=eval_type, dimension=dimension):
+                    # The helper supplies a two-layer partial constructor;
+                    # the flag must override its depth without losing settings.
+                    alg = self._make_alg(
+                        use_single_layer_transformer_encoder=True,
+                        actor_eval_type=eval_type,
+                        actor_encoding_dim=dimension)
+                    encoder = alg._actor_encoder
+                    encoder.eval()
+                    self.assertIsInstance(encoder, TransformerEncoder)
+                    self.assertEqual(len(encoder._transformer.layers), 1)
+                    self.assertEqual(encoder._num_layers, 1)
+                    layer = encoder._transformer.layers[0]
+                    self.assertEqual(layer.self_attn.num_heads, 1)
+                    self.assertEqual(layer.dropout.p, 0.1)
+                    captured = []
+                    handle = encoder.register_forward_pre_hook(
+                        lambda module, inputs: captured.append(inputs[0]))
+                    encoding, _ = alg._encode_actor_policies()
+                    handle.remove()
+                    tokens = captured[0]
+                    self.assertFalse(tokens.is_contiguous())
+                    positions = encoder._pos_encoder.pe[:, :tokens.shape[1], :]
+                    self.assertGreater(positions.abs().sum(), 0.)
+                    self.assertTensorEqual(encoder._pos_encoder(tokens),
+                                           tokens + positions)
+                    expected = layer(tokens + positions)[:, 0, :]
+                    if encoder._core_fc is not None:
+                        expected = encoder._core_fc(expected)
+                    self.assertTensorClose(encoding, expected)
+                    self.assertEqual(encoding.shape, (3, dimension or 16))
+                    self.assertEqual(encoder.output_spec.shape,
+                                     (dimension or 16,))
+                    self.assertEqual(encoder.state_spec, ())
+                    self.assertEqual(encoder(tokens)[1], ())
+
+        with self.assertRaisesRegex(AssertionError, 'use_actor_id_encoding'):
+            self._make_alg(use_single_layer_transformer_encoder=True,
+                           use_actor_id_encoding=True)
+
+    def test_single_layer_transformer_checkpoint_depth_must_match(self):
+        original = self._make_alg()
+        single = self._make_alg(use_single_layer_transformer_encoder=True)
+        self.assertEqual(len(original._actor_encoder._transformer.layers), 2)
+        # ALF reports incompatible keys from load_state_dict; the actual
+        # checkpoint loader enforces strict resume compatibility.
+        for source, target in ((original, single), (single, original)):
+            with tempfile.TemporaryDirectory() as ckpt_dir:
+                Checkpointer(ckpt_dir, algorithm=source).save(1)
+                with self.assertRaises(RuntimeError):
+                    Checkpointer(ckpt_dir, algorithm=target).load(1, strict=True)
+
+    def _single_layer_critic_loss(self, alg, observation):
+        target_action = alg._actor_networks(observation)[0].reshape(-1, 2)
+        _, critic = alg._critic_train_step(
+            observation, alg.get_initial_train_state(4).critic,
+            BafcInfo(action=torch.zeros(4, 2)), target_action)
+        return alg._calc_critic_loss(BafcInfo(
+            reward=torch.ones(2, 2), discount=torch.full((2, 2), .99),
+            step_type=torch.full((2, 2), StepType.MID, dtype=torch.int64),
+            critic=BafcCriticInfo(
+                critic=critic.critic.reshape(2, 2, 3, 3),
+                target_critic=critic.target_critic.reshape(2, 2, 3, 3))
+        )).loss.mean()
+
+    def test_single_layer_transformer_critic_gradients_and_sample_sources(self):
+        for source in ('trainable', 'frozen', 'replay'):
+            with self.subTest(source=source):
+                alg = self._make_alg(use_single_layer_transformer_encoder=True,
+                                     eval_samples_source=source,
+                                     actor_utd=1, critic_utd=2)
+                alg._critic_update_counter = 1
+                alg._apply_train_mode_grad_flags()
+                observations = torch.randn(4, 5, 4, requires_grad=True)
+                if source == 'replay':
+                    alg.preprocess_experience(
+                        TimeStep(observation=observations), BafcInfo(), ())
+                optimizer = torch.optim.Adam(alg.parameters(), lr=1e-3)
+                weight = (alg._actor_encoder._transformer.layers[0]
+                          .self_attn.in_proj_weight)
+                weights = weight.detach().clone()
+                samples = alg._actor_eval_samples.detach().clone()
+                loss = self._single_layer_critic_loss(alg, torch.randn(4, 4))
+                self.assertTrue(torch.isfinite(loss))
+                loss.backward()
+                self.assertGreater(weight.grad.abs().sum(), 0.)
+                if source == 'trainable':
+                    self.assertGreater(
+                        alg._actor_eval_samples.grad.abs().sum(), 0.)
+                else:
+                    self.assertIsNone(alg._actor_eval_samples.grad)
+                self.assertIsNone(observations.grad)
+                self.assertTrue(all(p.grad is None
+                                    for p in alg._actor_networks.parameters()))
+                optimizer.step()
+                self.assertFalse(torch.equal(
+                    weights, weight))
+                self.assertEqual(torch.equal(samples, alg._actor_eval_samples),
+                                 source != 'trainable')
+
+    def test_single_layer_transformer_functional_actor_gradient(self):
+        for detach in (False, True):
+            with self.subTest(detach=detach):
+                alg = self._make_alg(use_single_layer_transformer_encoder=True,
+                                     detach_actor_policy_input=detach,
+                                     actor_eval_type='output')
+                alg._critic_networks = _EncodingParallelCritic()
+                observation = torch.randn(2, 4)
+                action = alg._actor_networks(observation)[0]
+                _, info = alg._actor_train_step(
+                    observation, action, torch.zeros(2, 2),
+                    torch.ones(2, 3), ())
+                (info.loss.mean() + info.extra.eval_action_loss.mean()).backward()
+                nonzero = any(p.grad is not None and p.grad.abs().sum() > 0
+                              for p in alg._actor_networks.parameters())
+                self.assertEqual(bool(nonzero), not detach)
+                self.assertTrue(all(p.grad is None
+                                    for p in alg._actor_encoder.parameters()))
+
+    def test_single_layer_transformer_optimizer_checkpoint_continuation(self):
+        for dedicated in (False, True):
+            with self.subTest(dedicated=dedicated):
+                def make_agent():
+                    agent = self._make_agent(
+                        use_single_layer_transformer_encoder=True, actor_utd=1, critic_utd=2,
+                        actor_encoder_optimizer=(alf.optimizers.Adam(lr=2e-3)
+                                                 if dedicated else None))
+                    agent._default_optimizer = alf.optimizers.Adam(lr=1e-3)
+                    agent._setup_optimizers()
+                    return agent
+
+                def update(agent, observation):
+                    alg = agent._rl_algorithm
+                    alg._apply_train_mode_grad_flags()
+                    for optimizer in agent.optimizers():
+                        optimizer.zero_grad(set_to_none=True)
+                    loss = self._single_layer_critic_loss(alg, observation)
+                    loss.backward()
+                    for optimizer in agent.optimizers():
+                        optimizer.step()
+                    alg._critic_update_counter += 1
+                    alg._update_target_critic()
+                    return loss.detach()
+
+                agent = make_agent()
+                alg = agent._rl_algorithm
+                owner = (alg._module_to_optimizer[alg._actor_encoder]
+                         if dedicated else agent.default_optimizer)
+                for parameter in alg._actor_encoder.parameters():
+                    self.assertTrue(any(parameter is p
+                                        for group in owner.param_groups
+                                        for p in group['params']))
+                observation = torch.randn(4, 4)
+                update(agent, observation)
+                with tempfile.TemporaryDirectory() as ckpt_dir:
+                    Checkpointer(ckpt_dir, algorithm=agent).save(1)
+                    restored = make_agent()
+                    Checkpointer(ckpt_dir, algorithm=restored).load(1)
+                self.assertEqual(restored._rl_algorithm._critic_update_counter, 1)
+                for old, new in zip(agent.optimizers(), restored.optimizers()):
+                    self.assertEqual(old.state_dict()['param_groups'],
+                                     new.state_dict()['param_groups'])
+                    self.assertEqual(set(old.state_dict()['state']),
+                                     set(new.state_dict()['state']))
+                    old_state = list(old.state_dict()['state'].values())
+                    new_state = list(new.state_dict()['state'].values())
+                    for a, b in zip(alf.nest.flatten(old_state),
+                                    alf.nest.flatten(new_state)):
+                        if isinstance(a, torch.Tensor):
+                            self.assertTensorEqual(a, b)
+                        else:
+                            self.assertEqual(a, b)
+                # Replay the dropout draws to compare training continuation.
+                rng = torch.get_rng_state()
+                expected_loss = update(agent, observation)
+                torch.set_rng_state(rng)
+                self.assertTensorEqual(expected_loss,
+                                       update(restored, observation))
+                for (name, old), (_, new) in zip(agent.named_parameters(),
+                                                restored.named_parameters()):
+                    self.assertTensorEqual(old, new, msg=name)
+                self.assertEqual(restored._rl_algorithm._critic_update_counter, 2)
 
     def test_actor_id_encoding_is_independent_and_critic_trainable(self):
         for dimension in (None, 8):
@@ -344,9 +531,15 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
         self.assertGreater(results[1][-1][-1].abs().sum().item(), 0.)
 
     def test_ablation_training_cycles(self):
-        for actor_id, detach in ((False, True), (True, False), (True, True)):
-            with self.subTest(actor_id=actor_id, detach=detach):
+        for actor_id, detach, single_layer in ((False, True, False),
+                                        (True, False, False),
+                                        (True, True, False),
+                                        (False, False, True),
+                                        (False, True, True)):
+            with self.subTest(actor_id=actor_id, detach=detach,
+                              single_layer=single_layer):
                 alg = self._make_alg(use_actor_id_encoding=actor_id,
+                                     use_single_layer_transformer_encoder=single_layer,
                                      detach_actor_policy_input=detach,
                                      actor_utd=1, critic_utd=2,
                                      debug_summaries=True)
@@ -1280,7 +1473,8 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
     def test_k1_random_pairing_preserves_gradient_and_loss(self):
         slopes = torch.tensor([[1., 2.], [3., 5.], [8., 13.]])
         alg = self._make_alg(
-            actor_critic_pairing=False, actor_eval_type='output')
+            actor_critic_pairing=False, actor_eval_type='output',
+            use_legacy_actor_gradient=True)
         alg._critic_networks = _LinearParallelCritic(slopes)
         matching = torch.tensor([[2, 0, 1]])
         action = torch.randn(2, 3, 2, requires_grad=True)
@@ -1346,8 +1540,8 @@ class BafcAlgorithmV3CheckpointTest(alf.test.TestCase):
                  "alf.algorithms.bafc_algorithm_v3.safe_mean_hist_summary"
              ) as summary_mock, \
              mock.patch(
-                 "alf.algorithms.bafc_algorithm_v3.nest_utils.grad",
-                 wraps=nest_utils.grad) as grad_mock, \
+                 "torch.autograd.grad",
+                 wraps=torch.autograd.grad) as grad_mock, \
              mock.patch.object(
                  alg._critic_networks,
                  "forward",

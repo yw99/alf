@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 import torch
 import torch.nn as nn
@@ -415,6 +416,149 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+def _normalize_attention_vector(x, eps):
+    """Return ``sqrt(head_dim) * x / max(norm(x), eps)`` without overflow.
+
+    Scaling before the reduction also handles finite vectors whose norm is
+    larger than the largest representable value. Half-precision reductions
+    are performed in float32.
+    """
+    dtype = x.dtype
+    work = x.float() if dtype in (torch.float16, torch.bfloat16) else x
+    scale = work.abs().amax(dim=-1, keepdim=True).clamp_min(eps)
+    scaled = work / scale
+    denominator = torch.linalg.vector_norm(scaled, dim=-1, keepdim=True)
+    denominator = torch.maximum(denominator, eps / scale)
+    return (scaled / denominator * math.sqrt(x.shape[-1])).to(dtype)
+
+
+class _InspectableTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    """Stock parameter layout with optional Q/K normalization and capture.
+
+    The default path is PyTorch's implementation. The explicit path uses the
+    same packed projection and SDPA layouts, without materializing an attention
+    matrix or selecting a different attention backend.
+    """
+
+    def __init__(self, *args, normalize_qk=False, qk_norm_eps=1e-6, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.normalize_qk = normalize_qk
+        self.qk_norm_eps = qk_norm_eps
+        self._gradient_chain_capture = None
+
+    def _capture(self, name, value):
+        if self._gradient_chain_capture is not None:
+            values, prefix = self._gradient_chain_capture
+            values[prefix + name] = value
+        return value
+
+    def _attention(self, x, attn_mask, padding_mask, is_causal):
+        self._capture('attention_input', x)
+        # Match multi_head_attention_forward's projection and memory layout.
+        unbatched = x.ndim == 2
+        if unbatched:
+            x = x.unsqueeze(1)
+        elif self.self_attn.batch_first:
+            x = x.transpose(0, 1)
+        length, batch, embed_dim = x.shape
+        heads = self.self_attn.num_heads
+        head_dim = embed_dim // heads
+        q, k, v = F._in_projection_packed(
+            x, x, x, self.self_attn.in_proj_weight,
+            self.self_attn.in_proj_bias)
+
+        def split_heads(value):
+            return value.view(length, batch * heads, head_dim).transpose(
+                0, 1).view(batch, heads, length, head_dim)
+
+        q, k, v = map(split_heads, (q, k, v))
+        self._capture('q_raw', q)
+        self._capture('k_raw', k)
+        self._capture('v', v)
+        if self.normalize_qk:
+            q = _normalize_attention_vector(q, self.qk_norm_eps)
+            k = _normalize_attention_vector(k, self.qk_norm_eps)
+        self._capture('q', q)
+        self._capture('k', k)
+
+        if is_causal and attn_mask is None:
+            raise RuntimeError('Need attn_mask if specifying the is_causal hint.')
+        if is_causal and padding_mask is None:
+            attn_mask = None
+        else:
+            if attn_mask is not None:
+                if attn_mask.ndim == 2:
+                    if tuple(attn_mask.shape) != (length, length):
+                        raise ValueError('Invalid 2D attention mask shape')
+                    attn_mask = attn_mask[None, None]
+                elif attn_mask.ndim == 3:
+                    if tuple(attn_mask.shape) != (batch * heads, length, length):
+                        raise ValueError('Invalid 3D attention mask shape')
+                    attn_mask = attn_mask.view(batch, heads, length, length)
+                else:
+                    raise ValueError('Attention mask must have 2 or 3 dimensions')
+            if padding_mask is not None:
+                if unbatched:
+                    padding_mask = padding_mask.unsqueeze(0)
+                if tuple(padding_mask.shape) != (batch, length):
+                    raise ValueError('Invalid key padding mask shape')
+                padding_mask = padding_mask[:, None, None, :]
+                attn_mask = (padding_mask if attn_mask is None else
+                             attn_mask + padding_mask)
+                is_causal = False
+
+        output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask,
+            self.self_attn.dropout if self.training else 0., is_causal)
+        self._capture('attention', output)
+        output = output.permute(2, 0, 1, 3).contiguous().view(
+            batch * length, embed_dim)
+        output = F.linear(output, self.self_attn.out_proj.weight,
+                          self.self_attn.out_proj.bias)
+        output = output.view(length, batch, embed_dim)
+        if unbatched:
+            output = output.squeeze(1)
+        elif self.self_attn.batch_first:
+            output = output.transpose(0, 1)
+        self._capture('attention_projected', output)
+        return self.dropout1(output)
+
+    def _feedforward(self, x):
+        self._capture('ff_input', x)
+        x = self._capture('ff_hidden', self.linear1(x))
+        x = self._capture('ff_activation', self.activation(x))
+        x = self.linear2(self.dropout(x))
+        return self._capture('ff_output', self.dropout2(x))
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None,
+                is_causal=False):
+        if not self.normalize_qk and self._gradient_chain_capture is None:
+            return super().forward(src, src_mask, src_key_padding_mask,
+                                   is_causal=is_causal)
+        # Do not use the fused inference layer: it would bypass normalization.
+        src_key_padding_mask = F._canonical_mask(
+            mask=src_key_padding_mask, mask_name='src_key_padding_mask',
+            other_type=F._none_or_dtype(src_mask), other_name='src_mask',
+            target_type=src.dtype)
+        src_mask = F._canonical_mask(
+            mask=src_mask, mask_name='src_mask', other_type=None,
+            other_name='', target_type=src.dtype, check_other=False)
+        x = self._capture('input', src)
+        if self.norm_first:
+            normalized = self._capture('norm1', self.norm1(x))
+            x = self._capture('attention_residual', x + self._attention(
+                normalized, src_mask, src_key_padding_mask, is_causal))
+            normalized = self._capture('norm2', self.norm2(x))
+            x = self._capture('ff_residual', x + self._feedforward(normalized))
+        else:
+            x = self._capture('attention_residual', x + self._attention(
+                x, src_mask, src_key_padding_mask, is_causal))
+            x = self._capture('norm1', self.norm1(x))
+            x = self._capture('ff_residual', x + self._feedforward(x))
+            x = self._capture('norm2', self.norm2(x))
+        return self._capture('output', x)
+
+
 @alf.configurable
 class TransformerEncoder(PreprocessorNetwork):
     """A BERT-like transformer encoder.
@@ -458,7 +602,10 @@ class TransformerEncoder(PreprocessorNetwork):
                  return_core_only=True,
                  core_embedding_dim=None,
                  input_preprocessors=None,
-                 name="TransformerNetwork"):
+                 name="TransformerNetwork",
+                 final_norm=False,
+                 normalize_qk=False,
+                 qk_norm_eps=1e-6):
         """
         Args:
             input_tensor_spec (nested TensorSpec): the (nested) tensor spec of
@@ -477,6 +624,12 @@ class TransformerEncoder(PreprocessorNetwork):
             return_core_only (bool): if True, will only return the core embedding
             core_embedding_dim (int): dimension of the output embedding of the core,
                 if not None, an extra FC layer is used to project the core embedding.
+            final_norm (bool): normalize the stack output before core selection.
+                Useful with ``norm_first=True``. Disabled by default to preserve
+                existing parameter names and initialization.
+            normalize_qk (bool): normalize each attention head's query and key
+                to length ``sqrt(head_dim)`` before standard scaled attention.
+            qk_norm_eps (float): minimum query/key normalization denominator.
             input_preprocessors (nested Network|nn.Module): a nest of
                 stateless preprocessor networks, each of which will be applied to the
                 corresponding input. If not None, then it must have the same
@@ -500,6 +653,8 @@ class TransformerEncoder(PreprocessorNetwork):
             name=name)
 
         assert self._processed_input_tensor_spec.ndim == 2
+        if not math.isfinite(qk_norm_eps) or qk_norm_eps <= 0:
+            raise ValueError('qk_norm_eps must be finite and positive')
 
         input_length, d_model = self._processed_input_tensor_spec.shape
         if d_ff is None:
@@ -512,23 +667,53 @@ class TransformerEncoder(PreprocessorNetwork):
         self._pos_encoder = PositionalEncoding(d_model, dropout, input_length)
 
         # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
+        encoder_layer = _InspectableTransformerEncoderLayer(
             d_model=d_model,
             nhead=num_attention_heads,
             dim_feedforward=d_ff,
             dropout=dropout,
             batch_first=batch_first,
             norm_first=norm_first,
-            activation="gelu")
+            activation="gelu",
+            normalize_qk=normalize_qk,
+            qk_norm_eps=qk_norm_eps)
 
-        self._transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-        # self._norm = nn.LayerNorm(d_model)
+        # Nested inference tensors cannot pass through explicit Q/K projection.
+        self._transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers,
+            norm=nn.LayerNorm(d_model) if final_norm else None,
+            enable_nested_tensor=not normalize_qk)
+        self._gradient_chain_capture = None
         self._return_core_only = return_core_only
         if return_core_only and core_embedding_dim is not None:
             self._core_fc = layers.FC(core_size * d_model, core_embedding_dim,
                                       use_ln=True)
         else:
             self._core_fc = None
+
+    @contextlib.contextmanager
+    def capture_gradient_chain(self):
+        """Capture named intermediate tensors from the executed forward graph.
+
+        Yields a dictionary populated by the next forward pass, without
+        detaching tensors or changing the SDPA backend. Keys under
+        ``layers/{index}/`` include Q/K/V (``[B, heads, tokens, head_dim]``),
+        normalization, residual, and feedforward stages. The caller may retain
+        this dictionary for vector--Jacobian products after leaving the context.
+        References held by the module are removed even if the forward fails.
+        """
+        if self._gradient_chain_capture is not None:
+            raise RuntimeError('Gradient-chain capture is already active')
+        values = {}
+        self._gradient_chain_capture = values
+        for i, layer in enumerate(self._transformer.layers):
+            layer._gradient_chain_capture = (values, 'layers/%d/' % i)
+        try:
+            yield values
+        finally:
+            self._gradient_chain_capture = None
+            for layer in self._transformer.layers:
+                layer._gradient_chain_capture = None
 
     def forward(self, inputs, state=()):
         """
@@ -546,14 +731,30 @@ class TransformerEncoder(PreprocessorNetwork):
         z, state = super().forward(inputs, state)
         batch_size = z.shape[0]
         query = self._pos_encoder(z)
-        output = self._transformer(query)
-        # output = self._norm(output)
+        capture = self._gradient_chain_capture
+        if capture is None:
+            output = self._transformer(query)
+        else:
+            capture['input'] = z
+            capture['positioned_input'] = query
+            # Avoid the stack's nested-tensor inference conversion during capture.
+            output = query
+            for layer in self._transformer.layers:
+                output = layer(output)
+            capture['stack_output'] = output
+            if self._transformer.norm is not None:
+                output = self._transformer.norm(output)
+                capture['final_norm'] = output
 
         if self._return_core_only:
             core_embedding = output[:, :self._core_size, :].reshape(
                 batch_size, -1)
             if self._core_fc is not None:
                 core_embedding = self._core_fc(core_embedding)
+            if capture is not None:
+                capture['output'] = core_embedding
             return core_embedding, state
         else:
+            if capture is not None:
+                capture['output'] = output
             return output, state

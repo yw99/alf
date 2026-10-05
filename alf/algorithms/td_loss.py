@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from contextlib import contextmanager
 import torch
 import torch.nn as nn
 from typing import Union, List, Callable, Optional
@@ -112,6 +113,22 @@ class TDLoss(nn.Module):
         """
         return self._gamma.clone()
 
+    @contextmanager
+    def capture_diagnostics(self):
+        """Observe exact loss-space values, targets and residuals from one call.
+
+        Values are detached and exclude the padded last time step. The observer
+        does not recompute targets or update a target normalizer a second time.
+        No diagnostic tensors are retained by the module after the context.
+        """
+        previous = getattr(self, '_diagnostic_capture', None)
+        capture = {}
+        self._diagnostic_capture = capture
+        try:
+            yield capture
+        finally:
+            self._diagnostic_capture = previous
+
     def compute_td_target(self, info: namedtuple, target_value: torch.Tensor):
         """Calculate the td target.
 
@@ -188,7 +205,8 @@ class TDLoss(nn.Module):
                 each time step. This is used to calculate return. ``target_value``
                 can be same as ``value``.
         Returns:
-            LossInfo: with the ``extra`` field same as ``loss``.
+            LossInfo: ``loss`` contains the TD loss and ``extra`` contains the
+            signed residual ``target - value``, both padded by one zero time step.
         """
         returns = self.compute_td_target(info, target_value)
         value = value[:-1]
@@ -206,6 +224,10 @@ class TDLoss(nn.Module):
             value = self._target_normalizer.normalize(value)
 
         td_error = returns - value
+        capture = getattr(self, '_diagnostic_capture', None)
+        if capture is not None:
+            capture.update(value=value.detach(), target=returns.detach(),
+                           residual=td_error.detach())
         if self._debug_summaries and alf.summary.should_record_summaries():
             mask = info.step_type[:-1] != StepType.LAST
             with alf.summary.scope(self._name):

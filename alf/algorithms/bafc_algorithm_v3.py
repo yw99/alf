@@ -16,6 +16,8 @@
 from absl import logging
 import numpy as np
 import functools
+import copy
+from contextlib import nullcontext
 from enum import Enum
 
 import torch
@@ -36,6 +38,7 @@ import alf.nest.utils as nest_utils
 from alf.networks import ActorFCNetwork, FuncCriticNetwork, TransformerEncoder
 from alf.tensor_specs import TensorSpec, BoundedTensorSpec
 from alf.utils import losses, common, math_ops, checkpoint_utils
+from alf.utils import bafcv3_gradient_diagnostics as gradient_diagnostics
 from alf.utils.normalizers import ScalarAdaptiveNormalizer
 from alf.utils.schedulers import Scheduler
 from alf.utils.summary_utils import safe_mean_hist_summary
@@ -133,10 +136,26 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  num_sampled_critic_targets=1,
                  eval_samples_source='trainable',
                  use_actor_id_encoding=False,
-                 detach_actor_policy_input=False):
+                 detach_actor_policy_input=False,
+                 use_single_layer_transformer_encoder=False,
+                 use_target_actor_encoder=False,
+                 use_legacy_actor_gradient=False,
+                 debug_gradient_chain=False,
+                 debug_gradient_chain_compare_backends=False):
         """
         Args:
 
+            use_target_actor_encoder (bool): use a frozen, Polyak-updated encoder
+                for TD targets, sharing the critic target updater and clock.
+                Requires matching architecture flags when resuming.
+            use_legacy_actor_gradient (bool): reproduce the historical connected
+                feature surrogates. False injects independent token partials once.
+            debug_gradient_chain (bool): collect gradient-chain and TD diagnostics.
+                Expensive measurements use the existing debug-summary cadence.
+            debug_gradient_chain_compare_backends (bool): additionally compare
+                against an isolated float32 math-SDPA reference at that cadence.
+                Training dropout must be zero for a comparable reference;
+                otherwise emit a skipped_dropout metric and skip the comparison.
             actor_critic_pairing (bool): whether or not fix the 1-1 pairing of actors 
                 and critics during actor_train_step (there are the same number of 
                 actors and critics, we pair each actor with a unique and different 
@@ -168,12 +187,29 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 during actor updates only (control B), retaining the ordinary
                 action gradient and unchanged functional critic training. This
                 is redundant when ``use_actor_id_encoding`` is True.
+            use_single_layer_transformer_encoder (bool): use one transformer
+                layer to encode actor tokens, retaining the encoder's positional
+                encoding, attention, feedforward network and normalization.
+                Overrides ``num_layers`` to 1 when calling ``actor_encoder_cls``;
+                other encoder settings and the output dimension are unchanged.
+                The constructor must accept ``num_layers``. Cannot be combined
+                with ``use_actor_id_encoding``. Resume with the same architecture;
+                flattened linear and multilayer checkpoints are not converted.
+                False preserves the existing encoder construction exactly.
             bootstrap_mask_type (str): the type of sampling the bootstrap_mask for
                 bootstrapped training of actors and/or critics. There are two types, 
                 ``episode`` and ``step``. ``episode`` means a same bootstrap_mask for
                 every step of an episode. ``step`` means resampled bootstrap_mask for
                 every step of an episode.
         """
+        assert not (use_target_actor_encoder and use_actor_id_encoding), (
+            "use_target_actor_encoder cannot be combined with use_actor_id_encoding.")
+        assert not debug_gradient_chain_compare_backends or debug_gradient_chain, (
+            "debug_gradient_chain_compare_backends requires debug_gradient_chain.")
+        assert not (use_single_layer_transformer_encoder
+                    and use_actor_id_encoding), (
+            "use_single_layer_transformer_encoder cannot be combined with "
+            "use_actor_id_encoding.")
         assert actor_eval_type in ['full', 'exclude_input', 'last_two', 'output'], (
             r"{actor_eval_type} in not supported.")
         assert eval_samples_init_method in ['normal', 'uniform'], (
@@ -229,6 +265,15 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             self._critic_utd = critic_utd
 
         self._use_actor_id_encoding = use_actor_id_encoding
+        self._use_target_actor_encoder = use_target_actor_encoder
+        self._use_legacy_actor_gradient = use_legacy_actor_gradient
+        self._debug_gradient_chain = debug_gradient_chain
+        self._debug_gradient_chain_compare_backends = debug_gradient_chain_compare_backends
+        self._gradient_chain_pending = None
+        self._gradient_chain_step = 0
+        self._gradient_chain_intervals = (
+            gradient_diagnostics.DiagnosticIntervalAccumulator()
+            if debug_gradient_chain else None)
         self._detach_actor_policy_input = detach_actor_policy_input
         self._num_actor_critic = num_actor_critic
         self._actor_critic_pairing = actor_critic_pairing
@@ -280,8 +325,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
         actor_token_spec = TensorSpec(
             shape=(actor_token_length, num_actor_eval_samples))
-        actor_encoder = actor_encoder_cls(
-            actor_token_spec, core_embedding_dim=actor_encoding_dim)
+        if use_single_layer_transformer_encoder:
+            actor_encoder = actor_encoder_cls(
+                actor_token_spec, core_embedding_dim=actor_encoding_dim,
+                num_layers=1)
+        else:
+            actor_encoder = actor_encoder_cls(
+                actor_token_spec, core_embedding_dim=actor_encoding_dim)
 
         # functional critic
         if actor_encoding_dim is None:
@@ -340,6 +390,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._critic_networks = critic_networks
         self._target_critic_networks = critic_networks.copy(
             name='target_critic_networks')
+        if use_target_actor_encoder:
+            # Network.copy() reinitializes and consumes RNG; this is a weight copy.
+            self._target_actor_encoder = copy.deepcopy(actor_encoder)
+            self._target_actor_encoder.requires_grad_(False)
         # self._target_critic_network.set_obs_action_batch_dominate(True)
 
         if critic_loss_ctor is None:
@@ -371,8 +425,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 period=period,
                 delayed_update=use_ema)
 
+        target_sources = [self._critic_networks]
+        target_destinations = [self._target_critic_networks]
+        if use_target_actor_encoder:
+            target_sources.append(self._actor_encoder)
+            target_destinations.append(self._target_actor_encoder)
         self._update_target_critic = _create_target_updater(
-            [self._critic_networks], [self._target_critic_networks],
+            target_sources, target_destinations,
             target_critic_tau, target_critic_period, target_critic_use_ema)
 
         if use_actor_id_encoding:
@@ -491,6 +550,13 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if "critic_update_counter" in runtime_state:
             self._critic_update_counter = self._bafc_scalar_int(
                 runtime_state["critic_update_counter"])
+        # Diagnostic caches are ephemeral, but update IDs should stay monotonic
+        # across an exact resume using the already-checkpointed training counters.
+        self._gradient_chain_step = (self._actor_update_counter
+                                     + self._critic_update_counter)
+        self._gradient_chain_pending = None
+        if self._debug_gradient_chain:
+            self._gradient_chain_intervals = gradient_diagnostics.DiagnosticIntervalAccumulator()
         if "reweighting_target_observation_cache" in runtime_state:
             self._reweighting_target_observation_cache = (
                 self._bafc_runtime_tensor(
@@ -763,7 +829,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
     def _mean_pairwise_cosine(individual_dqda):
         """Mean off-diagonal cosine without constructing a K by K Gram matrix."""
         k = individual_dqda.shape[0]
-        flat_grad = individual_dqda.reshape(*individual_dqda.shape[:3], -1)
+        flat_grad = individual_dqda.double().reshape(*individual_dqda.shape[:3], -1)
         norm = flat_grad.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         unit_grad = flat_grad / norm
         summed_sq_norm = unit_grad.sum(dim=0).square().sum(dim=-1)
@@ -773,11 +839,17 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
     def _summarize_actor_gradients(self, dqda, clipped_dqda, dqde,
                                    clipped_dqde, current_action, replay_action,
                                    q_value, individual_dqda):
+        def finite_summary(name, value):
+            value = value.detach()
+            finite = torch.isfinite(value)
+            alf.summary.scalar(name + '/nonfinite_count', (~finite).sum())
+            safe_mean_hist_summary(name, value[finite])
+
         dqda = dqda.detach()
-        safe_mean_hist_summary('actor_gradients/dqda', dqda)
-        safe_mean_hist_summary('actor_gradients/dqda_abs', dqda.abs())
-        safe_mean_hist_summary('actor_gradients/dqda_l2_norm',
-                               dqda.flatten(start_dim=2).norm(dim=-1))
+        finite_summary('actor_gradients/dqda', dqda)
+        finite_summary('actor_gradients/dqda_abs', dqda.abs())
+        finite_summary('actor_gradients/dqda_l2_norm',
+                               dqda.double().flatten(start_dim=2).norm(dim=-1))
         for i in range(dqda.shape[-1]):
             alf.summary.scalar(
                 f'actor_gradients/dqda_abs_component_{i}',
@@ -785,12 +857,12 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
         if self._dqda_clipping:
             clipped_dqda = clipped_dqda.detach()
-            safe_mean_hist_summary('actor_gradients/clipped_dqda', clipped_dqda)
-            safe_mean_hist_summary('actor_gradients/clipped_dqda_abs',
+            finite_summary('actor_gradients/clipped_dqda', clipped_dqda)
+            finite_summary('actor_gradients/clipped_dqda_abs',
                                    clipped_dqda.abs())
-            safe_mean_hist_summary(
+            finite_summary(
                 'actor_gradients/clipped_dqda_l2_norm',
-                clipped_dqda.flatten(start_dim=2).norm(dim=-1))
+                clipped_dqda.double().flatten(start_dim=2).norm(dim=-1))
             for i in range(clipped_dqda.shape[-1]):
                 alf.summary.scalar(
                     f'actor_gradients/clipped_dqda_abs_component_{i}',
@@ -799,30 +871,29 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 'actor_gradients/dqda_clip_fraction',
                 dqda.abs().gt(self._dqda_clipping).to(torch.float32).mean())
 
-        for i, (raw, clipped) in enumerate(
-                zip(nest.flatten(dqde), nest.flatten(clipped_dqde))):
+        for i, raw in enumerate(nest.flatten(dqde)):
             raw = raw.detach()
-            safe_mean_hist_summary(f'actor_gradients/dqde_leaf_{i}_abs',
+            finite_summary(f'actor_gradients/dqde_leaf_{i}_abs',
                                    raw.abs())
-            safe_mean_hist_summary(
+            finite_summary(
                 f'actor_gradients/dqde_leaf_{i}_l2_norm',
-                raw.flatten(start_dim=max(0, raw.ndim - 1)).norm(dim=-1))
-            if self._dqda_clipping:
-                clipped = clipped.detach()
-                safe_mean_hist_summary(
+                raw.double().flatten(start_dim=max(0, raw.ndim - 1)).norm(dim=-1))
+            if self._dqda_clipping and clipped_dqde is not None:
+                clipped = nest.flatten(clipped_dqde)[i].detach()
+                finite_summary(
                     f'actor_gradients/clipped_dqde_leaf_{i}_abs',
                     clipped.abs())
-                safe_mean_hist_summary(
+                finite_summary(
                     f'actor_gradients/clipped_dqde_leaf_{i}_l2_norm',
-                    clipped.flatten(start_dim=max(0, clipped.ndim - 1)).norm(
+                    clipped.double().flatten(start_dim=max(0, clipped.ndim - 1)).norm(
                         dim=-1))
 
         current_action = current_action.detach()
         replay_action = replay_action.detach().unsqueeze(1)
-        safe_mean_hist_summary(
+        finite_summary(
             'actor_actions/current_vs_replay_l2',
             (current_action - replay_action).flatten(start_dim=2).norm(dim=-1))
-        safe_mean_hist_summary('actor_actions/current_abs',
+        finite_summary('actor_actions/current_abs',
                                current_action.abs())
         alf.summary.scalar(
             'actor_actions/current_fraction_abs_gt_0_95',
@@ -831,22 +902,24 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         if individual_dqda is not None:
             q_value = q_value.detach()
             individual_dqda = individual_dqda.detach()
-            safe_mean_hist_summary('actor_critic_aggregation/q_mean',
+            finite_summary('actor_critic_aggregation/q_mean',
                                    q_value.mean(dim=0))
-            safe_mean_hist_summary(
+            finite_summary(
                 'actor_critic_aggregation/q_std',
                 q_value.std(dim=0, unbiased=False))
-            safe_mean_hist_summary(
+            finite_summary(
                 'actor_critic_aggregation/individual_dqda_l2_norm',
-                individual_dqda.flatten(start_dim=3).norm(dim=-1))
-            safe_mean_hist_summary(
+                individual_dqda.double().flatten(start_dim=3).norm(dim=-1))
+            finite_summary(
                 'actor_critic_aggregation/dqda_pairwise_cosine',
                 self._mean_pairwise_cosine(individual_dqda))
 
-    def _encode_actor_policies(self, actor_eval_samples=None):
+    def _encode_actor_policies(self, actor_eval_samples=None, return_tokens=False,
+                               encoder_rng_state=None):
         """Return encodings in stable actor order and functional eval outputs."""
         if self._use_actor_id_encoding:
-            return self._actor_id_embedding.weight, ()
+            result = (self._actor_id_embedding.weight, ())
+            return (*result, ()) if return_tokens else result
         if actor_eval_samples is None:
             actor_eval_samples = self._get_actor_eval_samples()
         elif self._eval_samples_source == 'frozen':
@@ -860,9 +933,21 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             eval_action = eval_action[-2:]
 
         actor_tokens = self._tokenize_actor_out(eval_action)
+        if encoder_rng_state is not None:
+            encoder_rng_state['cpu'] = torch.get_rng_state()
+            if actor_tokens.is_cuda:
+                encoder_rng_state['cuda'] = torch.cuda.get_rng_state(actor_tokens.device)
         actor_encoding = self._actor_encoder(actor_tokens)[0]
 
-        return actor_encoding, eval_action
+        result = (actor_encoding, eval_action)
+        return (*result, actor_tokens) if return_tokens else result
+
+    @staticmethod
+    def _linear_gradient_surrogate(gradient, value):
+        """Zero-valued surrogate with derivative -gradient, without squaring it."""
+        dtype = torch.float64 if value.dtype == torch.float64 else torch.float32
+        value = value.to(dtype)
+        return -gradient.detach().to(dtype) * (value - value.detach())
 
     def _actor_train_step(self,
                           observation,
@@ -881,8 +966,18 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         """
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        actor_encoding, eval_action = self._encode_actor_policies(
-            actor_eval_samples)
+        record_debug = (self._debug_summaries
+                        and alf.summary.should_record_summaries())
+        record_chain = self._debug_gradient_chain and record_debug
+        capture_context = (self._actor_encoder.capture_gradient_chain()
+                           if record_chain and not self._use_actor_id_encoding
+                           and hasattr(self._actor_encoder, 'capture_gradient_chain')
+                           else nullcontext({}))
+        reference_rng = ({} if record_chain and
+                         self._debug_gradient_chain_compare_backends else None)
+        with capture_context as capture:
+            actor_encoding, eval_action, actor_tokens = self._encode_actor_policies(
+                actor_eval_samples, return_tokens=True, encoder_rng_state=reference_rng)
         action_only = (self._use_actor_id_encoding
                        or self._detach_actor_policy_input)
         if action_only:
@@ -933,69 +1028,368 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         else:
             eval_action_in_graph = eval_action
 
-        record_debug = (self._debug_summaries
-                        and alf.summary.should_record_summaries())
         need_individual_dqda = record_debug and k > 1
         dqda_input = matched_action if need_individual_dqda else action
-        if action_only:
-            dqda = nest_utils.grad(dqda_input, q_value.sum() / k)
-            dqde = ()
-        else:
-            dqda, dqde = nest_utils.grad(
-                (dqda_input, eval_action_in_graph),
-                q_value.sum() / k,
-                retain_graph=self._actor_eval_type != 'output')
+        # Connected-feature derivatives are useful measurements, but reinjecting
+        # them at both a hidden feature and its descendant counts a path twice.
+        measure_connected = (self._use_legacy_actor_gradient or record_debug
+                             or self._debug_gradient_chain)
+        leaves = nest.flatten(eval_action_in_graph) if not action_only else []
+        inputs = [dqda_input]
+        if not action_only and not self._use_legacy_actor_gradient:
+            inputs.append(actor_tokens)
+        if measure_connected:
+            inputs.extend(x for x in leaves if x.requires_grad)
+        if record_chain and not action_only:
+            inputs.extend([actor_encoding, actor_tokens])
+        inputs = list({id(x): x for x in inputs}.values())
+        stage_gradients = {}
+        handles = []
+        if record_chain:
+            for name, tensor in capture.items():
+                if tensor.requires_grad:
+                    def save_gradient(gradient, name=name):
+                        stage_gradients[name] = gradient.detach()
+                    handles.append(tensor.register_hook(save_gradient))
+        try:
+            values = torch.autograd.grad(q_value.sum() / k, inputs,
+                                         retain_graph=True, allow_unused=True)
+        finally:
+            for handle in handles:
+                handle.remove()
+        gradients = {id(x): (g if g is not None else torch.zeros_like(x))
+                     for x, g in zip(inputs, values)}
+        dqda = gradients[id(dqda_input)]
+        dqde = [gradients.get(id(x), torch.zeros_like(x)) for x in leaves]
+        token_gradient = (gradients.get(id(actor_tokens)) if not action_only
+                          else None)
 
         individual_dqda = None
         if need_individual_dqda:
-            # dqda is scaled by 1/K through the mean-Q objective. Scatter-summing
-            # therefore produces the mean selected-critic gradient in actor order.
+            # Restore mean selected-critic gradients to stable actor order.
             individual_dqda = self._restore_actor_order(
                 dqda * k, matched_actor_ids)
             dqda = individual_dqda.mean(dim=0)
             q_value = self._restore_actor_order(q_value, matched_actor_ids)
 
-        if self._dqda_clipping:
-            clipped_dqda = torch.clamp(dqda, -self._dqda_clipping,
-                                       self._dqda_clipping)
-            clipped_dqde = nest.map_structure(
-                lambda x: torch.clamp(x, -self._dqda_clipping,
-                                      self._dqda_clipping), dqde)
-        else:
-            clipped_dqda = dqda
-            clipped_dqde = dqde
+        def clip(x):
+            return (x.clamp(-self._dqda_clipping, self._dqda_clipping)
+                    if self._dqda_clipping else x)
 
+        clipped_dqda = clip(dqda)
+        clipped_dqde = [clip(g) for g in dqde] if self._use_legacy_actor_gradient else None
         if record_debug:
             self._summarize_actor_gradients(
                 dqda, clipped_dqda, dqde, clipped_dqde, action, replay_action,
                 q_value, individual_dqda)
+            alf.summary.scalar('actor_gradients/critic_objective',
+                               q_value.detach().mean())
 
         def action_loss_fn(gradient, a_in):
-            loss = 0.5 * losses.element_wise_squared_loss(
-                (gradient + a_in).detach(), a_in)
+            if self._use_legacy_actor_gradient:
+                loss = 0.5 * losses.element_wise_squared_loss(
+                    (gradient + a_in).detach(), a_in)
+            else:
+                loss = self._linear_gradient_surrogate(gradient, a_in)
             return loss.sum(list(range(2, loss.ndim)))
 
-        # 1st term of OPG: loss corresponding to input action
-        action_loss = nest.map_structure(action_loss_fn, clipped_dqda, action)
+        action_loss = action_loss_fn(clipped_dqda, action)
         if self._use_bootstrap_actors:
             action_loss = action_loss * mask / self._bootstrap_mask_prob
         action_loss = action_loss.sum(-1)
 
+        probe_hidden_loss = probe_output_loss = None
         if action_only:
             eval_action_loss = torch.zeros_like(action_loss)
+        elif self._use_legacy_actor_gradient:
+            leaf_losses = [action_loss_fn(g, x).mean()
+                           for g, x in zip(clipped_dqde, leaves)]
+            eval_action_loss = sum(leaf_losses).repeat(action_loss.shape[0])
+            probe_hidden_loss = sum(leaf_losses[:-1]) if len(leaf_losses) > 1 else None
+            probe_output_loss = leaf_losses[-1]
         else:
-            # 2nd term of OPG: loss corresponding to input eval_action
-            eval_action_loss = nest.map_structure(
-                action_loss_fn, clipped_dqde, eval_action_in_graph)
-            # ALF workaround: reduce to scalar_loss and repeat to [T*B]
-            # Will be averaged to a scalar_loss in calc_loss
-            eval_action_loss = math_ops.add_n(eval_action_loss).mean().repeat(
+            clipped_tokens = clip(token_gradient)
+            if self._actor_eval_type == 'full':
+                # Preserve the old exclusion of the direct raw-probe-input path,
+                # including the initial joint update where probes are trainable.
+                input_width = eval_action[0].shape[-1]
+                clipped_tokens = torch.cat((
+                    torch.zeros_like(clipped_tokens[:, :input_width]),
+                    clipped_tokens[:, input_width:]), dim=1)
+            token_loss = self._linear_gradient_surrogate(
+                clipped_tokens, actor_tokens)
+            scale = actor_tokens.shape[0] * actor_tokens.shape[-1]
+            action_width = action.shape[-1]
+            probe_hidden_loss = token_loss[:, :-action_width].sum() / scale
+            probe_output_loss = token_loss[:, -action_width:].sum() / scale
+            eval_action_loss = (probe_hidden_loss + probe_output_loss).repeat(
                 action_loss.shape[0])
+            if record_chain:
+                gradient_diagnostics.summarize_tensor(
+                    'gradient_chain/rank_local/token_applied', clipped_tokens)
+
+        if self._debug_gradient_chain:
+            for i, gradient in enumerate(dqde):
+                self._gradient_chain_intervals.record(
+                    'dqde/leaf_%d' % i, gradient, self._gradient_chain_step)
+        if record_chain:
+            self._record_actor_gradient_chain(
+                dqda, token_gradient, dqde, actor_encoding, actor_tokens,
+                gradients, capture, stage_gradients, leaves)
+            if self._debug_gradient_chain_compare_backends and not action_only:
+                self._compare_actor_attention_backends(
+                    actor_tokens, leaves, actor_encoding, token_gradient, dqde,
+                    critic_observation, critic_action, matched_actor_ids, k,
+                    batch_size, state, reference_rng)
+            self._gradient_chain_pending = (
+                action_loss, probe_hidden_loss, probe_output_loss)
 
         actor_info = LossInfo(
             loss=action_loss,
             extra=BafcActorInfo(eval_action_loss=eval_action_loss)) 
         return critic_state, actor_info
+
+    def _record_actor_gradient_chain(self, dqda, token_gradient, dqde,
+                                     encoding, tokens, gradients, capture,
+                                     stage_gradients, leaves):
+        """Observe the executed objective backward, never a reconstructed graph."""
+        prefix = 'gradient_chain/rank_local/'
+        summarize = gradient_diagnostics.summarize_tensor
+        summarize(prefix + 'action', dqda)
+        if token_gradient is not None:
+            summarize(prefix + 'tokens', token_gradient)
+            summarize(prefix + 'encoding', gradients[id(encoding)])
+            # Token partials and connected leaf cotangents are different objects.
+            # Their difference isolates all paths through descendant features.
+            offset = (tokens.shape[1] - sum(x.shape[-1] for x in leaves))
+            for i, (leaf, total) in enumerate(zip(leaves, dqde)):
+                width = leaf.shape[-1]
+                direct = token_gradient[:, offset:offset + width].permute(2, 0, 1)
+                summarize(prefix + 'features/leaf_%d/direct' % i, direct)
+                summarize(prefix + 'features/leaf_%d/connected' % i, total)
+                summarize(prefix + 'features/leaf_%d/through_descendants' % i,
+                          total - direct)
+                offset += width
+        for name, activation in capture.items():
+            summarize(prefix + 'stages/' + name + '/activation', activation,
+                      histogram=False)
+            if name in stage_gradients:
+                summarize(prefix + 'stages/' + name + '/cotangent',
+                          stage_gradients[name], histogram=False)
+        # Only readout queries are materialized: O(L*d), not all L*L scores.
+        for name, query in capture.items():
+            if not name.endswith('/q'):
+                continue
+            layer = name[:-2]
+            key = capture[layer + '/k']
+            logits = (query.detach().double()[:, :, :1] @
+                      key.detach().double().transpose(-2, -1)) / query.shape[-1]**0.5
+            probability = logits.softmax(-1)
+            top = logits.topk(min(2, logits.shape[-1]), dim=-1)
+            winner = top.indices[..., 0]
+            attention_prefix = prefix + 'attention/' + layer + '/'
+            summarize(attention_prefix + 'readout_logits', logits)
+            summarize(attention_prefix + 'entropy',
+                      -(probability * probability.clamp_min(1e-300).log()).sum(-1))
+            summarize(attention_prefix + 'max_probability', probability.amax(-1))
+            summarize(attention_prefix + 'winner', winner)
+            if top.values.shape[-1] == 2:
+                summarize(attention_prefix + 'winner_margin',
+                          top.values[..., 0] - top.values[..., 1])
+            output_start = tokens.shape[1] - self._action_spec.shape[-1]
+            summarize(attention_prefix + 'winner_is_action',
+                      (winner >= output_start).float())
+            for actor in range(winner.shape[0]):
+                for head in range(winner.shape[1]):
+                    alf.summary.scalar(
+                        attention_prefix + 'actor_%d/head_%d/winner' % (actor, head),
+                        winner[actor, head, 0])
+            for kind in ('q_raw', 'k_raw', 'q', 'k'):
+                summarize(attention_prefix + kind + '_norm',
+                          capture[layer + '/' + kind].detach().double().norm(dim=-1))
+
+    def _compare_actor_attention_backends(self, tokens, leaves, encoding,
+                                           token_gradient, dqde, observation,
+                                           action, matched_ids, k, batch_size,
+                                           state, reference_rng):
+        """Shadow the same actor objective using math SDPA and isolated state."""
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        from torch.func import functional_call
+
+        if not isinstance(self._actor_encoder, TransformerEncoder):
+            return
+        # Different SDPA backends need not draw identical attention-dropout
+        # masks from the same RNG seed. A deterministic comparison requires p=0.
+        stochastic = any(
+            module.training and (
+                (isinstance(module, nn.Dropout) and module.p > 0) or
+                (isinstance(module, nn.MultiheadAttention) and module.dropout > 0))
+            for network in (self._actor_encoder, self._critic_networks)
+            for module in network.modules())
+        alf.summary.scalar('gradient_chain/backend_comparison/skipped_dropout',
+                           int(stochastic))
+        if stochastic:
+            return
+        # Reuse the actor graph only for the final VJP, so connected dqde includes
+        # precisely the same h -> action path and the same probe realization.
+        reference_tokens = tokens.detach().float().requires_grad_(True)
+        devices = ([tokens.device.index] if tokens.is_cuda else [])
+        encoder_state = {
+            name: (tensor.detach().float().clone() if tensor.is_floating_point()
+                   else tensor.detach().clone()) for name, tensor in
+            list(self._actor_encoder.named_parameters()) +
+            list(self._actor_encoder.named_buffers())}
+        critic_state = {
+            name: (tensor.detach().float().clone() if tensor.is_floating_point()
+                   else tensor.detach().clone()) for name, tensor in
+            list(self._critic_networks.named_parameters()) +
+            list(self._critic_networks.named_buffers())}
+        # No new critic/probe selection and no persistent RNG/buffer changes.
+        with torch.random.fork_rng(devices=devices), sdpa_kernel(SDPBackend.MATH), \
+                torch.autocast(device_type=tokens.device.type, enabled=False):
+            torch.set_rng_state(reference_rng['cpu'])
+            if tokens.is_cuda:
+                torch.cuda.set_rng_state(reference_rng['cuda'], tokens.device)
+            reference_encoding = functional_call(
+                self._actor_encoder, encoder_state, (reference_tokens,))[0]
+            matched_encoding = reference_encoding[matched_ids]
+            critic_encoding = matched_encoding[:, None].expand(
+                k, batch_size, self._num_actor_critic, matched_encoding.shape[-1]
+            ).reshape(k * batch_size, self._num_actor_critic, -1)
+            reference_q = functional_call(
+                self._critic_networks, critic_state,
+                ((critic_encoding, (observation.detach().float(), action.detach().float())), state))[0]
+            reference_gradient = torch.autograd.grad(
+                reference_q.sum() / k, reference_tokens)[0]
+        reference_leaves = [x for x in leaves if x.requires_grad]
+        connected = torch.autograd.grad(
+            tokens, reference_leaves, grad_outputs=reference_gradient.to(tokens.dtype),
+            retain_graph=True, allow_unused=True) if reference_leaves else []
+        connected = {id(x): (g if g is not None else torch.zeros_like(x))
+                     for x, g in zip(reference_leaves, connected)}
+        comparisons = [('encoding', encoding, reference_encoding),
+                       ('tokens', token_gradient, reference_gradient)]
+        comparisons.extend(('dqde_leaf_%d' % i, actual,
+                            connected.get(id(leaf), torch.zeros_like(leaf)))
+                           for i, (leaf, actual) in enumerate(zip(leaves, dqde)))
+        for name, actual, reference in comparisons:
+            prefix = 'gradient_chain/backend_comparison/' + name
+            actual, reference = actual.detach().double(), reference.detach().double()
+            gradient_diagnostics.summarize_tensor(prefix + '/math', reference)
+            gradient_diagnostics.summarize_tensor(prefix + '/difference', actual - reference)
+            alf.summary.scalar(prefix + '/relative_l2_error',
+                               (actual - reference).norm() /
+                               reference.norm().clamp_min(1e-30))
+            alf.summary.scalar(prefix + '/cosine',
+                               gradient_diagnostics.gradient_cosine_similarity(
+                                   [actual], [reference]))
+
+    def _finish_actor_gradient_chain(self, info):
+        """Parameter VJPs with the actual action/probe loss reductions."""
+        pending, self._gradient_chain_pending = self._gradient_chain_pending, None
+        if pending is None:
+            return
+        action_loss, hidden_loss, output_loss = pending
+        action_loss = action_loss.reshape(info.step_type.shape)
+        if self._config.mask_out_loss_for_last_step:
+            action_loss = action_loss * (info.step_type != StepType.LAST)
+        params = [p for p in self._actor_networks.parameters() if p.requires_grad]
+        losses_to_measure = [('replay_action', action_loss.mean()),
+                             ('connected_hidden' if self._use_legacy_actor_gradient
+                              else 'direct_hidden', hidden_loss),
+                             ('probe_output_path', output_loss)]
+        branches = {}
+        for name, loss in losses_to_measure:
+            branches[name] = (torch.autograd.grad(
+                loss, params, retain_graph=True, allow_unused=True)
+                if isinstance(loss, torch.Tensor) and loss.requires_grad
+                else (None,) * len(params))
+        def add(*vectors):
+            return tuple(sum(values) if values else None for values in
+                         ([g for g in entries if g is not None]
+                          for entries in zip(*vectors)))
+        hidden_name = losses_to_measure[1][0]
+        branches['probe_sum'] = add(branches[hidden_name], branches['probe_output_path'])
+        branches['total'] = add(branches['replay_action'], branches['probe_sum'])
+        prefix = 'gradient_chain/rank_local/parameters/'
+        statistics = {}
+        for name, vector in branches.items():
+            statistics[name] = gradient_diagnostics.gradient_vector_statistics(vector)
+            for key, scalar in statistics[name].items():
+                alf.summary.scalar(prefix + name + '/' + key, scalar)
+        total_norm = statistics['total']['norm'].clamp_min(1e-30)
+        for name in branches:
+            alf.summary.scalar(prefix + name + '/norm_relative_to_total',
+                               statistics[name]['norm'] / total_norm)
+        for left, right in ((hidden_name, 'probe_output_path'),
+                            ('replay_action', 'probe_sum')):
+            alf.summary.scalar(prefix + left + '_vs_' + right + '/cosine',
+                               gradient_diagnostics.gradient_cosine_similarity(
+                                   branches[left], branches[right]))
+        # These are local objective contributions before an outer Agent's loss
+        # weight or replay importance weight. Actual reduced optimizer gradients
+        # are separately observed in after_update(). Baseline uses unit weights.
+        alf.summary.scalar(prefix + 'excludes_outer_loss_weights', 1)
+
+    def _record_td_gradient_diagnostics(self, info, td_records):
+        # Batch reductions across all actors/critics. Per-actor attribution is
+        # expanded into scalar tags only at the sparse summary boundary.
+        if len(td_records) != self._num_actor_critic:
+            return
+        values, residuals, targets = [], [], []
+        for loss_fn, value, residual, capture in td_records:
+            if not isinstance(residual, torch.Tensor) or residual.shape != value.shape:
+                return  # A custom/quantile loss may not expose ordinary TD residuals.
+            if capture:
+                value, residual = capture['value'], capture['residual']
+                targets.append(capture['target'])
+            else:
+                value, residual = value[:-1].detach(), residual[:-1].detach()
+                if getattr(loss_fn, '_normalize_target', False):
+                    value = loss_fn._target_normalizer.normalize(value)
+            values.append(value)
+            residuals.append(residual)
+        value = torch.stack(values, dim=3)
+        residual = torch.stack(residuals, dim=3)
+        mask = (info.step_type[:-1] != StepType.LAST)[:, :, None, None]
+        if self._use_bootstrap_critics:
+            mask = mask & info.bootstrap_mask[:-1, :, None, :].bool()
+        dimensions = (0, 1) + tuple(range(4, value.ndim))
+        measurements = [('residual', residual), ('value', value)]
+        if len(targets) == self._num_actor_critic:
+            measurements.append(('target', torch.stack(targets, dim=3)))
+        # A custom loss without the observer cannot expose an exact target.
+        # Reconstructing value + residual would lose small targets by cancellation.
+        for name, tensor in measurements:
+            statistics = gradient_diagnostics.tensor_statistics(
+                tensor, mask=mask, reduce_dims=dimensions)
+            self._gradient_chain_intervals.record_statistics(
+                'td/' + name, statistics, self._gradient_chain_step)
+
+    def _record_optimizer_gradient_diagnostics(self):
+        # The inline minibatch summary gate selects only the last update. Read
+        # preceding critic gradients on the same summary ITERATION before they
+        # are cleared by the actor update. No extra backward/collective is used.
+        step = int(alf.summary.get_global_counter())
+        config = self._config
+        scheduled = (step % config.summary_interval == 0 or
+                     (config.summarize_first_interval and step < config.summary_interval))
+        if not (self._debug_summaries and alf.summary.is_summary_enabled() and scheduled):
+            return
+        modules = [('actor', self._actor_networks), ('encoder', self._actor_encoder),
+                   ('critic', self._critic_networks)]
+        for name, module in modules:
+            gradients = [p.grad for p in module.parameters() if p.grad is not None]
+            if not gradients:
+                continue
+            statistics = gradient_diagnostics.gradient_vector_statistics(gradients)
+            self._gradient_chain_intervals.record_statistics(
+                'optimizer_gradients/' + name, statistics, self._gradient_chain_step)
+        if self._actor_eval_samples.grad is not None:
+            self._gradient_chain_intervals.record_statistics(
+                'optimizer_gradients/probes',
+                gradient_diagnostics.gradient_vector_statistics([self._actor_eval_samples.grad]),
+                self._gradient_chain_step)
 
     def _select_critic_targets(self, target_critics):
         """Optionally construct one RLPD-style target for all critics.
@@ -1032,7 +1426,14 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                            actor_eval_samples=None):
         ## Step 1: encode all actors from actor_eval_samples
         ####################################################
-        actor_encoding, _ = self._encode_actor_policies(actor_eval_samples)
+        actor_encoding, _, actor_tokens = self._encode_actor_policies(
+            actor_eval_samples, return_tokens=True)
+        if self._use_target_actor_encoder:
+            with torch.no_grad():
+                target_actor_encoding = self._target_actor_encoder(
+                    actor_tokens.detach())[0]
+        else:
+            target_actor_encoding = actor_encoding
 
         ## Step 2: compute critics and target critics for training actor batch
         ##
@@ -1045,6 +1446,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         batch_size = observation.shape[0]
         # repeat the entirety of actor_encoding T*S times -> [n_actor * T*S, d_enc]
         actor_encoding = actor_encoding.repeat(batch_size, 1)
+        target_actor_encoding = target_actor_encoding.repeat(batch_size, 1)
         # repeat each row of rollout obs & action n_actor times -> [n_actor * T*S, d_sa]
         critic_observation = observation.repeat_interleave(
             self._num_actor_critic, dim=0)
@@ -1060,7 +1462,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             target_observation = observation.repeat_interleave(
                 self._num_actor_critic, dim=0)
             target_critics, target_critic_state = self._target_critic_networks(
-                (actor_encoding, (target_observation, action)), state.target_critic)
+                (target_actor_encoding, (target_observation, action)), state.target_critic)
 
         # [T*B*n_actor, n_critic] -> [T*S, n_actor, n_critic]
         critics = critics.reshape(-1, self._num_actor_critic, *critics.shape[1:])
@@ -1167,6 +1569,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
 
     def calc_loss(self, info: BafcInfo):
         assert not self._is_eval
+        if self._gradient_chain_pending is not None:
+            self._finish_actor_gradient_chain(info)
         actor_loss = info.actor
         eval_action_loss = actor_loss.extra.eval_action_loss
         if isinstance(eval_action_loss, torch.Tensor):
@@ -1188,6 +1592,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         with alf.summary.record_if(lambda: self._do_critic_summary):
             critic_info = info.critic
             critic_losses = []
+            td_records = []
             for i, l in enumerate(self._critic_losses):
                 # critics has shape [T, S, n_actor, n_critic, ...].
                 # A random shared target has shape [T, S, n_actor, ...];
@@ -1196,16 +1601,23 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                     target_value = critic_info.target_critic
                 else:
                     target_value = critic_info.target_critic[:, :, :, i, ...]
-                critic_loss = l(
-                    info=info,
-                    value=critic_info.critic[:, :, :, i, ...],
-                    target_value=target_value).loss
+                value = critic_info.critic[:, :, :, i, ...]
+                capture_context = (l.capture_diagnostics()
+                                   if self._debug_gradient_chain and
+                                   hasattr(l, 'capture_diagnostics') else nullcontext({}))
+                with capture_context as capture:
+                    td_loss = l(info=info, value=value, target_value=target_value)
+                critic_loss = td_loss.loss
+                if self._debug_gradient_chain:
+                    td_records.append((l, value, td_loss.extra, capture))
                 if self._use_bootstrap_critics:
                     bootstrap_mask = info.bootstrap_mask[:, :,
                                                          i] / self._bootstrap_mask_prob
                     critic_loss = critic_loss * bootstrap_mask
                 critic_losses.append(critic_loss)
 
+        if self._debug_gradient_chain:
+            self._record_td_gradient_diagnostics(info, td_records)
         self._do_critic_summary = False
         critic_loss = math_ops.add_n(critic_losses)
 
@@ -1214,8 +1626,23 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
             extra=critic_loss)
 
     def _trainable_attributes_to_ignore(self):
-        return ['_target_critic_networks']
+        ignored = ['_target_critic_networks']
+        if self._use_target_actor_encoder:
+            ignored.append('_target_actor_encoder')
+        return ignored
 
     def after_update(self, root_inputs, info: BafcInfo):
+        if self._debug_gradient_chain:
+            self._record_optimizer_gradient_diagnostics()
+            if self._debug_summaries and alf.summary.should_record_summaries():
+                self._gradient_chain_intervals.summarize(
+                    'gradient_chain/intervals', self._gradient_chain_step)
+                alf.summary.scalar('gradient_chain/optimizer_gradients_are_ddp_reduced',
+                                   int(torch.distributed.is_initialized()))
+                alf.summary.scalar('gradient_chain/actor_update_counter',
+                                   self._actor_update_counter)
+                alf.summary.scalar('gradient_chain/critic_update_counter',
+                                   self._critic_update_counter)
+            self._gradient_chain_step += 1
         self._update_train_mode()
         self._update_target_critic()

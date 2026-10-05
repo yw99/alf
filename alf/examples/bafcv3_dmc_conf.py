@@ -47,8 +47,28 @@ alf.define_config('bafcv3_use_bootstrap_critics', False)
 use_bootstrap_critics = alf.get_config_value('bafcv3_use_bootstrap_critics')
 alf.define_config('bafcv3_num_attention_heads', 1)
 num_attention_heads = alf.get_config_value('bafcv3_num_attention_heads')
+alf.define_config('bafcv3_transformer_norm_first', False)
+transformer_norm_first = alf.get_config_value('bafcv3_transformer_norm_first')
+alf.define_config('bafcv3_transformer_final_norm', False)
+transformer_final_norm = alf.get_config_value('bafcv3_transformer_final_norm')
+alf.define_config('bafcv3_transformer_normalize_qk', False)
+transformer_normalize_qk = alf.get_config_value('bafcv3_transformer_normalize_qk')
+alf.define_config('bafcv3_transformer_qk_norm_eps', 1e-6)
+transformer_qk_norm_eps = alf.get_config_value('bafcv3_transformer_qk_norm_eps')
 alf.define_config('bafcv3_use_actor_id_encoding', False)
 use_actor_id_encoding = alf.get_config_value('bafcv3_use_actor_id_encoding')
+alf.define_config('bafcv3_use_single_layer_transformer_encoder', False)
+use_single_layer_transformer_encoder = alf.get_config_value(
+    'bafcv3_use_single_layer_transformer_encoder')
+alf.define_config('bafcv3_use_target_actor_encoder', False)
+use_target_actor_encoder = alf.get_config_value('bafcv3_use_target_actor_encoder')
+alf.define_config('bafcv3_use_legacy_actor_gradient', False)
+use_legacy_actor_gradient = alf.get_config_value('bafcv3_use_legacy_actor_gradient')
+alf.define_config('bafcv3_debug_gradient_chain', False)
+debug_gradient_chain = alf.get_config_value('bafcv3_debug_gradient_chain')
+alf.define_config('bafcv3_debug_gradient_chain_compare_backends', False)
+debug_gradient_chain_compare_backends = alf.get_config_value(
+    'bafcv3_debug_gradient_chain_compare_backends')
 alf.define_config('bafcv3_detach_actor_policy_input', False)
 detach_actor_policy_input = alf.get_config_value(
     'bafcv3_detach_actor_policy_input')
@@ -114,6 +134,11 @@ alf.config(
     eval_samples_clipping=obs_normalizer_clipping,
     eval_samples_source=eval_samples_source,
     use_actor_id_encoding=use_actor_id_encoding,
+    use_single_layer_transformer_encoder=use_single_layer_transformer_encoder,
+    use_target_actor_encoder=use_target_actor_encoder,
+    use_legacy_actor_gradient=use_legacy_actor_gradient,
+    debug_gradient_chain=debug_gradient_chain,
+    debug_gradient_chain_compare_backends=debug_gradient_chain_compare_backends,
     detach_actor_policy_input=detach_actor_policy_input,
     actor_eval_type='last_two',
     actor_encoding_dim=None,
@@ -132,6 +157,10 @@ alf.config(
     'TransformerEncoder',
     num_layers=4,
     num_attention_heads=num_attention_heads,
+    norm_first=transformer_norm_first,
+    final_norm=transformer_final_norm,
+    normalize_qk=transformer_normalize_qk,
+    qk_norm_eps=transformer_qk_norm_eps,
     dropout=0.0)
 
 alf.config(
