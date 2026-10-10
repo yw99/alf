@@ -309,5 +309,196 @@ print(json.dumps({{scope + '.' + key: alf.get_config_value(scope + '.' + key)
             self.assertFalse(results.exists())
 
 
+class BafcV3DqdeWeightLayersConfigTest(alf.test.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self._repo_root = Path(__file__).resolve().parents[2]
+        self._config = self._repo_root / 'alf/examples/bafcv3_dmc_conf.py'
+        self._launcher = self._repo_root / (
+            'alf/examples/run_humanoid_run_bafcv3_preln_dqde_weight_layers_seed01-8g.sh')
+        self._baseline_launcher = self._repo_root / (
+            'alf/examples/run_humanoid_run_bafcv3_preln_pairing_targets-8g.sh')
+
+    def _dry_run(self, results, *options, launcher=None, env=None):
+        return subprocess.run(
+            ['bash', str(launcher or self._launcher), '--dry-run', '--dir',
+             str(results), *options], cwd=self._repo_root,
+            env=env or dict(os.environ, PYTHON_BIN=sys.executable),
+            text=True, capture_output=True)
+
+    @staticmethod
+    def _commands(run):
+        return [shlex.split(line) for line in run.stdout.splitlines()
+                if line.startswith('CUDA_VISIBLE_DEVICES=')]
+
+    @staticmethod
+    def _settings(command):
+        return dict(command[i + 1].split('=', 1)
+                    for i, item in enumerate(command) if item == '--conf_param')
+
+    def test_launcher_matrix_and_baseline_parity(self):
+        subprocess.run(['bash', '-n', str(self._launcher)], check=True)
+        for override in (False, True):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as tmp:
+                results = Path(tmp) / 'results with spaces'
+                options = (['--env', 'humanoid:walk', '--steps', '1200',
+                            '--checkpoints', '2', '--gpus', '7,6,5,4,3,2,1,0',
+                            '--base-port', '31000'] if override else [])
+                run = self._dry_run(results, *options)
+                baseline_run = self._dry_run(
+                    results, *options, launcher=self._baseline_launcher)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(baseline_run.returncode, 0, baseline_run.stderr)
+                self.assertFalse(results.exists())
+                baseline = self._settings(self._commands(baseline_run)[0])
+                self.assertEqual(baseline['TrainerConfig.random_seed'], '2')
+                self.assertEqual(baseline['bafcv3_actor_critic_pairing'], 'False')
+                self.assertEqual(baseline['bafcv3_use_random_critic_targets'], 'True')
+                commands = self._commands(run)
+                self.assertEqual(len(commands), 6)
+                roots, ports, configurations = set(), set(), set()
+                for index, command in enumerate(commands):
+                    setting, seed = divmod(index, 2)
+                    layers, weight = ((1, '0.5'), (2, '1'), (2, '0.5'))[setting]
+                    gpu_groups = (('7,6,5,4', '3,2,1,0') if override else
+                                  ('0,1,2,3', '4,5,6,7'))
+                    self.assertEqual(command[0],
+                                     'CUDA_VISIBLE_DEVICES=' + gpu_groups[seed])
+                    self.assertEqual(command[1], 'MASTER_PORT=' +
+                                     str((31000 if override else 29960) + index))
+                    ports.add(command[1])
+                    expected = dict(baseline)
+                    expected.update({
+                        'TrainerConfig.random_seed': str(seed),
+                        'bafcv3_use_single_layer_transformer_encoder': str(layers == 1),
+                        'TransformerEncoder.num_layers': str(layers),
+                        'bafcv3_dqde_weight': weight,
+                    })
+                    self.assertEqual(self._settings(command), expected)
+                    self.assertEqual(command[command.index('--distributed') + 1],
+                                     'multi-gpu')
+                    self.assertEqual(command[command.index('--conf') + 1],
+                                     str(self._config))
+                    root = Path(command[command.index('--root_dir') + 1])
+                    roots.add(root)
+                    self.assertEqual(root.name, f'seed_{seed}')
+                    self.assertEqual(root.parent.name, 'dqde_weight' + weight)
+                    self.assertEqual(root.parents[1].name, f'layers{layers}')
+                    self.assertRegex(root.parents[2].name, r'^\d{8}T\d{6}Z$')
+                    self.assertEqual(root.parents[3], results /
+                                     ('humanoid_walk' if override else 'humanoid_run') /
+                                     'bafcv3_preln_dqde_weight_layers_seed01_8g')
+                    self.assertEqual(command[command.index('>') + 1],
+                                     str(root / 'out.log'))
+                    configurations.add((layers, weight, seed))
+                self.assertEqual(len(roots), 6)
+                self.assertEqual(len(ports), 6)
+                self.assertEqual(configurations, {
+                    (layers, weight, seed)
+                    for layers, weight in ((1, '0.5'), (2, '1'), (2, '0.5'))
+                    for seed in (0, 1)})
+                self.assertEqual(len({root.parents[2] for root in roots}), 1)
+
+    def test_config_weight_defaults_to_one(self):
+        code = f'''
+import alf
+alf.parse_config({str(self._config)!r}, [], create_env=False)
+print(alf.get_config_value('BafcAlgorithmV3.dqde_weight'))
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', code], cwd=self._repo_root,
+            check=True, text=True, capture_output=True)
+        self.assertEqual(float(result.stdout.strip().splitlines()[-1]), 1.)
+
+    def test_launcher_configs_build_requested_encoders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._dry_run(Path(tmp) / 'results')
+            self.assertEqual(run.returncode, 0, run.stderr)
+            # Both seeds have the same model configuration; construct one each.
+            for command in self._commands(run)[::2]:
+                settings = self._settings(command)
+                layers = int(settings['TransformerEncoder.num_layers'])
+                weight = float(settings['bafcv3_dqde_weight'])
+                with self.subTest(layers=layers, weight=weight):
+                    conf_params = [f'{key}={value}'
+                                   for key, value in settings.items()]
+                    code = f'''
+from functools import partial
+import json
+from unittest import mock
+import alf
+from alf.algorithms.bafc_algorithm_v3 import BafcAlgorithmV3
+from alf.algorithms.config import TrainerConfig
+from alf.networks import ActorFCNetwork, FuncCriticNetwork
+from alf.tensor_specs import BoundedTensorSpec, TensorSpec
+alf.parse_config({str(self._config)!r}, {conf_params!r}, create_env=False)
+keys = {{'BafcAlgorithmV3': ('dqde_weight', 'actor_eval_type', 'actor_use_ln',
+            'actor_critic_pairing', 'num_actor_critic',
+            'num_sampled_critics_for_actor', 'use_random_critic_targets',
+            'num_sampled_critic_targets', 'use_target_actor_encoder',
+            'use_legacy_actor_gradient', 'debug_gradient_chain',
+            'debug_gradient_chain_compare_backends'),
+        'TransformerEncoder': ('num_layers', 'norm_first', 'final_norm',
+            'normalize_qk', 'num_attention_heads', 'dropout')}}
+parsed = {{scope + '.' + key: alf.get_config_value(scope + '.' + key)
+           for scope, fields in keys.items() for key in fields}}
+# Reduce network sizes while retaining all encoder/gradient configuration.
+with mock.patch('alf.algorithms.algorithm.psutil.Process'):
+    alg = BafcAlgorithmV3(
+        observation_spec=TensorSpec((4,)),
+        action_spec=BoundedTensorSpec((2,), minimum=-1., maximum=1.),
+        config=TrainerConfig(root_dir={tmp!r}),
+        actor_network_cls=partial(ActorFCNetwork, fc_layer_params=(8, 8)),
+        critic_network_cls=partial(FuncCriticNetwork,
+            obs_action_joint_fc_layer_params=(8, 8),
+            actor_obs_action_joint_fc_layer_params=(8, 8)),
+        num_actor_critic=2, num_actor_eval_samples=4,
+        num_sampled_critics_for_actor=1)
+parsed['effective_layers'] = len(alg._actor_encoder._transformer.layers)
+parsed['target_layers'] = len(alg._target_actor_encoder._transformer.layers)
+parsed['effective_weight'] = alg._dqde_weight
+print(json.dumps(parsed))
+'''
+                    result = subprocess.run(
+                        [sys.executable, '-c', code], cwd=self._repo_root,
+                        check=True, text=True, capture_output=True)
+                    parsed = json.loads(result.stdout.strip().splitlines()[-1])
+                    self.assertEqual(parsed, {
+                        'BafcAlgorithmV3.dqde_weight': weight,
+                        'BafcAlgorithmV3.actor_eval_type': 'last_two',
+                        'BafcAlgorithmV3.actor_use_ln': True,
+                        'BafcAlgorithmV3.actor_critic_pairing': False,
+                        'BafcAlgorithmV3.num_actor_critic': 10,
+                        'BafcAlgorithmV3.num_sampled_critics_for_actor': 8,
+                        'BafcAlgorithmV3.use_random_critic_targets': True,
+                        'BafcAlgorithmV3.num_sampled_critic_targets': 1,
+                        'BafcAlgorithmV3.use_target_actor_encoder': True,
+                        'BafcAlgorithmV3.use_legacy_actor_gradient': False,
+                        'BafcAlgorithmV3.debug_gradient_chain': True,
+                        'BafcAlgorithmV3.debug_gradient_chain_compare_backends': True,
+                        'TransformerEncoder.num_layers': layers,
+                        'TransformerEncoder.norm_first': True,
+                        'TransformerEncoder.final_norm': True,
+                        'TransformerEncoder.normalize_qk': False,
+                        'TransformerEncoder.num_attention_heads': 1,
+                        'TransformerEncoder.dropout': 0.,
+                        'effective_layers': layers,
+                        'target_layers': layers,
+                        'effective_weight': weight,
+                    })
+
+    def test_launcher_six_job_port_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results = Path(tmp) / 'results'
+            run = self._dry_run(results, '--base-port', '65530')
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn('MASTER_PORT=65535 ', run.stdout)
+            run = self._dry_run(results, '--base-port', '65531')
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn('room for six valid ports', run.stderr)
+            self.assertFalse(results.exists())
+
+
 if __name__ == '__main__':
     alf.test.main()

@@ -226,6 +226,90 @@ class BafcAlgorithmV3GradientTest(alf.test.TestCase):
                 else:
                     self.assertGreater(difference, 1e-7)
 
+    def test_dqde_weight_scales_only_probe_gradient_after_clipping(self):
+        for legacy in (False, True):
+            for clip in (None, .01):
+                with self.subTest(legacy=legacy, clip=clip):
+                    kwargs = dict(
+                        actor_eval_type='last_two', actor_critic_pairing=False,
+                        num_sampled_critics_for_actor=2,
+                        use_legacy_actor_gradient=legacy,
+                        dqda_clipping=clip, use_bootstrap_actors=True)
+                    alg = self._gradient_alg(**kwargs)
+                    observation = torch.randn(3, 4, dtype=torch.float64)
+                    matching = torch.tensor([[2, 0, 1], [1, 2, 0]])
+                    mask = torch.tensor([[1., 0., 1.], [0., 1., 0.],
+                                         [1., 1., 0.]], dtype=torch.float64)
+                    valid = torch.tensor([1., 0., 1.], dtype=torch.float64)
+                    parameters = tuple(alg._actor_networks.parameters())
+                    action = torch.autograd.grad(
+                        self._reference_loss(
+                            alg, observation, mask, valid, matching,
+                            clip=clip, legacy=legacy, action_only=True),
+                        parameters)
+                    total = torch.autograd.grad(
+                        self._reference_loss(
+                            alg, observation, mask, valid, matching,
+                            clip=clip, legacy=legacy), parameters)
+                    probe = tuple(t - a for t, a in zip(total, action))
+                    self.assertGreater(sum(g.norm().item() for g in probe), 0)
+                    default = self._actual_gradients(
+                        alg, observation, mask, valid, matching)
+                    self._assert_gradients_close(default, total)
+                    for weight in (0., .5, 1.):
+                        with self.subTest(weight=weight):
+                            weighted_alg = self._gradient_alg(
+                                dqde_weight=weight, **kwargs)
+                            actual = self._actual_gradients(
+                                weighted_alg, observation, mask, valid, matching)
+                            expected = tuple(a + weight * p
+                                             for a, p in zip(action, probe))
+                            self._assert_gradients_close(actual, expected)
+                            if weight == 1.:
+                                self._assert_gradients_close(actual, default)
+
+    def test_dqde_weight_scales_gradient_chain_probe_branches(self):
+        for legacy in (False, True):
+            branches = []
+            for weight in (1., .5):
+                with self.subTest(legacy=legacy, weight=weight):
+                    alg = self._gradient_alg(
+                        actor_eval_type='last_two', dqde_weight=weight,
+                        use_legacy_actor_gradient=legacy,
+                        debug_summaries=True, debug_gradient_chain=True)
+                    observation = torch.randn(3, 4, dtype=torch.float64)
+                    action = alg._actor_networks(observation)[0]
+                    with mock.patch.object(
+                            alf.summary, 'should_record_summaries',
+                            return_value=True), \
+                         mock.patch.object(alf.summary, 'scalar'), \
+                         mock.patch.object(alf.summary, 'histogram'):
+                        _, info = alg._actor_train_step(
+                            observation, action, torch.zeros_like(action[:, 0]),
+                            torch.ones(3, 3, dtype=torch.float64), ())
+                    losses = alg._gradient_chain_pending
+                    parameters = tuple(alg._actor_networks.parameters())
+                    gradients = [torch.autograd.grad(
+                        loss.mean(), parameters, retain_graph=True,
+                        allow_unused=True, materialize_grads=True)
+                                 for loss in losses]
+                    actual_probe = torch.autograd.grad(
+                        info.extra.eval_action_loss.mean(), parameters)
+                    self._assert_gradients_close(
+                        actual_probe, tuple(h + o for h, o in
+                                            zip(gradients[1], gradients[2])))
+                    branches.append(gradients)
+            for i, (unweighted, weighted) in enumerate(zip(*branches)):
+                scale = 1. if i == 0 else .5
+                self._assert_gradients_close(
+                    weighted, tuple(scale * gradient for gradient in unweighted))
+
+    def test_dqde_weight_rejects_negative_and_nonfinite_values(self):
+        for weight in (-.5, float('nan'), float('inf'), float('-inf')):
+            with self.subTest(weight=weight):
+                with self.assertRaisesRegex(ValueError, 'dqde_weight'):
+                    self._make_alg(dqde_weight=weight)
+
     def test_full_mode_excludes_direct_raw_probe_path(self):
         alg = self._gradient_alg(actor_eval_type='full')
         observation = torch.randn(3, 4, dtype=torch.float64)

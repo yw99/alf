@@ -141,7 +141,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                  use_target_actor_encoder=False,
                  use_legacy_actor_gradient=False,
                  debug_gradient_chain=False,
-                 debug_gradient_chain_compare_backends=False):
+                 debug_gradient_chain_compare_backends=False,
+                 dqde_weight=1.0):
         """
         Args:
 
@@ -150,6 +151,10 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 Requires matching architecture flags when resuming.
             use_legacy_actor_gradient (bool): reproduce the historical connected
                 feature surrogates. False injects independent token partials once.
+            dqde_weight (float): finite, nonnegative weight for the probe-policy
+                gradient contribution, applied after clipping. Scales both hidden
+                and output probe contributions, including legacy gradients, while
+                leaving the ordinary action gradient unchanged. Defaults to 1.
             debug_gradient_chain (bool): collect gradient-chain and TD diagnostics.
                 Expensive measurements use the existing debug-summary cadence.
             debug_gradient_chain_compare_backends (bool): additionally compare
@@ -202,6 +207,8 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 every step of an episode. ``step`` means resampled bootstrap_mask for
                 every step of an episode.
         """
+        if not np.isfinite(dqde_weight) or dqde_weight < 0:
+            raise ValueError('dqde_weight must be finite and nonnegative')
         assert not (use_target_actor_encoder and use_actor_id_encoding), (
             "use_target_actor_encoder cannot be combined with use_actor_id_encoding.")
         assert not debug_gradient_chain_compare_backends or debug_gradient_chain, (
@@ -267,6 +274,7 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
         self._use_actor_id_encoding = use_actor_id_encoding
         self._use_target_actor_encoder = use_target_actor_encoder
         self._use_legacy_actor_gradient = use_legacy_actor_gradient
+        self._dqde_weight = dqde_weight
         self._debug_gradient_chain = debug_gradient_chain
         self._debug_gradient_chain_compare_backends = debug_gradient_chain_compare_backends
         self._gradient_chain_pending = None
@@ -1126,7 +1134,16 @@ class BafcAlgorithmV3(OffPolicyAlgorithm):
                 action_loss.shape[0])
             if record_chain:
                 gradient_diagnostics.summarize_tensor(
-                    'gradient_chain/rank_local/token_applied', clipped_tokens)
+                    'gradient_chain/rank_local/token_applied',
+                    clipped_tokens * self._dqde_weight)
+
+        # Weight the full probe contribution after clipping and reduction. Keep
+        # the diagnostic branch losses consistent with the optimizer objective.
+        eval_action_loss = eval_action_loss * self._dqde_weight
+        if probe_hidden_loss is not None:
+            probe_hidden_loss = probe_hidden_loss * self._dqde_weight
+        if probe_output_loss is not None:
+            probe_output_loss = probe_output_loss * self._dqde_weight
 
         if self._debug_gradient_chain:
             for i, gradient in enumerate(dqde):

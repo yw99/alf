@@ -64,6 +64,8 @@ alf.define_config('bafcv3_use_target_actor_encoder', False)
 use_target_actor_encoder = alf.get_config_value('bafcv3_use_target_actor_encoder')
 alf.define_config('bafcv3_use_legacy_actor_gradient', False)
 use_legacy_actor_gradient = alf.get_config_value('bafcv3_use_legacy_actor_gradient')
+alf.define_config('bafcv3_dqde_weight', 1.0)
+dqde_weight = alf.get_config_value('bafcv3_dqde_weight')
 alf.define_config('bafcv3_debug_gradient_chain', False)
 debug_gradient_chain = alf.get_config_value('bafcv3_debug_gradient_chain')
 alf.define_config('bafcv3_debug_gradient_chain_compare_backends', False)
@@ -137,6 +139,7 @@ alf.config(
     use_single_layer_transformer_encoder=use_single_layer_transformer_encoder,
     use_target_actor_encoder=use_target_actor_encoder,
     use_legacy_actor_gradient=use_legacy_actor_gradient,
+    dqde_weight=dqde_weight,
     debug_gradient_chain=debug_gradient_chain,
     debug_gradient_chain_compare_backends=debug_gradient_chain_compare_backends,
     detach_actor_policy_input=detach_actor_policy_input,
