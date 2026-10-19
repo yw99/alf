@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launch humanoid:run BAFCv3 control A (actor-ID encoding) with actor LN on.
-# Seeds 0 and 1 each use four GPUs through DDP: the first four GPUs run seed 0,
-# and the last four run seed 1. Both jobs run concurrently on distinct ports.
+# Seeds 2 and 3 each use four GPUs through DDP: the first four GPUs run seed 2,
+# and the last four run seed 3. Both jobs run concurrently on distinct ports.
 # Other experiment settings match run_humanoid_dog_run_bafcv3_actor_id_seed0123-8g.sh:
 # pairing off, eight sampled actor critics, critic/actor UTD 11/1, and one
 # randomly selected target critic. Each launch creates a fresh results directory.
@@ -10,9 +10,9 @@
 #   -d, --dir BASE_DIR       Base results directory (default: /workspace/alf_results)
 #   -n, --steps NUM_STEPS    Environment steps per job (default: 600000)
 #       --gpus CSV           Eight distinct GPU ids (default: 0,1,2,3,4,5,6,7)
-#                            First four: seed 0; last four: seed 1
+#                            First four: seed 2; last four: seed 3
 #       --checkpoints N      Number of checkpoints (default: 10)
-#       --base-port PORT     First of two DDP master ports (default: 29980)
+#       --base-port PORT     First of two DDP master ports (default: 29982)
 #       --dry-run            Print commands without creating files or launching jobs
 #   -h, --help               Show this help message
 #
@@ -37,9 +37,9 @@ BASE_DIR="/workspace/alf_results"
 NUM_ENV_STEPS=600000
 NUM_CHECKPOINTS=10
 GPUS="0,1,2,3,4,5,6,7"
-BASE_PORT=29980
+BASE_PORT=29982
 DRY_RUN=False
-SEEDS=(0 1)
+SEEDS=(2 3)
 
 CRITIC_UTD=11
 NUM_UPDATES_PER_TRAIN_ITER=12
@@ -134,7 +134,7 @@ GROUP_GPUS=(
 
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-RESULTS_PARENT="${BASE_DIR}/humanoid_run/bafcv3_actor_id_lnTrue_seed01_8g"
+RESULTS_PARENT="${BASE_DIR}/humanoid_run/bafcv3_actor_id_lnTrue_seed23_8g"
 ROOT_DIR="${RESULTS_PARENT}/${RUN_ID}"
 
 if [[ -e "${ROOT_DIR}" || -L "${ROOT_DIR}" ]]; then
@@ -151,13 +151,13 @@ if [[ "${DRY_RUN}" != "True" ]]; then
 fi
 
 cat <<EOF
-Starting humanoid:run BAFCv3 control A with actor LN, seeds 0 and 1
+Starting humanoid:run BAFCv3 control A with actor LN, seeds ${SEEDS[0]} and ${SEEDS[1]}
   Root dir: ${ROOT_DIR}
   Environment steps per job: ${NUM_ENV_STEPS}
   Num checkpoints: ${NUM_CHECKPOINTS}
   Seeds: ${SEEDS[*]}
-  Seed 0 GPUs: ${GROUP_GPUS[0]}
-  Seed 1 GPUs: ${GROUP_GPUS[1]}
+  Seed ${SEEDS[0]} GPUs: ${GROUP_GPUS[0]}
+  Seed ${SEEDS[1]} GPUs: ${GROUP_GPUS[1]}
   Threads: OMP=${OMP_NUM_THREADS}, MKL=${MKL_NUM_THREADS}, OPENBLAS=${OPENBLAS_NUM_THREADS}
   Critic UTD: ${CRITIC_UTD}
   Num updates per train iter: ${NUM_UPDATES_PER_TRAIN_ITER}
