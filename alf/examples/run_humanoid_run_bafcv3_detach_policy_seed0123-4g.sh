@@ -10,6 +10,7 @@
 #
 # Usage: bash run_humanoid_run_bafcv3_detach_policy_seed0123-4g.sh [options]
 #   -d, --dir BASE_DIR       Base results directory (default: /workspace/alf_results)
+#   -e, --env ENV_NAME       ALF environment name (default: humanoid:run)
 #   -n, --steps NUM_STEPS    Total environment steps per job (default: 600000)
 #       --gpus CSV           Comma-separated GPU ids (default: 0,1,2,3)
 #       --checkpoints N      Number of checkpoints (default: 10)
@@ -18,11 +19,14 @@
 #   -h, --help               Show this help message
 #
 # Example:
-#   bash run_humanoid_run_bafcv3_detach_policy_seed0123-4g.sh --dry-run
+#   bash run_humanoid_run_bafcv3_detach_policy_seed0123-4g.sh --env humanoid:walk --dry-run
 
 set -euo pipefail
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +48,7 @@ NUM_UPDATES_PER_TRAIN_ITER=12
 NUM_ACTOR_CRITIC=10
 NUM_SAMPLED_CRITICS_FOR_ACTOR=8
 NUM_SAMPLED_CRITIC_TARGETS=1
-ACTOR_USE_LN=False
+ACTOR_USE_LN=True
 DEBUG_SUMMARIES=True
 
 print_help() {
@@ -55,6 +59,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -d|--dir)
             BASE_DIR="$2"
+            shift 2
+            ;;
+        -e|--env)
+            ENV_NAME="$2"
             shift 2
             ;;
         -n|--steps)
@@ -102,6 +110,10 @@ if [[ ! "${NUM_ENV_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--steps must be a positive integer, got: ${NUM_ENV_STEPS}" >&2
     exit 1
 fi
+if [[ ! "${ENV_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "--env must have the form suite:task, got: ${ENV_NAME}" >&2
+    exit 1
+fi
 if [[ ! "${NUM_CHECKPOINTS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--checkpoints must be a positive integer, got: ${NUM_CHECKPOINTS}" >&2
     exit 1
@@ -111,10 +123,11 @@ if [[ ! "${BASE_PORT}" =~ ^[1-9][0-9]*$ ]] || (( BASE_PORT + 3 > 65535 )); then
     exit 1
 fi
 
-ROOT_DIR="${BASE_DIR}/humanoid_run/bafcv3_detach_policy_seed0123_4g/fixed_pairingFalse_num_sampled_critic${NUM_SAMPLED_CRITICS_FOR_ACTOR}/critic_utd${CRITIC_UTD}"
+ENV_DIR="${ENV_NAME//:/_}"
+ROOT_DIR="${BASE_DIR}/${ENV_DIR}/bafcv3_detach_policy_seed0123_4g/actor_use_LN${ACTOR_USE_LN}/fixed_pairingFalse_num_sampled_critic${NUM_SAMPLED_CRITICS_FOR_ACTOR}/critic_utd${CRITIC_UTD}"
 
 cat <<EOF
-Starting humanoid:run BAFCv3 seeds 0, 1, 2, and 3
+Starting ${ENV_NAME} BAFCv3 seeds 0, 1, 2, and 3
   Environment: ${ENV_NAME}
   Root dir: ${ROOT_DIR}
   Num env steps: ${NUM_ENV_STEPS}
@@ -131,6 +144,7 @@ Starting humanoid:run BAFCv3 seeds 0, 1, 2, and 3
   Actor-ID encoding (control A): False
   Detach actor policy input (control B): True
   Actor layer norm: ${ACTOR_USE_LN}
+  Threads: OMP=${OMP_NUM_THREADS}, MKL=${MKL_NUM_THREADS}, OPENBLAS=${OPENBLAS_NUM_THREADS}
   Dry run: ${DRY_RUN}
 EOF
 echo ""
@@ -186,7 +200,7 @@ echo ""
 if [[ "${DRY_RUN}" == "True" ]]; then
     echo "Dry run complete; no jobs were launched."
 else
-    echo "Launched four humanoid:run BAFCv3 4-GPU jobs: ${PIDS[*]}"
+    echo "Launched four ${ENV_NAME} BAFCv3 4-GPU jobs: ${PIDS[*]}"
     echo "Launcher is not waiting for completion."
 fi
 echo "To monitor: tail -f ${ROOT_DIR}/seed_*/out.log"

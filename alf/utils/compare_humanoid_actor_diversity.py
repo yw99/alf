@@ -24,13 +24,15 @@ def insert(records, key, value):
     records[key] = value
 
 
-def load_original(root):
+def load_original(root, expected_detach=False):
     records = {}
     for path in sorted((root/'raw').glob('*.npz')):
         with np.load(path,allow_pickle=False) as d:
             m=json.loads(str(d['metadata']))
             if m['encoding_type']!='functional':
-                raise ValueError('Expected original functional encodings')
+                raise ValueError('Expected functional encodings')
+            if m.get('detach_actor_policy_input', False) != expected_detach:
+                raise ValueError(f'Unexpected actor policy detachment setting: {path}')
             insert(records,(m['task'],m['seed'],m['env_steps']),dict(
                 replay=d['replay_rms'].copy(),l2=d['encoding_l2'].copy(),cosine=d['encoding_cosine'].copy(),
                 norms=d['encoding_norms'].copy(),probe=d['saved_probe_rms'].copy(),sources=[str(path)]))
@@ -66,20 +68,23 @@ def main():
     parser.add_argument('--control-replay',type=Path,default=Path('artifacts/control_a_replay_action_rms'))
     parser.add_argument('--control-embeddings',type=Path,default=Path('artifacts/control_a_embedding_distances'))
     parser.add_argument('--output',type=Path,default=Path('artifacts/humanoid_run_actor_diversity_comparison'))
+    parser.add_argument('--control-b',type=Path,help='Optional ongoing Control B diagnostic study; compare on shared checkpoints')
     args=parser.parse_args()
     arms={'BAFCv3':load_original(args.original),'Control A':load_control(args.control_replay,args.control_embeddings)}
-    if set(arms['BAFCv3'])!=set(arms['Control A']):
-        raise ValueError('Checkpoint keys differ; refusing an incomplete matched comparison')
-    keys=sorted(arms['BAFCv3'])
-    if {k[0] for k in keys}!={'humanoid:run'} or {k[1] for k in keys}!=set(range(4)):
-        raise ValueError('Expected humanoid:run seeds 0–3')
-    steps=sorted({k[2] for k in keys})
-    if len(keys)!=4*len(steps):
-        raise ValueError('Unequal checkpoint coverage across seeds')
+    if args.control_b:
+        arms['Control B']=load_original(args.control_b,expected_detach=True)
+    for label,records in arms.items():
+        if {k[0] for k in records}!={'humanoid:run'} or {k[1] for k in records}!=set(range(4)):
+            raise ValueError(f'Expected humanoid:run seeds 0–3: {label}')
+    steps=sorted(set.intersection(*[{k[2] for k in records if k[1]==seed}
+        for records in arms.values() for seed in range(4)]))
+    if not steps:
+        raise ValueError('No common checkpoint steps across all arms and seeds')
+    keys=[('humanoid:run',seed,step) for seed in range(4) for step in steps]
     out=args.output
     out.mkdir(parents=True,exist_ok=True)
     ix=np.triu_indices(10,1)
-    colors={'BAFCv3':'tab:blue','Control A':'tab:orange'}
+    colors={'BAFCv3':'tab:blue','Control A':'tab:orange','Control B':'tab:green'}
     overview,axes=plt.subplots(2,2,figsize=(12,8))
     detail,detail_axes=plt.subplots(4,3,figsize=(15,12),sharex=True)
     metrics=('replay','l2','cosine','norms')
@@ -143,6 +148,7 @@ def main():
             writer=csv.DictWriter(f,fieldnames=list(data[0]));writer.writeheader();writer.writerows(data)
     (out/'endpoints.json').write_text(json.dumps(endpoints,indent=2))
     manifest=dict(steps=steps,seeds=list(range(4)),
+        excluded_keys={label:[list(k) for k in sorted(set(records)-set(keys))] for label,records in arms.items()},
         interpretation='Same measurement protocol and checkpoint steps; different replay distributions and saved normalization per arm. Native functional encodings use saved probes, not replay states. Separation is descriptive and does not establish causal performance benefit.',
         inputs={label:sorted({p for r in records.values() for p in r['sources']}) for label,records in arms.items()})
     (out/'manifest.json').write_text(json.dumps(manifest,indent=2))

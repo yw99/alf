@@ -75,6 +75,7 @@ def worker(args):
     # These studies have four DDP ranks; never count legacy rank-0 duplicate.
     if {int(p.name.rsplit('rank', 1)[1]) for p in shards} != {0, 1, 2, 3}:
         raise ValueError(f'Expected replay ranks 0–3 for {cp}')
+    input_stats = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in [cp, *shards]}
     with torch.inference_mode():
         alg, norm, meta = load_model({'config': str(run / 'alf_config.py')}, str(cp), 'cpu')
         encoding_type = 'actor_id' if alg._use_actor_id_encoding else 'functional'
@@ -119,9 +120,13 @@ def worker(args):
             normalization='shared saved checkpoint statistics, frozen; not historical per-rank statistics',
             sampling='uniform without replacement per rank; FIRST/MID only; population-weighted MSE pooling',
             encoding_type=encoding_type,
+            detach_actor_policy_input=bool(alg._detach_actor_policy_input),
             probe_comparator='saved synthetic probes; inactive only in Control A',
             encoding_protocol='native checkpoint encoding; saved evaluation probes for functional encoding',
             state_unchanged=True, action_dim=actions.shape[-1], torch_version=torch.__version__)
+        if any((p.stat().st_size, p.stat().st_mtime_ns) != stat for p, stat in input_stats.items()):
+            raise RuntimeError('Model or replay files changed during checkpoint analysis')
+        meta['source_files_unchanged'] = True
         np.savez_compressed(args.result, replay_rms=pooled_rms(rank_mse, populations),
             saved_probe_rms=probe_rms, rank_mse=np.stack(rank_mse),
             encodings=encodings.cpu().numpy(), encoding_l2=representation['l2'],
@@ -180,7 +185,8 @@ def summarize(out):
         ax.grid(alpha=.2)
         ax.legend()
     modes = {r[0].get('encoding_type', 'actor_id') for rr in groups.values() for r in rr}
-    study_label = 'BAFCv3 functional encoder' if modes == {'functional'} else 'Control A actor ID'
+    detached = all(r[0].get('detach_actor_policy_input', False) for rr in groups.values() for r in rr)
+    study_label = ('Control B detached policy pathway' if detached else 'BAFCv3 functional encoder') if modes == {'functional'} else 'Control A actor ID'
     fig.suptitle(f'{study_label} — 45-pair mean; bands: pair minimum–maximum')
     for f,name in ((fig,'overview'),(detail,'per_seed')):
         f.tight_layout()
